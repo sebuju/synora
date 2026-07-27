@@ -247,6 +247,12 @@ function handleSignal(ws, msg) {
     if (ws.role === 'phone') openRecording(ws);
     return;
   }
+  if (msg.type === 'time-ping') {
+    // NTP-style probe: clients use the server clock as the common timebase
+    // for aligning frames captured on different devices.
+    send(ws, { type: 'time-pong', t0: msg.t0, tServer: Date.now() });
+    return;
+  }
   if (msg.type === 'vcam') {
     if (ws.role === 'viewer') {
       if (msg.phoneId === null) stopVcam();

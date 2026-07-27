@@ -20,6 +20,7 @@ Both devices show a "connection not private" warning once (self-signed certifica
 
 - Multi-device dashboard: every connected phone appears as a live tile with the device count in the header. Click a tile to enlarge one device, click again to go back.
 - **Combined** toggle: composites all live feeds onto a single canvas (auto grid layout, labeled), so every device shows in one video surface; Fullscreen expands whatever view is active.
+- Frame-synced combining: phones and dashboard align their clocks against the server, each phone publishes when its frames were captured, and the combined view holds every feed back to the slowest one so the tiles show the same instant. The header reports the current spread; alignment lands within one frame. Costs roughly 70 ms of extra delay in the combined view — the tile grid stays live.
 - Sub-second latency live view (WebRTC, direct P2P over LAN)
 - Automatic recording: every phone session is saved to `recordings/<timestamp>_phone<id>.webm` (plays in VLC or any browser)
 - Camera switch button (rear/front) — starts a new recording file
@@ -27,6 +28,25 @@ Both devices show a "connection not private" warning once (self-signed certifica
 - Resolution selector on the phone (480p / 720p / 1080p) — phone camera picks the closest supported mode; change starts a new recording file
 - Auto-reconnect on either side
 - Screen wake lock on the phone while streaming
+
+## Virtual webcam (optional, Windows)
+
+A phone feed can be exposed as a normal webcam device, selectable in any app.
+It needs two extra pieces, and the server enables the feature only when it
+finds both:
+
+1. [AkVirtualCamera](https://github.com/webcamoid/akvirtualcamera/releases) —
+   install it, then create the device:
+   ```
+   "%ProgramFiles%\AkVirtualCamera\x64\AkVCamManager.exe" add-device "Phone Stream"
+   "%ProgramFiles%\AkVirtualCamera\x64\AkVCamManager.exe" add-format AkVCamVideoDevice0 RGB24 1280 720 30
+   "%ProgramFiles%\AkVirtualCamera\x64\AkVCamManager.exe" update
+   ```
+2. `ffmpeg.exe` placed in `tools/` (any recent Windows build).
+
+Restart the server; it logs `Virtual cam ready` and a **Webcam** button appears
+on each dashboard tile. Click one to route that phone into the virtual camera,
+click again to stop.
 
 ## Notes
 
