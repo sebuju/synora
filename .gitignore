@@ -1,0 +1,7 @@
+node_modules/
+certs/
+recordings/
+tools/
+.vscode/
+.claude/
+CLAUDE.md

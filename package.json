@@ -1,0 +1,14 @@
+{
+  "name": "android-streamer",
+  "version": "1.0.0",
+  "description": "Stream phone camera to PC browser over LAN via WebRTC, with server-side recording",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "qrcode-terminal": "^0.12.0",
+    "selfsigned": "^2.4.1",
+    "ws": "^8.18.0"
+  }
+}
