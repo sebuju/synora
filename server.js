@@ -119,11 +119,41 @@ function serveStatic(req, res) {
 // phone's id; viewer→phone messages carry a phoneId for routing. Binary
 // frames from a phone = recording chunks for that phone's current file.
 const phones = new Map();
+// Phone ids are stable per device: a client persists a random id across
+// reloads and presents it on every connection, so a refresh keeps its slot on
+// the dashboard (and its recording filenames) instead of taking a new number.
+const phoneIdsByClient = new Map();
 let nextPhoneId = 1;
 let viewerSocket = null;
 
 function log(msg) {
   console.log(`[${fmtDateTime(new Date())}] ${msg}`);
+}
+
+// Roster of connected phones, printed whenever it changes. Settings come from
+// the phones themselves (see client-state), so they read '?' until reported.
+const CLIENT_COLUMNS = [
+  ['id', (id) => String(id)],
+  ['resolution', (id, s) => s.res || '?'],
+  ['mic', (id, s) => (s.mic === undefined ? '?' : s.mic ? 'on' : 'off')],
+];
+const CLIENT_COL_WIDTH = 12;
+
+function clientRow(cells) {
+  return `  ${cells.map((c) => c.padEnd(CLIENT_COL_WIDTH)).join('').trimEnd()}`;
+}
+
+function logClients() {
+  if (phones.size === 0) {
+    log('Clients: none');
+    return;
+  }
+  log(`Clients (${phones.size}):`);
+  console.log(clientRow(CLIENT_COLUMNS.map(([name]) => name)));
+  for (const id of [...phones.keys()].sort((a, b) => a - b)) {
+    const state = phones.get(id).clientState || {};
+    console.log(clientRow(CLIENT_COLUMNS.map(([, value]) => value(id, state))));
+  }
 }
 
 function closeRecording(ws) {
@@ -159,24 +189,32 @@ let vcamDeviceId = null;
 let vcamPhoneId = null;
 let vcamFfmpeg = null;
 
+// Re-run whenever the feature is still off, so a driver installed after the
+// server started is picked up without a restart. Only state changes are
+// logged, so the repeat checks stay silent.
+let vcamStatus = null;
+
 function detectVcam() {
+  let status;
   if (!fs.existsSync(FFMPEG)) {
-    log('Virtual cam disabled: tools/ffmpeg.exe not found');
-    return;
+    status = 'Virtual cam disabled: tools/ffmpeg.exe not found';
+  } else if (!fs.existsSync(AKVCAM_MANAGER)) {
+    status = 'Virtual cam disabled: AkVirtualCamera not installed';
+  } else {
+    // Parseable output is one bare device id per line; the default is a table.
+    const res = spawnSync(AKVCAM_MANAGER, ['-p', 'devices'], { encoding: 'utf8' });
+    const id = (res.stdout || '').split(/\r?\n/).map((l) => l.trim()).find((l) => l);
+    if (id) {
+      vcamDeviceId = id;
+      status = `Virtual cam ready: ${id}`;
+    } else {
+      status = 'Virtual cam disabled: no AkVCam device configured';
+    }
   }
-  if (!fs.existsSync(AKVCAM_MANAGER)) {
-    log('Virtual cam disabled: AkVirtualCamera not installed');
-    return;
+  if (status !== vcamStatus) {
+    vcamStatus = status;
+    log(status);
   }
-  // Parseable output is one bare device id per line; the default is a table.
-  const res = spawnSync(AKVCAM_MANAGER, ['-p', 'devices'], { encoding: 'utf8' });
-  const id = (res.stdout || '').split(/\r?\n/).map((l) => l.trim()).find((l) => l);
-  if (!id) {
-    log('Virtual cam disabled: no AkVCam device configured');
-    return;
-  }
-  vcamDeviceId = id;
-  log(`Virtual cam ready: ${vcamDeviceId}`);
 }
 
 function stopVcam() {
@@ -226,26 +264,59 @@ function startVcam(phoneId) {
   send(viewerSocket, { type: 'vcam-state', phoneId });
 }
 
+function phoneIdFor(clientId) {
+  // A client that cannot persist an id (or predates the scheme) still gets a
+  // number, it just does not survive a reload.
+  if (!clientId) return nextPhoneId++;
+  if (!phoneIdsByClient.has(clientId)) phoneIdsByClient.set(clientId, nextPhoneId++);
+  return phoneIdsByClient.get(clientId);
+}
+
 function handleSignal(ws, msg) {
   if (msg.type === 'role') {
     if (msg.role === 'phone') {
       ws.role = 'phone';
-      ws.phoneId = nextPhoneId++;
+      ws.phoneId = phoneIdFor(msg.clientId);
+      // A reload can land the new socket before the old one's close fires, so
+      // retire whatever socket still holds the id — only one owns it.
+      const prev = phones.get(ws.phoneId);
+      if (prev && prev !== ws) prev.close();
       phones.set(ws.phoneId, ws);
       log(`Phone ${ws.phoneId} connected (${phones.size} total)`);
+      // The webcam feed was bound to the socket that just went away; the new
+      // one starts a fresh WebM stream, which needs a fresh ffmpeg.
+      if (ws.phoneId === vcamPhoneId) startVcam(ws.phoneId);
+      // The id is the server's to hand out, and the phone shows it so a device
+      // can be matched with its tile and its recordings.
+      send(ws, { type: 'phone-id', phoneId: ws.phoneId });
       if (viewerSocket) send(ws, { type: 'viewer-ready' });
     } else if (msg.role === 'viewer') {
       if (viewerSocket && viewerSocket !== ws) viewerSocket.close();
       viewerSocket = ws;
       ws.role = 'viewer';
       log('Viewer connected');
+      // Catch a driver that appeared since startup. An active feed holds the
+      // id it is streaming to, so leave that case alone.
+      if (!vcamDeviceId) detectVcam();
       send(ws, { type: 'vcam-state', phoneId: vcamPhoneId, available: !!vcamDeviceId });
       for (const phone of phones.values()) send(phone, { type: 'viewer-ready' });
     }
     return;
   }
+  if (msg.type === 'client-state') {
+    if (ws.role === 'phone') {
+      ws.clientState = { res: msg.res, mic: !!msg.mic };
+      logClients();
+    }
+    return;
+  }
   if (msg.type === 'recording-start') {
     if (ws.role === 'phone') openRecording(ws);
+    return;
+  }
+  if (msg.type === 'ping') {
+    // Liveness probe: clients treat an unanswered ping as a dead socket.
+    send(ws, { type: 'pong' });
     return;
   }
   if (msg.type === 'time-ping') {
@@ -296,10 +367,14 @@ function main() {
 
     ws.on('close', () => {
       if (ws.role === 'phone') {
-        phones.delete(ws.phoneId);
         closeRecording(ws);
+        // A reconnect of the same device may already own this id — its state
+        // belongs to the new socket, so leave it alone.
+        if (phones.get(ws.phoneId) !== ws) return;
+        phones.delete(ws.phoneId);
         if (ws.phoneId === vcamPhoneId) stopVcam();
         log(`Phone ${ws.phoneId} disconnected (${phones.size} total)`);
+        logClients();
         send(viewerSocket, { type: 'phone-gone', phoneId: ws.phoneId });
       } else if (ws === viewerSocket) {
         viewerSocket = null;
