@@ -8,18 +8,48 @@
 </head>
 <body>
   <header>
-    <h1>Camera Streamer</h1>
-    <span id="status">starting…</span>
+    <span id="phoneLabel"></span>
+    <span id="status" class="grow">starting…</span>
     <select id="resSelect">
       <option value="480p">480p</option>
       <option value="720p" selected>720p</option>
       <option value="1080p">1080p</option>
     </select>
-    <button id="micBtn">Mic: off</button>
-    <button id="switchBtn">Switch camera</button>
+    <button id="micBtn" class="icon-btn" type="button" title="Microphone" aria-label="Microphone">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="9" y="2.5" width="6" height="11" rx="3"/>
+        <path d="M5.5 11.5a6.5 6.5 0 0 0 13 0"/>
+        <path d="M12 18v3.5"/>
+        <path class="slash" d="M3.5 3.5l17 17"/>
+      </svg>
+    </button>
+    <button id="switchBtn" class="icon-btn" type="button" title="Switch camera" aria-label="Switch camera">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="2.5" y="6.5" width="19" height="13" rx="2.5"/>
+        <path d="M8.5 6.5L10 4h4l1.5 2.5"/>
+        <path d="M9.2 13.2a2.8 2.8 0 0 1 5.6 0"/>
+        <polyline points="13.5 11.9 14.8 13.2 16.1 11.9"/>
+        <path d="M14.8 13.2a2.8 2.8 0 0 1-5.6 0"/>
+        <polyline points="7.9 14.5 9.2 13.2 10.5 14.5"/>
+      </svg>
+    </button>
+    <button id="recBtn" class="icon-btn" type="button" title="Start new recording" aria-label="Start new recording">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="9"/>
+        <circle cx="12" cy="12" r="4.2" fill="currentColor" stroke="none"/>
+      </svg>
+    </button>
   </header>
-  <main>
+  <main class="tappable">
     <video id="preview" autoplay playsinline muted></video>
+    <div id="pauseOverlay">
+      <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+        <path d="M8 5l11 7-11 7z"/>
+      </svg>
+    </div>
   </main>
   <script src="/common.js"></script>
   <script src="/phone.js"></script>
