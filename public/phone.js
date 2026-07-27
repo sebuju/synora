@@ -23,6 +23,7 @@ const signaling = connectSignaling('phone', {
   onOpen() {
     wsOpen = true;
     setStatus('connected, waiting for viewer');
+    clockSync.start();
     startRecorder();
   },
   onClose() {
@@ -31,6 +32,7 @@ const signaling = connectSignaling('phone', {
     stopRecorder();
   },
   async onMessage(msg) {
+    if (clockSync.handle(msg)) return;
     if (msg.type === 'viewer-ready') {
       viewerWaiting = true;
       if (stream) await startCall();
@@ -47,6 +49,8 @@ const signaling = connectSignaling('phone', {
     }
   },
 });
+
+const clockSync = createClockSync(signaling);
 
 async function startCamera() {
   stream?.getTracks().forEach((t) => t.stop());
@@ -71,10 +75,59 @@ async function startCamera() {
   }
 }
 
+// Advertise the absolute-capture-time RTP header extension on the video
+// section. It carries each frame's capture instant on the sender's clock,
+// which is what lets the dashboard align feeds from different phones.
+function withAbsCaptureTime(sdp) {
+  if (sdp.includes(ABS_CAPTURE_TIME_URI)) return sdp;
+  const sections = sdp.split(/(?=^m=)/m);
+  return sections.map((section) => {
+    if (!section.startsWith('m=video')) return section;
+    const used = [...section.matchAll(/^a=extmap:(\d+)/gm)].map((m) => Number(m[1]));
+    let id = 1;
+    while (used.includes(id)) id++;
+    if (id > 14) return section;
+    const lines = section.trimEnd().split('\r\n');
+    const last = lines.map((l) => l.startsWith('a=extmap:')).lastIndexOf(true);
+    lines.splice(last + 1, 0, `a=extmap:${id} ${ABS_CAPTURE_TIME_URI}`);
+    return `${lines.join('\r\n')}\r\n`;
+  }).join('');
+}
+
+// The dashboard sees each frame's RTP timestamp but has no way to know when it
+// was captured. Encoded-frame access gives us both at the sending end, so we
+// publish the pairing and let the dashboard interpolate the rest.
+function publishFrameTiming(sender) {
+  if (!sender.createEncodedStreams) return;
+  let streams;
+  try {
+    streams = sender.createEncodedStreams();
+  } catch {
+    return;
+  }
+  let lastSent = 0;
+  const tagger = new TransformStream({
+    transform(frame, controller) {
+      const now = clockSync.now();
+      // The RTP clock is exact between pairings, so these are only needed
+      // often enough for the dashboard to find a low-encode-delay sample.
+      if (clockSync.synced && now - lastSent > 250) {
+        lastSent = now;
+        signaling.send({ type: 'rtp-map', rtp: frame.timestamp, serverTime: now });
+      }
+      controller.enqueue(frame);
+    },
+  });
+  streams.readable.pipeThrough(tagger).pipeTo(streams.writable).catch(() => {});
+}
+
 async function startCall() {
   pc?.close();
-  pc = new RTCPeerConnection(RTC_CONFIG);
+  pc = new RTCPeerConnection({ ...RTC_CONFIG, encodedInsertableStreams: true });
   stream.getTracks().forEach((t) => pc.addTrack(t, stream));
+  for (const sender of pc.getSenders()) {
+    if (sender.track?.kind === 'video') publishFrameTiming(sender);
+  }
   pc.onicecandidate = (ev) => {
     if (ev.candidate) signaling.send({ type: 'ice', candidate: ev.candidate });
   };
@@ -83,6 +136,7 @@ async function startCall() {
     else if (pc.connectionState === 'failed') setStatus('connection failed');
   };
   const offer = await pc.createOffer();
+  offer.sdp = withAbsCaptureTime(offer.sdp);
   await pc.setLocalDescription(offer);
   signaling.send({ type: 'offer', description: pc.localDescription });
 }
