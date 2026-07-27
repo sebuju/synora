@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Camera Dashboard</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <h1>Camera Dashboard</h1>
+    <span id="status">connecting…</span>
+    <button id="combinedBtn">Combined: off</button>
+    <button id="muteBtn">Sound: off</button>
+    <button id="fullscreenBtn">Fullscreen</button>
+  </header>
+  <main>
+    <div id="grid"></div>
+    <canvas id="combined" width="1920" height="1080"></canvas>
+    <div id="empty">No devices connected</div>
+  </main>
+  <script src="/common.js"></script>
+  <script src="/viewer.js"></script>
+</body>
+</html>
