@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Camera Streamer</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <h1>Camera Streamer</h1>
+    <span id="status">starting…</span>
+    <select id="resSelect">
+      <option value="480p">480p</option>
+      <option value="720p" selected>720p</option>
+      <option value="1080p">1080p</option>
+    </select>
+    <button id="micBtn">Mic: off</button>
+    <button id="switchBtn">Switch camera</button>
+  </header>
+  <main>
+    <video id="preview" autoplay playsinline muted></video>
+  </main>
+  <script src="/common.js"></script>
+  <script src="/phone.js"></script>
+</body>
+</html>
