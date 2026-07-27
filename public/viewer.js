@@ -111,6 +111,11 @@ function removeDevice(phoneId) {
 async function acceptOffer(phoneId, description) {
   const dev = ensureDevice(phoneId);
   dev.pc?.close();
+  // A phone keeps its id across reloads, so a device can be handed a second
+  // connection. Its RTP clock and buffered frames belong to the old one.
+  dev.rtpMap = null;
+  dev.latency = null;
+  dropFrames(dev);
   dev.pc = new RTCPeerConnection(RTC_CONFIG);
   dev.pc.ontrack = (ev) => {
     dev.video.srcObject = ev.streams[0];
