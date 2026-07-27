@@ -4,7 +4,8 @@
   "description": "Stream phone camera to PC browser over LAN via WebRTC, with server-side recording",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "node --watch server.js"
   },
   "dependencies": {
     "qrcode-terminal": "^0.12.0",
