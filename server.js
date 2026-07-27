@@ -168,7 +168,8 @@ function detectVcam() {
     log('Virtual cam disabled: AkVirtualCamera not installed');
     return;
   }
-  const res = spawnSync(AKVCAM_MANAGER, ['devices'], { encoding: 'utf8' });
+  // Parseable output is one bare device id per line; the default is a table.
+  const res = spawnSync(AKVCAM_MANAGER, ['-p', 'devices'], { encoding: 'utf8' });
   const id = (res.stdout || '').split(/\r?\n/).map((l) => l.trim()).find((l) => l);
   if (!id) {
     log('Virtual cam disabled: no AkVCam device configured');
