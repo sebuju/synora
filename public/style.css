@@ -31,9 +31,14 @@ header h1 {
   flex: 1;
 }
 
-#status {
+#status,
+#syncLabel {
   font-size: 13px;
   color: #9a9a9a;
+}
+
+#syncLabel {
+  color: #6fae7f;
 }
 
 button,
@@ -68,8 +73,8 @@ video {
 
 /* Dashboard grid: combined view of all connected devices. */
 #grid {
-  width: 100%;
-  height: 100%;
+  position: absolute;
+  inset: 0;
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
   gap: 8px;
@@ -132,10 +137,27 @@ video {
   pointer-events: none;
 }
 
-/* Combined view: all feeds composited onto one canvas. */
+/* Combined view: all feeds composited onto one canvas. The tile grid keeps
+   rendering underneath — a hidden <video> stops producing frame callbacks,
+   which is exactly what the compositing and sync code reads — so the combined
+   view covers it with an opaque backdrop instead of hiding it. */
+#backdrop {
+  display: none;
+  position: absolute;
+  inset: 0;
+  background: #111;
+  z-index: 1;
+}
+
 #combined {
   display: none;
+  position: relative;
   max-width: 100%;
   max-height: 100%;
   background: #000;
+  z-index: 2;
+}
+
+#empty {
+  z-index: 3;
 }
