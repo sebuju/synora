@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Camera Streamer</title>
+  <link rel="stylesheet" href="/style.css">
+  <style>
+    main { flex-direction: column; gap: 8px; padding: 24px; justify-content: flex-start; align-items: center; overflow-y: auto; }
+    section { width: 100%; max-width: 900px; }
+    /* Direct child only — the cards have their own h2s. */
+    section > h2 {
+      font-size: 13px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #9a9a9a;
+      margin: 10px 0 8px;
+    }
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 12px;
+    }
+    .card {
+      display: block;
+      padding: 16px;
+      background: #1c1c1c;
+      border: 1px solid #333;
+      border-radius: 10px;
+      text-decoration: none;
+      color: #eee;
+    }
+    .card:hover { background: #242424; border-color: #444; }
+    .card h2 { font-size: 16px; margin-bottom: 6px; }
+    .card p { font-size: 13px; color: #9a9a9a; line-height: 1.4; }
+    .card .path { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: #6fae7f; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <header>
+    <a class="home" href="/">Camera Streamer</a>
+  </header>
+  <main>
+    <section>
+      <h2>Server</h2>
+      <div class="cards">
+        <a class="card" href="/viewer">
+          <h2>Dashboard <span class="path">/viewer</span></h2>
+          <p>All phone feeds: tile grid, synced combined view, 3D room view, recordings and virtual webcam control. Open this on the PC.</p>
+        </a>
+        <a class="card" href="/markers">
+          <h2>Print room tags <span class="path">/markers</span></h2>
+          <p>Printable ArUco tags (150 mm, one per A4 sheet). Mount around the room; tag 0 is the room origin.</p>
+        </a>
+      </div>
+    </section>
+    <section>
+      <h2>Client</h2>
+      <div class="cards">
+        <a class="card" href="/phone">
+          <h2>Phone <span class="path">/phone</span></h2>
+          <p>Streams this device's camera to the dashboard. Open on each phone (the QR code in the server console points here).</p>
+        </a>
+        <a class="card" href="/calibrate">
+          <h2>Camera calibration <span class="path">/calibrate</span></h2>
+          <p>One-time per phone lens: print the ChArUco board, capture ~15 views, save intrinsics. Marker distances go from ~5% to sub-1% error.</p>
+        </a>
+        <a class="card" href="/digital">
+          <h2>On-screen tag <span class="path">/digital</span></h2>
+          <p>Shows a room tag on this screen at true physical size instead of printing — calibrate the screen once with a credit card.</p>
+        </a>
+      </div>
+    </section>
+  </main>
+</body>
+</html>
