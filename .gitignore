@@ -2,6 +2,10 @@ node_modules/
 certs/
 recordings/
 tools/
+public/vendor/
+models/
+markers.json
+server.log
 .vscode/
 .claude/
 CLAUDE.md

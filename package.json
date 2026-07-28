@@ -5,9 +5,12 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "fetch-vendor": "node fetch-vendor.js"
   },
   "dependencies": {
+    "jpeg-js": "^0.4.4",
+    "onnxruntime-node": "^1.27.0",
     "qrcode-terminal": "^0.12.0",
     "selfsigned": "^2.4.1",
     "ws": "^8.18.0"
