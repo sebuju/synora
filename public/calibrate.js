@@ -100,8 +100,9 @@ function drawOverlay(cornersMat) {
 
 function detectTick() {
   if (!cv || !calVideo.videoWidth) return;
-  const gray = grabber.grab(calVideo);
-  if (!gray) return;
+  const grabbed = grabber.luma(calVideo);
+  if (!grabbed) return;
+  const gray = grabbed.mat;
   const chC = new cv.Mat();
   const chI = new cv.Mat();
   const mkC = new cv.MatVector();
@@ -247,7 +248,7 @@ facingSelect.onchange = calResSelect.onchange = async () => {
   }
   board = makeCharucoBoard(cv);
   detector = makeCharucoDetector(cv, board);
-  grabber = createFrameGrabber(cv);
+  grabber = createCanvasLumaSource(cv);
 
   // Render the printable board once: 182x260 mm at ~300 dpi.
   const boardImg = new cv.Mat();
