@@ -1,26 +1,42 @@
 'use strict';
 
 // Room mapping: consumes posed keyframes, feeds the depth worker, and owns
-// the voxel occupancy grid. A voxel becomes occupied once two different
-// keyframes have hit it — one monocular depth map hallucinating a surface
-// should not paint the room.
+// the voxel occupancy grid.
 
 const fs = require('fs');
 const path = require('path');
 const { Worker } = require('worker_threads');
+const { createFloorplan } = require('./floorplan.js');
+const { integrateGrid } = require('./surface.js');
 
 const VOXEL_SIZE_M = 0.075;
 const KEY_OFFSET = 512;          // must match depth-worker.js packing
-// First hit shows immediately — with the metric model and the per-frame
-// calibration guards, a keyframe that got this far is trustworthy, and
-// waiting for a second corroborating frame made the map feel dead. Carving
-// still removes what later frames see through.
-const OCCUPIED_AT_HITS = 1;
-// A voxel seen through (free-space votes from ray carving) far more often
-// than it is hit is a depth hallucination, not a surface — dismiss it.
-const MISS_TOLERANCE = 4;        // occupied while misses <= hits * this
+
+// Occupancy is log-odds, not hit/miss counters. Counters were one-way: a cell
+// that a single bad keyframe painted needed several times as many clean
+// see-throughs to lose again, so the map only ever grew and a bad minute was
+// permanent. Log-odds saturates in both directions, so evidence stays
+// reversible and a surface that later frames disagree with fades on its own.
+// A hit only confirms a cell when it comes from somewhere new. Standing still
+// and staring at noise otherwise accumulates evidence exactly as if you had
+// walked around it — the single biggest way false geometry becomes solid. A
+// repeat from the same viewpoint still counts for something (it keeps a real
+// surface from decaying while you stand there) but cannot promote on its own.
+const L_HIT = 0.9;               // a depth sample from a viewpoint not seen before
+const L_HIT_REPEAT = 0.15;       // the same cell from the same viewpoint again
+const L_NEAR = 0.25;             // face neighbor of one — a vote, not a hit
+const L_MISS = -0.45;            // a ray passed through on its way to a surface
+const L_MIN = -3;
+const L_MAX = 4;
+// Hysteresis: without it a cell hovering at the threshold flickers into every
+// delta flush, and the wall fit downstream chases the flicker.
+const L_OCCUPY = 1.8;            // 2 direct hits, or 1 hit and 4 shell votes
+const L_RELEASE = 0.5;
 const DELTA_FLUSH_MS = 500;
 const SNAPSHOT_CHUNK = 5000;
+// Below the floor with nothing to show, a cell is just carved air — forget it
+// rather than carry a key per cubic decimetre of the room forever.
+const FORGET_BELOW = L_MIN + 0.01;
 
 // --- Wall layer ------------------------------------------------------------
 // The map's real subject is the room shell, not the furniture in it. A column
@@ -32,11 +48,87 @@ const WALL_MIN_HEIGHT_M = 1.0;   // vertical span before a column reads as wall
 const WALL_FILL_MIN = 0.45;      // occupied fraction of that span
 const WALL_INLIER_M = 0.12;      // point-to-line distance counted as on-wall
 const WALL_GAP_M = 0.5;          // split a fitted line into walls at gaps
-const WALL_MIN_LEN_M = 0.6;
-const WALL_MIN_COLS = 6;
+// These now gate only the off-axis leftover pass over 5 cm evidence cells, not
+// 7.5 cm voxel columns: a real wall gives ~20 cells per metre there, so the
+// bar can be well above what the rectilinear pass already handles.
+const WALL_MIN_LEN_M = 1.2;
+const WALL_MIN_COLS = 12;
 const WALL_MAX_COUNT = 16;
-const WALL_TRIALS = 48;
+const WALL_TRIALS = 120;
 const WALL_RECOMPUTE_MS = 1500;
+// Columns per metre along the segment. A wall is a solid row of columns; a
+// line drawn through scattered clutter is not, however many points it grazes.
+// At 7.5 cm cells a filled wall gives ~13/m, so this only rejects the sparse.
+const WALL_MIN_DENSITY = 8;
+// A wall is thicker than one column of voxels — dilation, depth wobble and a
+// drifting depth scale all smear it across a few layers. Clearing only the
+// fitted columns leaves the neighbouring layer in the pool, and the next
+// iteration dutifully fits a second wall 10 cm behind the first. Buildings do
+// not have those, so the slab around an accepted segment goes with it, and
+// any collinear pair that survives anyway is merged afterwards.
+const WALL_SLAB_M = 0.25;
+const WALL_MERGE_ANGLE_DEG = 12;
+// Candidate pairs are drawn from the same neighborhood. Sampling globally
+// makes room-crossing diagonals as likely as real walls, and a diagonal that
+// wins takes its inliers out of the pool — shredding the walls it crossed.
+const WALL_PAIR_MAX_M = 3;
+
+// Fold segments that describe the same piece of wall into one. Two fits can
+// still land on the same plane from different neighborhoods, and a room with
+// two parallel walls a handful of centimetres apart is not a room.
+function mergeWallSegments(segs) {
+  const dirOf = (s) => {
+    const dx = s.b[0] - s.a[0];
+    const dz = s.b[1] - s.a[1];
+    const len = Math.hypot(dx, dz) || 1;
+    return [dx / len, dz / len, len];
+  };
+  const cosLimit = Math.cos(WALL_MERGE_ANGLE_DEG * Math.PI / 180);
+  // Longest first: the long segment sets the plane, short ones fold into it.
+  const order = segs.slice().sort((p, q) => dirOf(q)[2] - dirOf(p)[2]);
+  const merged = [];
+  for (const s of order) {
+    const [sx, sz] = dirOf(s);
+    const host = merged.find((m) => {
+      const [mx, mz] = dirOf(m);
+      if (Math.abs(mx * sx + mz * sz) < cosLimit) return false;   // antiparallel counts
+      // Both endpoints inside the host's slab, and the projections must meet.
+      const ts = [];
+      for (const pt of [s.a, s.b]) {
+        const dx = pt[0] - m.a[0];
+        const dz = pt[1] - m.a[1];
+        if (Math.abs(dx * mz - dz * mx) > WALL_SLAB_M) return false;
+        ts.push(dx * mx + dz * mz);
+      }
+      const mLen = dirOf(m)[2];
+      return Math.min(...ts) <= mLen + WALL_GAP_M && Math.max(...ts) >= -WALL_GAP_M;
+    });
+    if (!host) {
+      merged.push({ ...s, a: [...s.a], b: [...s.b] });
+      continue;
+    }
+    // Extend the host along its own direction and average the heights by how
+    // many columns each side actually saw.
+    const [mx, mz, mLen] = dirOf(host);
+    let lo = 0;
+    let hi = mLen;
+    for (const pt of [s.a, s.b]) {
+      const t = (pt[0] - host.a[0]) * mx + (pt[1] - host.a[1]) * mz;
+      lo = Math.min(lo, t);
+      hi = Math.max(hi, t);
+    }
+    const w = host.cols + s.cols;
+    const rnd = (v) => Math.round(v * 100) / 100;
+    const ax = host.a[0];
+    const az = host.a[1];
+    host.a = [rnd(ax + mx * lo), rnd(az + mz * lo)];
+    host.b = [rnd(ax + mx * hi), rnd(az + mz * hi)];
+    host.y0 = rnd((host.y0 * host.cols + s.y0 * s.cols) / w);
+    host.y1 = rnd((host.y1 * host.cols + s.y1 * s.cols) / w);
+    host.cols = w;
+  }
+  return merged;
+}
 
 function unpack(key) {
   return [
@@ -46,17 +138,24 @@ function unpack(key) {
   ].map((v) => Math.round(v * 1000) / 1000);
 }
 
-function createMapping({ modelPath, metric, survey, log, onDelta, onSnapshot, onWalls }) {
+function createMapping({
+  modelPath, metric, survey, depthCal, log, onDelta, onSnapshot, onWalls, onCalState,
+}) {
   let worker = null;
   let busy = false;
   let nextId = 1;
+  let inFlight = null;             // the job the worker is chewing on
   // One pending keyframe per client: a slow inference drops stale frames
   // rather than queueing them.
   const pending = new Map();
-  const shiftByClient = new Map();  // per-client EMA of the fitted depth shift
 
-  const hits = new Map();          // packed key -> surface hit count
-  const misses = new Map();        // packed key -> seen-through count
+  // Surface evidence for the floor plan. Separate from the voxel grid on
+  // purpose: the voxels are what the room looked like, this is what the walls
+  // are, and only one of the two is worth fitting geometry to.
+  const floorplan = createFloorplan();
+
+  const logOdds = new Map();       // packed key -> accumulated log-odds
+  const seenFrom = new Map();      // packed key -> viewpoint id that last hit it
   const occupied = new Set();      // packed keys shown to the viewer
   let deltaAdded = [];
   let deltaRemoved = [];
@@ -110,39 +209,49 @@ function createMapping({ modelPath, metric, survey, log, onDelta, onSnapshot, on
     }, WALL_RECOMPUTE_MS);
   }
 
+  // The rectilinear structure comes from the surface-evidence grid; this pass
+  // only handles what the room's own axes could not explain. Fitting the
+  // occupancy grid was the old route and it fitted the depth error, not the
+  // room — occupancy is several cells wide wherever the depth is a few percent
+  // off, which is everywhere.
   function extractWalls() {
-    // Column statistics over the accumulated map.
-    const cols = new Map();          // (vx<<10|vz) -> { minY, maxY, count }
-    for (const key of occupied) {
-      const vy = (key >> 10) & 0x3ff;
-      const ck = ((key >> 20) & 0x3ff) << 10 | (key & 0x3ff);
-      const c = cols.get(ck);
-      if (!c) {
-        cols.set(ck, { minY: vy, maxY: vy, count: 1 });
-      } else {
-        if (vy < c.minY) c.minY = vy;
-        if (vy > c.maxY) c.maxY = vy;
-        c.count++;
+    const { segments, leftovers } = floorplan.fit();
+    const pts = leftovers.map((c) => ({
+      x: c.x, z: c.z, y0: c.yLo, y1: c.yHi,
+    }));
+
+    // Inliers of a line, ordered along it and split at gaps: a wall is one
+    // unbroken run, so this is also the unit everything downstream scores.
+    function runsAlong(points, ox, oz, ux, uz) {
+      const seq = points
+        .filter((p) => Math.abs((p.x - ox) * uz - (p.z - oz) * ux) <= WALL_INLIER_M)
+        .map((p) => ({ p, t: (p.x - ox) * ux + (p.z - oz) * uz }))
+        .sort((a, b) => a.t - b.t);
+      const runs = [];
+      let run = null;
+      for (const e of seq) {
+        if (run && e.t - run[run.length - 1].t <= WALL_GAP_M) run.push(e);
+        else runs.push(run = [e]);
       }
-    }
-    const pts = [];
-    const minSpanCells = WALL_MIN_HEIGHT_M / VOXEL_SIZE_M;
-    for (const [ck, c] of cols) {
-      const spanCells = c.maxY - c.minY + 1;
-      if (spanCells < minSpanCells || c.count < spanCells * WALL_FILL_MIN) continue;
-      pts.push({
-        x: ((ck >> 10) - KEY_OFFSET + 0.5) * VOXEL_SIZE_M,
-        z: ((ck & 0x3ff) - KEY_OFFSET + 0.5) * VOXEL_SIZE_M,
-        y0: (c.minY - KEY_OFFSET) * VOXEL_SIZE_M,
-        y1: (c.maxY - KEY_OFFSET + 1) * VOXEL_SIZE_M,
-      });
+      return runs;
     }
 
+    // Runs are scored, never raw inlier counts. Counting every point an
+    // infinite line touches is what let a diagonal through the middle of the
+    // room outscore an actual wall.
+    const runScore = (r) => {
+      if (r.length < WALL_MIN_COLS) return 0;
+      const span = r[r.length - 1].t - r[0].t;
+      if (span < WALL_MIN_LEN_M || r.length / span < WALL_MIN_DENSITY) return 0;
+      return r.length;
+    };
+    const bestRun = (runs) => runs.reduce(
+      (b, r) => (runScore(r) > runScore(b || []) ? r : b), null);
+
     const out = [];
+    const rnd = (v) => Math.round(v * 100) / 100;
     let pool = pts;
     while (pool.length >= WALL_MIN_COLS && out.length < WALL_MAX_COUNT) {
-      // RANSAC: at these point counts the best of a few dozen random pairs
-      // is reliably the dominant remaining wall.
       let best = null;
       for (let t = 0; t < WALL_TRIALS; t++) {
         const p1 = pool[(Math.random() * pool.length) | 0];
@@ -150,119 +259,133 @@ function createMapping({ modelPath, metric, survey, log, onDelta, onSnapshot, on
         const dx = p2.x - p1.x;
         const dz = p2.z - p1.z;
         const len = Math.hypot(dx, dz);
-        if (len < WALL_MIN_LEN_M / 2) continue;
-        const ux = dx / len;
-        const uz = dz / len;
-        const inliers = pool.filter((p) =>
-          Math.abs((p.x - p1.x) * uz - (p.z - p1.z) * ux) <= WALL_INLIER_M);
-        if (!best || inliers.length > best.length) best = inliers;
+        if (len < WALL_MIN_LEN_M / 2 || len > WALL_PAIR_MAX_M) continue;
+        const r = bestRun(runsAlong(pool, p1.x, p1.z, dx / len, dz / len));
+        if (r && runScore(r) > runScore(best || [])) best = r;
       }
-      if (!best || best.length < WALL_MIN_COLS) break;
+      if (!best) break;
 
-      // Total-least-squares refit of the winning line: principal direction
-      // of the inlier scatter.
-      const mx = best.reduce((a, p) => a + p.x, 0) / best.length;
-      const mz = best.reduce((a, p) => a + p.z, 0) / best.length;
+      // Total-least-squares refit over the winning run only, then re-collect
+      // along the refined line: the seed pair sets the direction from two
+      // noisy columns, and every column of the run has a say in correcting it.
+      const mx = best.reduce((a, e) => a + e.p.x, 0) / best.length;
+      const mz = best.reduce((a, e) => a + e.p.z, 0) / best.length;
       let sxx = 0;
       let szz = 0;
       let sxz = 0;
-      for (const p of best) {
-        sxx += (p.x - mx) ** 2;
-        szz += (p.z - mz) ** 2;
-        sxz += (p.x - mx) * (p.z - mz);
+      for (const e of best) {
+        sxx += (e.p.x - mx) ** 2;
+        szz += (e.p.z - mz) ** 2;
+        sxz += (e.p.x - mx) * (e.p.z - mz);
       }
       const theta = 0.5 * Math.atan2(2 * sxz, sxx - szz);
       const ux = Math.cos(theta);
       const uz = Math.sin(theta);
+      const refined = bestRun(runsAlong(pool, mx, mz, ux, uz)) || best;
 
-      // Split along the line at gaps — one physical wall per run.
-      const seq = best
-        .map((p) => ({ p, t: (p.x - mx) * ux + (p.z - mz) * uz }))
-        .sort((a, b) => a.t - b.t);
-      const runs = [[]];
-      for (const e of seq) {
-        const run = runs[runs.length - 1];
-        if (run.length && e.t - run[run.length - 1].t > WALL_GAP_M) runs.push([e]);
-        else run.push(e);
-      }
-      const rnd = (v) => Math.round(v * 100) / 100;
-      for (const r of runs) {
-        if (r.length < WALL_MIN_COLS) continue;
-        const t0 = r[0].t;
-        const t1 = r[r.length - 1].t;
-        if (t1 - t0 < WALL_MIN_LEN_M) continue;
+      const t0 = refined[0].t;
+      const t1 = refined[refined.length - 1].t;
+      if (runScore(refined)) {
         // Percentile ends vertically: one noisy column must not stretch the
         // wall to its own height.
-        const y0s = r.map((e) => e.p.y0).sort((a, b) => a - b);
-        const y1s = r.map((e) => e.p.y1).sort((a, b) => a - b);
+        const y0s = refined.map((e) => e.p.y0).sort((a, b) => a - b);
+        const y1s = refined.map((e) => e.p.y1).sort((a, b) => a - b);
         out.push({
           a: [rnd(mx + ux * t0), rnd(mz + uz * t0)],
           b: [rnd(mx + ux * t1), rnd(mz + uz * t1)],
           y0: rnd(y0s[Math.floor(y0s.length * 0.2)]),
           y1: rnd(y1s[Math.floor(y1s.length * 0.8)]),
-          cols: r.length,
+          cols: refined.length,
         });
       }
-      // Everything on the line leaves the pool, kept run or not — a
-      // too-short run must not be refound forever.
-      const used = new Set(best);
-      pool = pool.filter((p) => !used.has(p));
+      // The accepted segment's slab leaves the pool — its own columns plus the
+      // layers smeared either side of it, which would otherwise come back as a
+      // parallel wall a few centimetres away. Only within the segment's own
+      // extent, though: the old pass dropped everything on the infinite line
+      // and shredded whatever walls crossed it. Progress is guaranteed, since
+      // the run's own columns are always inside the slab.
+      pool = pool.filter((p) => {
+        const t = (p.x - mx) * ux + (p.z - mz) * uz;
+        const d = Math.abs((p.x - mx) * uz - (p.z - mz) * ux);
+        return !(d <= WALL_SLAB_M && t >= t0 - WALL_GAP_M && t <= t1 + WALL_GAP_M);
+      });
     }
-    return out;
+    return mergeWallSegments(segments.concat(out));
   }
 
   let rejectCount = 0;
 
+  // A thin survey is the failure that looks like a depth failure. With one
+  // tag in the map every keyframe is posed by a single planar PnP — mirror
+  // ambiguity, no second tag to check it against, and the whole cloud swings
+  // with that tag's angular error. A single tag also cannot observe the depth
+  // model's shift, so its calibration is stuck on a bare scale correction.
+  // The map is never better than the survey under it; say so.
+  const MIN_HEALTHY_MARKERS = 3;
+  const SPARSE_WARN_MS = 60000;
+  let lastSparseWarn = 0;
+
+  function warnSparseSurvey() {
+    const n = survey.getMarkerMap().markers.length;
+    if (n >= MIN_HEALTHY_MARKERS) return;
+    const now = Date.now();
+    if (now - lastSparseWarn < SPARSE_WARN_MS) return;
+    lastSparseWarn = now;
+    log(`Mapping: the marker map has ${n} tag${n === 1 ? '' : 's'}. Poses and depth ` +
+      'scale are both unchecked below three — put up more printed tags, on ' +
+      'more than one wall, and let the survey promote them.');
+  }
+
+  // Same throttle, different failure: the camera has never been swept, so
+  // there is no honest way to turn its depth map into metres.
+  const UNCALIBRATED_WARN_MS = 30000;
+  const lastUncalWarn = new Map();
+
+  let mirrorDrops = 0;
+
+  function warnMirror(clientId, jump) {
+    if (++mirrorDrops % 10 === 1) {
+      log(`Mapping: keyframe from client ${clientId} refused — its tag fix is ` +
+        `${jump.toFixed(2)} m from the live track (mirrored PnP solution). ` +
+        `${mirrorDrops} total.`);
+    }
+  }
+
+  function warnUncalibrated(key) {
+    const now = Date.now();
+    if (now - (lastUncalWarn.get(key) || 0) < UNCALIBRATED_WARN_MS) return;
+    lastUncalWarn.set(key, now);
+    log(`Mapping: no depth calibration for ${key} — keyframes ignored. ` +
+      'Open /depth-calibrate on that device and sweep a tag from near to far.');
+  }
+
   function onWorkerDone(res) {
     busy = false;
+    const job = inFlight;
+    inFlight = null;
     if (res.error) {
       log(`Depth inference failed: ${res.error}`);
+    } else if (res.sampled) {
+      // Calibration sweep: the frame's only product is its tag samples.
+      depthCal.addSamples(job.key, res.samples);
+      onCalState?.(job.clientId, job.deviceId);
     } else if (res.rejected) {
-      // Refusing a keyframe we cannot scale honestly beats painting garbage;
+      // Refusing a keyframe we cannot place honestly beats painting garbage;
       // logged sparsely so a systematic problem is visible without spam.
       if (++rejectCount % 10 === 1) {
-        log(`Mapping: keyframe rejected (${res.rejected}) — ${rejectCount} total. ` +
-          'Two tags at clearly different distances in one view teach the scale.');
+        log(`Mapping: keyframe rejected (${res.rejected}) — ${rejectCount} total.`);
       }
     } else {
-      if (res.shift !== null) {
-        const prev = shiftByClient.get(res.clientId);
-        shiftByClient.set(res.clientId, prev === undefined ? res.shift : prev * 0.8 + res.shift * 0.2);
-      }
-      for (const key of res.voxels) hits.set(key, (hits.get(key) || 0) + 1);
-      const empties = res.empties || [];
-      for (const key of empties) misses.set(key, (misses.get(key) || 0) + 1);
-
-      // Re-evaluate every voxel this keyframe touched, in either direction —
-      // hits can promote, accumulated see-throughs can dismiss.
-      let changed = 0;
-      const evaluate = (key) => {
-        const h = hits.get(key) || 0;
-        const m = misses.get(key) || 0;
-        const occ = h >= OCCUPIED_AT_HITS && m <= h * MISS_TOLERANCE;
-        if (occ && !occupied.has(key)) {
-          occupied.add(key);
-          deltaAdded.push(key);
-          changed++;
-        } else if (!occ && occupied.has(key)) {
-          occupied.delete(key);
-          deltaRemoved.push(key);
-          changed++;
-        }
-      };
-      for (const key of res.voxels) evaluate(key);
-      for (const key of empties) evaluate(key);
-
-      recent.push({ voxels: res.voxels });
-      if (recent.length > RECENT_CAP) recent.shift();
-      inferCount++;
-      if (changed) {
-        scheduleFlush();
-        scheduleWalls();
-      }
-      if (viewMode !== 'all') onSnapshot?.(snapshotParts());
+      const changed = integrate(res.clientId, res);
+      const fp = floorplan.stats();
+      // The tag residual is the calibration's report card in live use: it
+      // should sit near the residual the sweep froze at.
       log(`Mapping: client ${res.clientId} keyframe #${inferCount} -> ` +
-        `${res.voxels.length} hits, ${changed} changed, ${occupied.size} occupied`);
+        `${res.voxels.length} hits, ${changed} changed, ${occupied.size} occupied, ` +
+        `tags off ${(res.residual * 100).toFixed(0)}%, ` +
+        `kept ${Math.round(100 * res.kept / Math.max(1, res.considered))}% ` +
+        `(edges ${Math.round(100 * res.keptEdge / Math.max(1, res.considered))}%), ` +
+        `plan ${fp.cells} cells, floor ${fp.floorY} m`);
     }
     // Serve whichever client has the freshest waiting keyframe.
     const next = pending.entries().next().value;
@@ -272,8 +395,53 @@ function createMapping({ modelPath, metric, survey, log, onDelta, onSnapshot, on
     }
   }
 
+  // Fold one frame's surfaces into the map, whatever produced them: the depth
+  // model's keyframes and an XR client's ARCore depth arrive here identically.
+  function integrate(clientId, res) {
+    let changed = 0;
+    const bump = (key, delta) => {
+      const l = Math.min(L_MAX, Math.max(L_MIN, (logOdds.get(key) || 0) + delta));
+      const was = occupied.has(key);
+      // Hysteresis band: outside it the state follows the evidence, inside it
+      // the cell keeps whatever it already was.
+      if (!was && l >= L_OCCUPY) {
+        occupied.add(key);
+        deltaAdded.push(key);
+        changed++;
+      } else if (was && l < L_RELEASE) {
+        occupied.delete(key);
+        deltaRemoved.push(key);
+        changed++;
+      }
+      if (l <= FORGET_BELOW && !occupied.has(key)) {
+        logOdds.delete(key);
+        seenFrom.delete(key);
+      }
+      else logOdds.set(key, l);
+    };
+    floorplan.addPoints(res.surf, res.viewpoint);
+    for (const key of res.voxels) {
+      const fresh = seenFrom.get(key) !== res.viewpoint;
+      seenFrom.set(key, res.viewpoint);
+      bump(key, fresh ? L_HIT : L_HIT_REPEAT);
+    }
+    for (const key of res.dilated || []) bump(key, L_NEAR);
+    for (const key of res.empties || []) bump(key, L_MISS);
+
+    recent.push({ voxels: res.voxels });
+    if (recent.length > RECENT_CAP) recent.shift();
+    inferCount++;
+    if (changed) scheduleFlush();
+    // Walls follow the evidence, which every accepted frame adds to — even one
+    // that changed no voxel at all.
+    scheduleWalls();
+    if (viewMode !== 'all') onSnapshot?.(snapshotParts());
+    return changed;
+  }
+
   function dispatch(job) {
     busy = true;
+    inFlight = job;
     worker.postMessage(job, [job.jpeg.buffer]);
   }
 
@@ -281,13 +449,39 @@ function createMapping({ modelPath, metric, survey, log, onDelta, onSnapshot, on
     enabled,
 
     // A KFR1 keyframe from a client. header: { t, w, h, intrinsics, tags }.
-    handleKeyframe(clientId, header, jpegBuf) {
-      if (!enabled || viewMode === 'none') return;
-      const { pose } = survey.locate(header.tags);
-      if (!pose) return;   // not localizable — depth would land nowhere
+    handleKeyframe(clientId, deviceId, header, jpegBuf) {
+      if (!enabled) return;
+      const key = depthCal.keyFor(deviceId, header.w, header.h);
+      depthCal.noteKey(deviceId, key);
+      const sweeping = depthCal.isCalibrating(deviceId);
+      if (!sweeping && viewMode === 'none') return;
+      // The sweep needs the depth model and the tags, nothing else: no room
+      // pose, no map, and it runs whether or not the viewer is watching.
+      const fit = sweeping ? null : depthCal.frozen(key);
+      let pose = null;
+      if (!sweeping) {
+        if (!fit) {
+          warnUncalibrated(key);
+          return;                // refusing beats inventing a scale per frame
+        }
+        warnSparseSurvey();
+        const fix = survey.locate(header.tags, clientId);
+        pose = fix.pose;
+        if (!pose) {
+          // A fix the client's own live track disagrees with is usually the
+          // mirrored PnP solution, and painting it puts the frame's whole
+          // cloud on the far side of the wall it was looking at.
+          if (fix.jump !== undefined) warnMirror(clientId, fix.jump);
+          return;
+        }
+      }
       const job = {
         id: nextId++,
         clientId,
+        deviceId,
+        key,
+        mode: sweeping ? 'sample' : 'map',
+        fit,
         jpeg: jpegBuf,
         w: header.w,
         h: header.h,
@@ -295,10 +489,40 @@ function createMapping({ modelPath, metric, survey, log, onDelta, onSnapshot, on
         pose,
         tags: header.tags,
         voxelSizeM: VOXEL_SIZE_M,
-        priorShift: shiftByClient.get(clientId) ?? null,
       };
       if (busy) pending.set(clientId, job);   // newer frame replaces older
       else dispatch(job);
+    },
+
+    // A depth frame from an XR client: ARCore's own depth, already unprojected
+    // to camera-frame points, so none of the model, the calibration or the
+    // upright rotation applies. Everything downstream of the points is shared
+    // with the model path.
+    handleXrFrame(clientId, header, points) {
+      if (!enabled && !onWalls) return;
+      const pose = survey.xrPoseOf(clientId, header.xr);
+      if (!pose) return;              // not aligned to the room yet
+      const { gw, gh } = header;
+      const n = gw * gh;
+      const cx = new Float32Array(n);
+      const cy = new Float32Array(n);
+      const cz = new Float32Array(n);
+      const ok = new Uint8Array(n);
+      for (let i = 0; i < n; i++) {
+        const x = points[i * 3];
+        if (Number.isNaN(x)) continue;
+        cx[i] = x;
+        cy[i] = points[i * 3 + 1];
+        cz[i] = points[i * 3 + 2];
+        ok[i] = 1;
+      }
+      const res = integrateGrid({ cx, cy, cz, ok, gw, gh, pose, voxelSizeM: VOXEL_SIZE_M });
+      const changed = integrate(clientId, res);
+      const fp = floorplan.stats();
+      log(`Mapping: client ${clientId} XR depth #${inferCount} -> ` +
+        `${res.voxels.length} hits, ${changed} changed, ${occupied.size} occupied, ` +
+        `kept ${Math.round(100 * res.kept / Math.max(1, res.considered))}%, ` +
+        `plan ${fp.cells} cells, floor ${fp.floorY} m`);
     },
 
     snapshotParts,
@@ -324,9 +548,10 @@ function createMapping({ modelPath, metric, survey, log, onDelta, onSnapshot, on
     // Drop the whole voxel map (keeps per-client depth-shift estimates —
     // those describe the clients, not the room).
     clear() {
-      hits.clear();
-      misses.clear();
+      logOdds.clear();
+      seenFrom.clear();
       occupied.clear();
+      floorplan.clear();
       recent.length = 0;
       deltaAdded = [];
       deltaRemoved = [];
@@ -370,4 +595,4 @@ function createMapping({ modelPath, metric, survey, log, onDelta, onSnapshot, on
   }
 }
 
-module.exports = { createMapping };
+module.exports = { createMapping, mergeWallSegments };
