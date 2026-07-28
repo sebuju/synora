@@ -9,6 +9,7 @@ const { WebSocketServer } = require('ws');
 const qrcode = require('qrcode-terminal');
 const { createSurvey } = require('./survey.js');
 const { createMapping } = require('./mapping.js');
+const { createDepthCal } = require('./depth-cal.js');
 
 const PORT = Number(process.env.PORT) || 8443;
 const CERT_DIR = path.join(__dirname, 'certs');
@@ -27,6 +28,7 @@ const DEPTH_MODEL = path.join(MODELS_DIR, 'depth.onnx');
 // suffices to calibrate each keyframe's depth.
 const DEPTH_MODEL_METRIC = path.join(MODELS_DIR, 'depth-metric.onnx');
 const MARKER_MAP_FILE = path.join(__dirname, 'markers.json');
+const DEPTH_CAL_FILE = path.join(__dirname, 'depth-calibration.json');
 const LOG_FILE = path.join(__dirname, 'server.log');
 // Physical marker edge length in meters — must match the printed size from
 // /markers, or every distance in the room frame scales by the same error.
@@ -139,6 +141,9 @@ function serveStatic(req, res) {
   if (urlPath === '/viewer' || urlPath === '/dashboard') urlPath = '/viewer.html';
   if (urlPath === '/calibrate') urlPath = '/calibrate.html';
   if (urlPath === '/markers') urlPath = '/markers.html';
+  if (urlPath === '/depth-calibrate') urlPath = '/depth-calibrate.html';
+  if (urlPath === '/xr-probe') urlPath = '/xr-probe.html';
+  if (urlPath === '/xr-client') urlPath = '/xr-client.html';
   if (urlPath === '/digital') urlPath = '/digital.html';
 
   const filePath = path.join(PUBLIC_DIR, path.normalize(urlPath));
@@ -265,17 +270,53 @@ const survey = createSurvey({
   log,
 });
 
+// The depth model's scale and shift for one camera at one keyframe size —
+// measured by a deliberate sweep on /depth-calibrate, then frozen.
+const depthCal = createDepthCal({
+  file: DEPTH_CAL_FILE,
+  metric: fs.existsSync(DEPTH_MODEL_METRIC),
+  log,
+  fmtDateTime,
+});
+
 // Room mapping: posed keyframes -> depth inference -> voxel grid, streamed to
-// the viewer as deltas. Enabled only when the depth model is present.
+// the viewer as deltas. Needs the depth model present *and* the keyframe's
+// camera calibrated — an uncalibrated camera's frames are refused, not guessed.
 const mapping = createMapping({
   modelPath: fs.existsSync(DEPTH_MODEL_METRIC) ? DEPTH_MODEL_METRIC : DEPTH_MODEL,
   metric: fs.existsSync(DEPTH_MODEL_METRIC),
   survey,
+  depthCal,
   log,
+  onCalState: (clientId, deviceId) => sendCalState(clientId, deviceId),
   onDelta: (delta) => send(viewerSocket, { type: 'map-delta', ...delta }),
   onSnapshot: (parts) => parts.forEach((p) => send(viewerSocket, p)),
   onWalls: (walls) => send(viewerSocket, { type: 'walls', walls }),
 });
+
+// A depth frame from an XR client: 'XRD1' magic, uint32 LE header length, JSON
+// header, then a Float32Array of camera-frame points (NaN where ARCore had no
+// depth). No depth model and no calibration involved — ARCore measured these.
+function tryXrFrame(ws, data) {
+  if (data.length < 9 || data[0] !== 0x58 || data[1] !== 0x52 ||
+    data[2] !== 0x44 || data[3] !== 0x31) return false;
+  const headerLen = data.readUInt32LE(4);
+  if (headerLen <= 0 || 8 + headerLen > data.length) return false;
+  let header;
+  try {
+    header = JSON.parse(data.subarray(8, 8 + headerLen).toString('utf8'));
+  } catch {
+    return false;
+  }
+  if (!header.xr || !header.gw || !header.gh) return false;
+  const body = data.subarray(8 + headerLen);
+  // Copy through a fresh buffer: the socket's memory is not aligned for a
+  // Float32Array view and is reused for the next message.
+  const pts = new Float32Array(header.gw * header.gh * 3);
+  Buffer.from(pts.buffer).set(body.subarray(0, pts.byteLength));
+  mapping.handleXrFrame(ws.clientId, header, pts);
+  return true;
+}
 
 // A keyframe binary frame: 'KFR1' magic, uint32 LE header length, JSON
 // header, JPEG. Returns true if the frame was consumed as a keyframe. A
@@ -295,8 +336,16 @@ function tryKeyframe(ws, data) {
   if (!header.intrinsics || !Array.isArray(header.tags)) return false;
   // Copy the JPEG out: the worker takes ownership of the buffer it gets, and
   // a subarray would hand it the whole socket message's memory.
-  mapping.handleKeyframe(ws.clientId, header, Buffer.from(data.subarray(8 + headerLen)));
+  mapping.handleKeyframe(
+    ws.clientId, ws.deviceId, header, Buffer.from(data.subarray(8 + headerLen)));
   return true;
+}
+
+// Calibration state goes to the device doing the sweeping — it is holding the
+// page, and the numbers are only meaningful next to the tag it is pointing at.
+function sendCalState(clientId, deviceId) {
+  const sock = clients.get(clientId);
+  if (sock) send(sock, depthCal.state(deviceId));
 }
 
 // ---------------------------------------------------------------------------
@@ -390,11 +439,26 @@ function clientIdFor(deviceId) {
   return clientIdsByDevice.get(deviceId);
 }
 
+// A device sweeping its depth calibration needs keyframes regardless of what
+// the dashboard's map view is set to — the sweep is the one thing that makes
+// the map possible in the first place.
+function keyframeMsFor(ws) {
+  if (depthCal.isCalibrating(ws.deviceId)) return POSE_CONFIG.keyframeMs;
+  return mapping.isActive() ? POSE_CONFIG.keyframeMs : 0;
+}
+
 function handleSignal(ws, msg) {
   if (msg.type === 'role') {
     if (msg.role === 'client') {
       ws.role = 'client';
       ws.clientId = clientIdFor(msg.deviceId);
+      // Kept as well as the clientId: depth calibration is a property of the
+      // physical camera, so it outlives the session-scoped small integer.
+      ws.deviceId = msg.deviceId;
+      // A plain client connection ends any sweep this device left running:
+      // the calibration page re-announces itself on every (re)connect, so
+      // whatever survives this is genuinely still sweeping.
+      depthCal.stop(msg.deviceId);
       // A reload can land the new socket before the old one's close fires, so
       // retire whatever socket still holds the id — only one owns it.
       const prev = clients.get(ws.clientId);
@@ -412,7 +476,7 @@ function handleSignal(ws, msg) {
       send(ws, {
         type: 'pose-config',
         ...POSE_CONFIG,
-        keyframeMs: mapping.isActive() ? POSE_CONFIG.keyframeMs : 0,
+        keyframeMs: keyframeMsFor(ws),
       });
       if (viewerSocket) send(ws, { type: 'viewer-ready' });
     } else if (msg.role === 'client-bulk') {
@@ -422,6 +486,7 @@ function handleSignal(ws, msg) {
       // stays on the main socket.
       ws.role = 'client-bulk';
       ws.clientId = clientIdFor(msg.deviceId);
+      ws.deviceId = msg.deviceId;
     } else if (msg.role === 'viewer') {
       if (viewerSocket && viewerSocket !== ws) viewerSocket.close();
       viewerSocket = ws;
@@ -485,8 +550,35 @@ function handleSignal(ws, msg) {
       mapping.setViewMode(msg.mode).forEach((p) => send(ws, p));
       // Keyframes are pure waste while mapping is off — tell the clients.
       for (const client of clients.values()) {
-        send(client, { type: 'pose-config', keyframeMs: mapping.isActive() ? POSE_CONFIG.keyframeMs : 0 });
+        send(client, { type: 'pose-config', keyframeMs: keyframeMsFor(client) });
       }
+    }
+    return;
+  }
+  if (msg.type === 'depth-cal') {
+    if (ws.role === 'client') {
+      if (msg.action === 'start') depthCal.start(ws.deviceId);
+      else if (msg.action === 'stop') depthCal.stop(ws.deviceId);
+      else if (msg.action === 'clear') depthCal.clear(ws.deviceId);
+      else if (msg.action === 'unfreeze') depthCal.unfreeze(ws.deviceId);
+      else if (msg.action === 'freeze') {
+        const res = depthCal.freeze(ws.deviceId);
+        if (!res.ok) send(ws, { type: 'depth-cal-error', reason: res.reason });
+      }
+      // Starting or stopping changes whether this device owes us keyframes.
+      send(ws, { type: 'pose-config', keyframeMs: keyframeMsFor(ws) });
+      send(ws, depthCal.state(ws.deviceId));
+    }
+    return;
+  }
+  if (msg.type === 'xr-pose') {
+    if (ws.role === 'client') {
+      // ARCore already knows where the camera is; the tags only say where the
+      // room is relative to ARCore's frame.
+      const { pose, quality, mapChanged } = survey.alignXr(ws.clientId, msg.xr, msg.tags || []);
+      send(viewerSocket, { ...msg, type: 'pose', clientId: ws.clientId, room: { pose, quality } });
+      send(ws, { type: 'room-pose', pose, quality });
+      if (mapChanged) send(viewerSocket, { type: 'marker-map', ...survey.getMarkerMap() });
     }
     return;
   }
@@ -530,6 +622,7 @@ function main() {
   detectVcam();
   probeAssets();
   survey.load();
+  depthCal.load();
   const tls = loadOrCreateCert();
   const server = https.createServer(tls, serveStatic);
   const wss = new WebSocketServer({ server });
@@ -541,6 +634,7 @@ function main() {
         // Keyframes must be picked off before the recording sink — they are
         // not WebM data, and they arrive whether or not a recording is open.
         if (tryKeyframe(ws, data)) return;
+        if (tryXrFrame(ws, data)) return;
         // Recording state lives on the client's main socket, wherever the
         // bytes arrive.
         const main = ws.role === 'client' ? ws : clients.get(ws.clientId);
