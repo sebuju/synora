@@ -38,10 +38,11 @@ function loadClientId(role) {
 }
 
 // Opens the signaling WebSocket, announces our role, auto-reconnects.
-// handlers: { onMessage(msg), onOpen(), onClose() } — all optional.
+// handlers: { onMessage(msg), onOpen(), onClose(), onPong(msg) } — optional.
+// clientId can be passed so a page's secondary socket (bulk uploads) presents
+// the same identity as its primary one.
 // Returns { send(obj), sendBinary(blob), close() }.
-function connectSignaling(role, handlers = {}) {
-  const clientId = loadClientId(role);
+function connectSignaling(role, handlers = {}, clientId = loadClientId(role)) {
   let ws = null;
   let closedByUs = false;
   let reconnectTimer = null;
@@ -73,7 +74,12 @@ function connectSignaling(role, handlers = {}) {
       } catch {
         return;
       }
-      if (msg.type === 'pong') return;
+      if (msg.type === 'pong') {
+        // Pongs are liveness plumbing, but they piggyback server state some
+        // pages care about — hand them to a separate hook.
+        handlers.onPong?.(msg);
+        return;
+      }
       handlers.onMessage?.(msg);
     };
     sock.onclose = () => {
@@ -118,6 +124,12 @@ function connectSignaling(role, handlers = {}) {
     sendBinary(blob) {
       if (ws?.readyState === WebSocket.OPEN) ws.send(blob);
     },
+    // Unsent bytes sitting in the socket. Senders of bulky, droppable data
+    // (keyframes) must check this — everything shares one socket, and small
+    // time-critical messages queue behind whatever was sent before them.
+    get bufferedAmount() {
+      return ws?.readyState === WebSocket.OPEN ? ws.bufferedAmount : 0;
+    },
     close() {
       closedByUs = true;
       ws?.close();
@@ -133,39 +145,129 @@ function setStatus(text) {
 // Clock sync. Phones and the dashboard run on independent clocks, so frames
 // can only be aligned against a shared reference: the server's clock. Probes
 // are NTP-style — the sample with the lowest round trip carries the least
-// uncertainty, so that one wins.
+// uncertainty — but a single such sample is not enough to hold a session
+// together: these clocks drift tens of ppm against the server, so an offset
+// measured at startup is tens of milliseconds stale a few minutes later, and
+// two phones drifting opposite ways pull their feeds that far apart. Samples
+// are kept in a sliding window instead; the low-RTT ones are fitted with a
+// line, and its slope is the drift.
+const CLOCK_BURST = 8;                 // probes on start and on becoming visible
+const CLOCK_BURST_SPACING_MS = 150;
+const CLOCK_PROBE_INTERVAL_MS = 2000;
+const CLOCK_WINDOW_MS = 120000;
+const CLOCK_RTT_TOLERANCE = 1.5;       // fit only samples this close to the best RTT
+const CLOCK_FIT_MIN_SAMPLES = 4;
+const CLOCK_FIT_MIN_SPAN_MS = 20000;   // a slope measured over less is noise
+const CLOCK_MAX_SKEW_PPM = 300;        // steeper than any real crystal
+const CLOCK_STEP_MS = 250;             // a jump no round trip could explain
+
 function createClockSync(signaling) {
-  let offset = 0;          // add to local Date.now() to get server time
+  // performance.now() is monotonic; Date.now() is not. Android resyncs its
+  // wall clock on its own schedule, and a step there would silently move every
+  // capture instant this device has already published.
+  const localNow = () => performance.now();
+  const samples = [];      // { t, offset, rtt }, all on the local clock
+  let anchor = 0;          // local time the fit is expressed around
+  let base = 0;            // offset at `anchor`
+  let skew = 0;            // offset gained per ms of local time
   let bestRtt = Infinity;
+  let stepStreak = 0;
   let synced = false;
   let timer = null;
+  let visibilityHooked = false;
+
+  function offsetAt(t) {
+    return base + skew * (t - anchor);
+  }
+
+  function refit() {
+    const cutoff = localNow() - CLOCK_WINDOW_MS;
+    while (samples.length && samples[0].t < cutoff) samples.shift();
+    if (!samples.length) {
+      synced = false;
+      return;
+    }
+    // What makes a sample wrong is asymmetry between the two directions, and
+    // that can never exceed the round trip itself — so the quickest exchanges
+    // are the only ones worth fitting.
+    bestRtt = Math.min(...samples.map((s) => s.rtt));
+    const good = samples.filter((s) => s.rtt <= bestRtt * CLOCK_RTT_TOLERANCE + 1);
+    const span = good[good.length - 1].t - good[0].t;
+
+    if (good.length >= CLOCK_FIT_MIN_SAMPLES && span >= CLOCK_FIT_MIN_SPAN_MS) {
+      // Least squares over the window. Anchoring on the newest sample keeps
+      // the extrapolation to `now` short, so drift error stays small.
+      anchor = good[good.length - 1].t;
+      let sx = 0, sy = 0, sxx = 0, sxy = 0;
+      for (const s of good) {
+        const x = s.t - anchor;
+        sx += x; sy += s.offset; sxx += x * x; sxy += x * s.offset;
+      }
+      const n = good.length;
+      const denom = n * sxx - sx * sx;
+      const cap = CLOCK_MAX_SKEW_PPM / 1e6;
+      skew = denom > 0 ? Math.max(-cap, Math.min(cap, (n * sxy - sx * sy) / denom)) : 0;
+      base = (sy - skew * sx) / n;
+    } else {
+      // Too little history to tell drift from noise — trust the quickest
+      // exchange on its own, as before.
+      const best = good.reduce((a, s) => (s.rtt < a.rtt ? s : a));
+      anchor = best.t;
+      base = best.offset;
+      skew = 0;
+    }
+    synced = true;
+  }
 
   function probe() {
-    signaling.send({ type: 'time-ping', t0: Date.now() });
+    signaling.send({ type: 'time-ping', t0: localNow() });
+  }
+
+  function burst() {
+    for (let i = 0; i < CLOCK_BURST; i++) setTimeout(probe, i * CLOCK_BURST_SPACING_MS);
   }
 
   return {
     // Feed every incoming message here; returns true if it was a clock reply.
     handle(msg) {
       if (msg.type !== 'time-pong') return false;
-      const t1 = Date.now();
-      const rtt = t1 - msg.t0;
-      if (rtt <= bestRtt) {
-        bestRtt = rtt;
-        offset = msg.tServer + rtt / 2 - t1;
-        synced = true;
+      const t = localNow();
+      const rtt = t - msg.t0;
+      // The server wrote its reply somewhere inside the round trip; the
+      // midpoint is the best guess and is wrong by at most half the trip.
+      const offset = msg.tServer + rtt / 2 - t;
+      if (synced && Math.abs(offset - offsetAt(t)) > Math.max(CLOCK_STEP_MS, rtt)) {
+        // A server restart, or the device suspending (which stops the
+        // monotonic clock but not the world), makes every earlier sample a
+        // lie. One wild sample is more likely a reply that sat in a queue, so
+        // only a run of them throws the history away.
+        if (++stepStreak < 3) return true;
+        samples.length = 0;
+        stepStreak = 0;
+      } else {
+        stepStreak = 0;
       }
+      samples.push({ t, offset, rtt });
+      refit();
       return true;
     },
-    // Safe to call again after a reconnect: the drift timer is only armed once.
+    // Safe to call again after a reconnect: the timer and the visibility hook
+    // are only armed once.
     start() {
-      // A short burst first (converges quickly), then occasional re-probes to
-      // track drift.
-      for (let i = 0; i < 5; i++) setTimeout(probe, i * 200);
-      if (!timer) timer = setInterval(probe, 10000);
+      burst();
+      if (!timer) timer = setInterval(probe, CLOCK_PROBE_INTERVAL_MS);
+      if (!visibilityHooked) {
+        visibilityHooked = true;
+        // Timers are throttled while hidden, so the window comes back stale —
+        // and on a device that suspended, wrong. Re-measure immediately.
+        document.addEventListener('visibilitychange', () => {
+          if (document.visibilityState === 'visible') burst();
+        });
+      }
     },
     now() {
-      return Date.now() + offset;
+      const t = localNow();
+      return t + offsetAt(t);
     },
     get synced() {
       return synced;
