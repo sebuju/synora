@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Camera Calibration</title>
+  <link rel="stylesheet" href="/style.css">
+  <style>
+    main { flex-direction: column; gap: 10px; padding: 10px; overflow-y: auto; justify-content: flex-start; }
+    #videoWrap { position: relative; max-width: 100%; }
+    #videoWrap video { display: block; max-width: 100%; max-height: 55vh; }
+    #overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+    #panel {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      flex-wrap: wrap;
+      font-size: 14px;
+    }
+    #coverage {
+      display: grid;
+      grid-template-columns: repeat(3, 14px);
+      grid-template-rows: repeat(3, 14px);
+      gap: 2px;
+    }
+    #coverage div { background: #333; border-radius: 2px; }
+    #coverage div.hit { background: #2e8b47; }
+    #result { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; color: #9a9a9a; white-space: pre-line; }
+    /* Printable ChArUco board: hidden on screen, alone on paper. CSS mm are
+       true millimeters at 100% print scale. */
+    #boardPrint { display: none; }
+    /* "Show board" mode: the board on this screen, for a phone to film when
+       there is no printer. Board scale cancels out of intrinsics, so the
+       on-screen size does not need calibrating. */
+    body.show-board #boardPrint {
+      display: flex;
+      position: fixed;
+      inset: 0;
+      z-index: 10;
+      background: #fff;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+    }
+    body.show-board #boardPrint canvas {
+      max-width: 96vw;
+      max-height: 96vh;
+      image-rendering: pixelated;
+    }
+    @media print {
+      body > * { display: none !important; }
+      #boardPrint { display: flex !important; align-items: center; justify-content: center; height: 100vh; background: #fff; }
+      #boardPrint canvas { width: 182mm; height: 260mm; image-rendering: pixelated; }
+    }
+    @page { size: A4 portrait; margin: 0; }
+  </style>
+</head>
+<body>
+  <header>
+    <a class="home" href="/" title="Back to start">Calibration</a>
+    <span id="status" class="grow">loading OpenCV…</span>
+    <select id="facingSelect">
+      <option value="environment" selected>back camera</option>
+      <option value="user">front camera</option>
+    </select>
+    <select id="calResSelect">
+      <option value="720p">720p</option>
+      <option value="1080p" selected>1080p</option>
+    </select>
+  </header>
+  <main>
+    <div id="videoWrap">
+      <video id="calVideo" autoplay playsinline muted></video>
+      <canvas id="overlay"></canvas>
+    </div>
+    <div id="panel">
+      <button id="captureBtn" disabled>Capture view</button>
+      <span id="viewCount">0 views</span>
+      <div id="coverage" title="image regions covered by captures"></div>
+      <button id="calibrateBtn" disabled>Calibrate</button>
+      <button id="saveBtn" disabled>Save</button>
+      <button id="clearBtn">Reset</button>
+      <button id="printBtn">Print board</button>
+      <button id="showBoardBtn">Show board</button>
+    </div>
+    <div id="result">Print the ChArUco board (Print board → 100% scale, A4) and fix it to something rigid and flat —
+or open this page on the PC, hit "Show board", and film the monitor with the phone.
+Note: the board is its own checkered pattern, not the room tags. Capture ~15 views: vary distance,
+tilt and position so every coverage cell lights up. Aim for RMS under 1 px.</div>
+  </main>
+  <div id="boardPrint"><canvas id="boardCanvas"></canvas></div>
+  <script src="/common.js"></script>
+  <script src="/cv-common.js"></script>
+  <script src="/calibrate.js"></script>
+</body>
+</html>
