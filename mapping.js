@@ -50,10 +50,10 @@ function createMapping({ modelPath, metric, survey, log, onDelta, onSnapshot, on
   let worker = null;
   let busy = false;
   let nextId = 1;
-  // One pending keyframe per phone: a slow inference drops stale frames
+  // One pending keyframe per client: a slow inference drops stale frames
   // rather than queueing them.
   const pending = new Map();
-  const shiftByPhone = new Map();  // per-phone EMA of the fitted depth shift
+  const shiftByClient = new Map();  // per-client EMA of the fitted depth shift
 
   const hits = new Map();          // packed key -> surface hit count
   const misses = new Map();        // packed key -> seen-through count
@@ -226,8 +226,8 @@ function createMapping({ modelPath, metric, survey, log, onDelta, onSnapshot, on
       }
     } else {
       if (res.shift !== null) {
-        const prev = shiftByPhone.get(res.phoneId);
-        shiftByPhone.set(res.phoneId, prev === undefined ? res.shift : prev * 0.8 + res.shift * 0.2);
+        const prev = shiftByClient.get(res.clientId);
+        shiftByClient.set(res.clientId, prev === undefined ? res.shift : prev * 0.8 + res.shift * 0.2);
       }
       for (const key of res.voxels) hits.set(key, (hits.get(key) || 0) + 1);
       const empties = res.empties || [];
@@ -261,10 +261,10 @@ function createMapping({ modelPath, metric, survey, log, onDelta, onSnapshot, on
         scheduleWalls();
       }
       if (viewMode !== 'all') onSnapshot?.(snapshotParts());
-      log(`Mapping: phone ${res.phoneId} keyframe #${inferCount} -> ` +
+      log(`Mapping: client ${res.clientId} keyframe #${inferCount} -> ` +
         `${res.voxels.length} hits, ${changed} changed, ${occupied.size} occupied`);
     }
-    // Serve whichever phone has the freshest waiting keyframe.
+    // Serve whichever client has the freshest waiting keyframe.
     const next = pending.entries().next().value;
     if (next) {
       pending.delete(next[0]);
@@ -280,14 +280,14 @@ function createMapping({ modelPath, metric, survey, log, onDelta, onSnapshot, on
   return {
     enabled,
 
-    // A KFR1 keyframe from a phone. header: { t, w, h, intrinsics, tags }.
-    handleKeyframe(phoneId, header, jpegBuf) {
+    // A KFR1 keyframe from a client. header: { t, w, h, intrinsics, tags }.
+    handleKeyframe(clientId, header, jpegBuf) {
       if (!enabled || viewMode === 'none') return;
       const { pose } = survey.locate(header.tags);
       if (!pose) return;   // not localizable — depth would land nowhere
       const job = {
         id: nextId++,
-        phoneId,
+        clientId,
         jpeg: jpegBuf,
         w: header.w,
         h: header.h,
@@ -295,9 +295,9 @@ function createMapping({ modelPath, metric, survey, log, onDelta, onSnapshot, on
         pose,
         tags: header.tags,
         voxelSizeM: VOXEL_SIZE_M,
-        priorShift: shiftByPhone.get(phoneId) ?? null,
+        priorShift: shiftByClient.get(clientId) ?? null,
       };
-      if (busy) pending.set(phoneId, job);   // newer frame replaces older
+      if (busy) pending.set(clientId, job);   // newer frame replaces older
       else dispatch(job);
     },
 
@@ -315,14 +315,14 @@ function createMapping({ modelPath, metric, survey, log, onDelta, onSnapshot, on
       return snapshotParts();
     },
 
-    // Mapping wants keyframes at all — lets the server tell phones to stop
-    // producing them (JPEG encode costs the phone real CPU every second).
+    // Mapping wants keyframes at all — lets the server tell clients to stop
+    // producing them (JPEG encode costs the client real CPU every second).
     isActive() {
       return enabled && viewMode !== 'none';
     },
 
-    // Drop the whole voxel map (keeps per-phone depth-shift estimates —
-    // those describe the phones, not the room).
+    // Drop the whole voxel map (keeps per-client depth-shift estimates —
+    // those describe the clients, not the room).
     clear() {
       hits.clear();
       misses.clear();

@@ -256,9 +256,9 @@ parentPort.on('message', (msg) => {
       if (res.empties?.buffer && res.empties.buffer !== res.voxels.buffer) {
         transfers.push(res.empties.buffer);
       }
-      parentPort.postMessage({ id: msg.id, phoneId: msg.phoneId, ...res }, transfers);
+      parentPort.postMessage({ id: msg.id, clientId: msg.clientId, ...res }, transfers);
     })
     .catch((err) => {
-      parentPort.postMessage({ id: msg.id, phoneId: msg.phoneId, error: err.message });
+      parentPort.postMessage({ id: msg.id, clientId: msg.clientId, error: err.message });
     });
 });

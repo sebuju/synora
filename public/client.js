@@ -2,14 +2,14 @@
 
 const preview = document.getElementById('preview');
 const feed = document.querySelector('main');
-const phoneLabel = document.getElementById('phoneLabel');
+const clientLabel = document.getElementById('clientLabel');
 const switchBtn = document.getElementById('switchBtn');
 const micBtn = document.getElementById('micBtn');
 const recBtn = document.getElementById('recBtn');
 const poseBtn = document.getElementById('poseBtn');
 const resSelect = document.getElementById('resSelect');
 
-// Constraints use `ideal`, so a phone that cannot do the asked size degrades
+// Constraints use `ideal`, so a client that cannot do the asked size degrades
 // to the closest it can rather than failing.
 const RESOLUTIONS = {
   '480p': { width: 854, height: 480 },
@@ -31,7 +31,7 @@ let cameraPending = null;
 let restarting = false;
 let restartQueued = false;
 
-const signaling = connectSignaling('phone', {
+const signaling = connectSignaling('client', {
   async onOpen() {
     wsOpen = true;
     setStatus('connected, waiting for viewer');
@@ -64,9 +64,9 @@ const signaling = connectSignaling('phone', {
   },
   async onMessage(msg) {
     if (clockSync.handle(msg)) return;
-    if (msg.type === 'phone-id') {
+    if (msg.type === 'client-id') {
       // Matches the name the server gives this device's recordings.
-      phoneLabel.textContent = `phone${msg.phoneId}`;
+      clientLabel.textContent = `client${msg.clientId}`;
     } else if (msg.type === 'viewer-ready') {
       viewerWaiting = true;
       await restartCall();
@@ -93,12 +93,12 @@ const clockSync = createClockSync(signaling);
 // Bulk uploads (recorder chunks, keyframes) get their own socket. They share
 // one TCP stream's ordering, but more importantly they no longer sit in front
 // of pose and signaling messages — half a megabyte of WebM per second queued
-// ahead of a pose message is exactly the lag it caused. Same clientId, so the
-// server maps both sockets to the same phone.
-const bulk = connectSignaling('phone-bulk', {}, loadClientId('phone'));
+// ahead of a pose message is exactly the lag it caused. Same deviceId, so the
+// server maps both sockets to the same client.
+const bulk = connectSignaling('client-bulk', {}, loadDeviceId('client'));
 
-// The server keeps a roster of connected phones; it only learns the settings a
-// phone chose for itself if the phone reports them, on connect and on change.
+// The server keeps a roster of connected clients; it only learns the settings a
+// client chose for itself if the client reports them, on connect and on change.
 function sendClientState() {
   signaling.send({
     type: 'client-state',
@@ -171,7 +171,7 @@ async function startCamera() {
 
 // Advertise the absolute-capture-time RTP header extension on the video
 // section. It carries each frame's capture instant on the sender's clock,
-// which is what lets the dashboard align feeds from different phones.
+// which is what lets the dashboard align feeds from different clients.
 function withAbsCaptureTime(sdp) {
   if (sdp.includes(ABS_CAPTURE_TIME_URI)) return sdp;
   // Within a BUNDLE group an extension id must mean the same thing in every
@@ -232,7 +232,7 @@ function frameTimingPublisher() {
     const now = clockSync.now();
     if (clockSync.synced && now - lastSent > RTP_MAP_PUBLISH_MS) {
       lastSent = now;
-      // Our own clock error biases this phone's feed alone, so the dashboard
+      // Our own clock error biases this client's feed alone, so the dashboard
       // cannot see it in the alignment it measures — send the bound along.
       signaling.send({
         type: 'rtp-map',
@@ -349,7 +349,7 @@ recBtn.onclick = async () => {
   }
   if (!(await ensureCamera())) return;
   startRecorder();
-  // Recording is invisible from the phone, so acknowledge the tap.
+  // Recording is invisible from the client, so acknowledge the tap.
   recBtn.classList.add('active');
   setTimeout(() => recBtn.classList.remove('active'), 400);
 };

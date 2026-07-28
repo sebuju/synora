@@ -5,11 +5,11 @@ const empty = document.getElementById('empty');
 const fullscreenBtn = document.getElementById('fullscreenBtn');
 const muteBtn = document.getElementById('muteBtn');
 
-// phoneId -> { pc, tile, video, label, camBtn }
+// clientId -> { pc, tile, video, label, camBtn }
 const devices = new Map();
 let soundOn = false;
 let vcamAvailable = false;
-let vcamPhoneId = null;
+let vcamClientId = null;
 // Room-frame marker map, as surveyed by the server. Null until it arrives.
 let markerMap = null;
 
@@ -25,7 +25,7 @@ const signaling = connectSignaling('viewer', {
   async onMessage(msg) {
     if (clockSync.handle(msg)) return;
     if (msg.type === 'rtp-map') {
-      const dev = devices.get(msg.phoneId);
+      const dev = devices.get(msg.clientId);
       if (dev) {
         updateRtpMap(dev, { rtp: msg.rtp, serverTime: msg.serverTime });
         if (msg.unc !== undefined) dev.clockUnc = msg.unc;
@@ -33,7 +33,7 @@ const signaling = connectSignaling('viewer', {
       return;
     }
     if (msg.type === 'pose') {
-      updatePoseLabel(msg.phoneId, msg);
+      updatePoseLabel(msg.clientId, msg);
       return;
     }
     if (msg.type === 'marker-map') {
@@ -64,19 +64,19 @@ const signaling = connectSignaling('viewer', {
       return;
     }
     if (msg.type === 'offer') {
-      await acceptOffer(msg.phoneId, msg.description);
+      await acceptOffer(msg.clientId, msg.description);
     } else if (msg.type === 'ice') {
-      const dev = devices.get(msg.phoneId);
+      const dev = devices.get(msg.clientId);
       try {
         await dev?.pc.addIceCandidate(msg.candidate);
       } catch {
         // Stale candidate from a previous connection — ignore.
       }
-    } else if (msg.type === 'phone-gone') {
-      removeDevice(msg.phoneId);
+    } else if (msg.type === 'client-gone') {
+      removeDevice(msg.clientId);
     } else if (msg.type === 'vcam-state') {
       if (msg.available !== undefined) vcamAvailable = msg.available;
-      vcamPhoneId = msg.phoneId;
+      vcamClientId = msg.clientId;
       for (const [id, d] of devices) updateCamBtn(id, d);
     }
   },
@@ -84,25 +84,25 @@ const signaling = connectSignaling('viewer', {
 
 const clockSync = createClockSync(signaling);
 
-function updateCamBtn(phoneId, dev) {
+function updateCamBtn(clientId, dev) {
   dev.camBtn.style.display = vcamAvailable ? '' : 'none';
-  dev.camBtn.textContent = phoneId === vcamPhoneId ? 'Webcam ✓' : 'Webcam';
-  dev.camBtn.classList.toggle('active', phoneId === vcamPhoneId);
+  dev.camBtn.textContent = clientId === vcamClientId ? 'Webcam ✓' : 'Webcam';
+  dev.camBtn.classList.toggle('active', clientId === vcamClientId);
 }
 
-// Camera-frame readout on the tile: which tags this phone sees and how far
-// the nearest one is. Goes stale quickly — a phone that stops reporting
+// Camera-frame readout on the tile: which tags this client sees and how far
+// the nearest one is. Goes stale quickly — a client that stops reporting
 // (disabled, backgrounded) must not keep showing a distance.
 const POSE_LABEL_TTL_MS = 2000;
 
-function updatePoseLabel(phoneId, msg) {
-  const dev = devices.get(phoneId);
+function updatePoseLabel(clientId, msg) {
+  const dev = devices.get(clientId);
   if (!dev) return;
   dev.lastPoseMsg = msg;
   dev.lastPoseAt = performance.now();
   if (msg.room?.pose) {
     const seen = msg.tags.map((t) => t.id);
-    roomViewList.forEach((v) => v.updatePhone(phoneId, msg.room.pose, seen));
+    roomViewList.forEach((v) => v.updateClient(clientId, msg.room.pose, seen));
   }
   clearTimeout(dev.poseLabelTimer);
   if (msg.tags.length) {
@@ -126,8 +126,8 @@ function updateStatus() {
   empty.style.display = n === 0 ? '' : 'none';
 }
 
-function ensureDevice(phoneId) {
-  let dev = devices.get(phoneId);
+function ensureDevice(clientId) {
+  let dev = devices.get(clientId);
   if (dev) return dev;
 
   const tile = document.createElement('div');
@@ -138,12 +138,12 @@ function ensureDevice(phoneId) {
   video.muted = !soundOn;
   const label = document.createElement('div');
   label.className = 'label';
-  label.textContent = `Phone ${phoneId}`;
+  label.textContent = `Client ${clientId}`;
   const camBtn = document.createElement('button');
   camBtn.className = 'cam-btn';
   camBtn.onclick = (ev) => {
     ev.stopPropagation();
-    signaling.send({ type: 'vcam', phoneId: phoneId === vcamPhoneId ? null : phoneId });
+    signaling.send({ type: 'vcam', clientId: clientId === vcamClientId ? null : clientId });
   };
   const poseLabel = document.createElement('div');
   poseLabel.className = 'pose-label';
@@ -162,28 +162,28 @@ function ensureDevice(phoneId) {
     rtpMap: null, rtpSamples: [], clockUnc: null,
     lastPoseMsg: null, poseLabelTimer: null,
   };
-  devices.set(phoneId, dev);
-  updateCamBtn(phoneId, dev);
+  devices.set(clientId, dev);
+  updateCamBtn(clientId, dev);
   updateStatus();
   return dev;
 }
 
-function removeDevice(phoneId) {
-  const dev = devices.get(phoneId);
+function removeDevice(clientId) {
+  const dev = devices.get(clientId);
   if (!dev) return;
   dev.pc?.close();
   clearTimeout(dev.poseLabelTimer);
-  roomViewList.forEach((v) => v.removePhone(phoneId));
+  roomViewList.forEach((v) => v.removeClient(clientId));
   dev.tile.remove();
   dropFrames(dev);
-  devices.delete(phoneId);
+  devices.delete(clientId);
   updateStatus();
 }
 
-async function acceptOffer(phoneId, description) {
-  const dev = ensureDevice(phoneId);
+async function acceptOffer(clientId, description) {
+  const dev = ensureDevice(clientId);
   dev.pc?.close();
-  // A phone keeps its id across reloads, so a device can be handed a second
+  // A client keeps its id across reloads, so a device can be handed a second
   // connection. Its RTP clock, buffered frames and pose all belong to the old
   // one.
   dev.rtpMap = null;
@@ -198,20 +198,20 @@ async function acceptOffer(phoneId, description) {
     dev.video.srcObject = ev.streams[0];
   };
   dev.pc.onicecandidate = (ev) => {
-    if (ev.candidate) signaling.send({ type: 'ice', phoneId, candidate: ev.candidate });
+    if (ev.candidate) signaling.send({ type: 'ice', clientId, candidate: ev.candidate });
   };
   dev.pc.onconnectionstatechange = () => {
     if (!dev.pc) return;
     dev.label.textContent =
       dev.pc.connectionState === 'connected'
-        ? `Phone ${phoneId}`
-        : `Phone ${phoneId} — ${dev.pc.connectionState}`;
+        ? `Client ${clientId}`
+        : `Client ${clientId} — ${dev.pc.connectionState}`;
   };
   await dev.pc.setRemoteDescription(description);
   const answer = await dev.pc.createAnswer();
   await dev.pc.setLocalDescription(answer);
-  signaling.send({ type: 'answer', phoneId, description: dev.pc.localDescription });
-  startFrameCapture(phoneId, dev);
+  signaling.send({ type: 'answer', clientId, description: dev.pc.localDescription });
+  startFrameCapture(clientId, dev);
 }
 
 // ---------------------------------------------------------------------------
@@ -242,8 +242,8 @@ const mapSideView = createMap2dView(mapSideCanvas, 'side', { onMarkerDblClick: f
 const roomViewList = [sceneView, map2dView, mapSideView];
 
 // --- Frame synchronisation -------------------------------------------------
-// Phones deliver frames with different end-to-end latency, so a naive
-// composite mixes moments that were captured milliseconds apart. Each phone
+// Clients deliver frames with different end-to-end latency, so a naive
+// composite mixes moments that were captured milliseconds apart. Each client
 // publishes pairings of RTP timestamp and capture time on the shared server
 // clock; every frame carries its RTP timestamp, so its capture instant follows
 // from the 90 kHz RTP clock. Feeds are then held back to match the slowest one.
@@ -261,12 +261,12 @@ let syncSupported = false;
 
 // Pairings are stamped when a frame is encoded, so each carries the encode
 // delay of that particular frame on top of the capture instant, and the
-// phone's own clock error on top of that. Encode delay is always positive, so
+// client's own clock error on top of that. Encode delay is always positive, so
 // the sample implying the earliest capture is the truest one — the same
 // reasoning that makes the lowest-RTT clock probe win.
 //
 // The catch is that a lower envelope taken over all of time never lets go of
-// its winner: once the phone's clock estimate moves, that one sample keeps a
+// its winner: once the client's clock estimate moves, that one sample keeps a
 // bias no later sample can outbid, and the feed sits wrong indefinitely. Only
 // a recent window is considered, so the mapping reconverges on its own.
 const RTP_MAP_WINDOW_MS = 20000;
@@ -294,20 +294,20 @@ function updateRtpMap(dev, sample) {
 }
 
 // Capture instant of a frame, on the server clock — null until the owning
-// phone has published a pairing.
+// client has published a pairing.
 function captureTimeOf(dev, rtpTimestamp) {
   if (!dev.rtpMap || !clockSync.synced) return null;
   return dev.rtpMap.serverTime + rtpDeltaMs(rtpTimestamp, dev.rtpMap.rtp);
 }
 
-function startFrameCapture(phoneId, dev) {
+function startFrameCapture(clientId, dev) {
   if (!dev.video.requestVideoFrameCallback || dev.capturing) return;
   dev.capturing = true;
   dev.frames = [];
   dev.latency = null;
 
   const onFrame = (now, meta) => {
-    if (!devices.has(phoneId)) {
+    if (!devices.has(clientId)) {
       dev.capturing = false;
       return;
     }
@@ -394,7 +394,7 @@ function dueFrame(dev, target) {
 // What the header reports is the alignment of the frames actually drawn: how
 // far the worst of them sits from the shared presentation instant. The
 // dashboard's own clock error shifts that instant for every feed at once, so
-// it cancels here and this number cannot see it; the phones' clock error does
+// it cancels here and this number cannot see it; the clients' clock error does
 // not cancel, and is reported beside it rather than quietly left out.
 let syncErrPeak = 0;
 let syncLabelAt = 0;
@@ -453,7 +453,7 @@ function drawCombined() {
       ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
       ctx.fillRect(cx + 12, cy + ch - 46, 110, 34);
       ctx.fillStyle = '#eee';
-      ctx.fillText(`Phone ${id}`, cx + 20, cy + ch - 22);
+      ctx.fillText(`Client ${id}`, cx + 20, cy + ch - 22);
     });
   }
   updateSyncLabel(feeds, latencies, worstErr);
@@ -493,7 +493,7 @@ setInterval(() => {
     if (!room?.pose) continue;
     const age = performance.now() - dev.lastPoseAt;
     const stale = age > 2000;
-    const colorHex = ROOM_PHONE_COLORS[id % ROOM_PHONE_COLORS.length];
+    const colorHex = ROOM_CLIENT_COLORS[id % ROOM_CLIENT_COLORS.length];
     const color = stale ? '#777' : `#${colorHex.toString(16).padStart(6, '0')}`;
     const p = room.pose.p;
     const f = quatRotate(room.pose.q, [0, 0, 1]);

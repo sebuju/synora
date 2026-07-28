@@ -1,7 +1,7 @@
 'use strict';
 
 // Renders the printable room tags. Everything meaningful about the tags
-// (dictionary, count) lives in cv-common.js so the phone detector and this
+// (dictionary, count) lives in cv-common.js so the client detector and this
 // page cannot drift apart.
 
 const sheets = document.getElementById('sheets');

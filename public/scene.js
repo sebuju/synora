@@ -1,16 +1,16 @@
 'use strict';
 
-// 3D room view: surveyed markers, live phone frusta, and (once mapping runs)
+// 3D room view: surveyed markers, live client frusta, and (once mapping runs)
 // the voxel map — all in the room frame the server's survey defines. Pure
 // renderer: everything it shows arrives via the setters below.
 //
 // Conventions: room frame is the anchor tag's frame (x right, y up, z out of
-// the wall). A phone pose {p,q} maps camera coordinates (OpenCV: +z forward,
+// the wall). A client pose {p,q} maps camera coordinates (OpenCV: +z forward,
 // +y down) into the room, so meshes built in that camera convention can take
 // the quaternion as-is.
 
 // Shared by the 3D scene and the 2D top-down map.
-const ROOM_PHONE_COLORS = [0x4dabf7, 0xffa94d, 0x69db7c, 0xff6b6b, 0xda77f2, 0xffe066];
+const ROOM_CLIENT_COLORS = [0x4dabf7, 0xffa94d, 0x69db7c, 0xff6b6b, 0xda77f2, 0xffe066];
 const ROOM_POSE_STALE_MS = 2000;
 
 // Green head-on sliding to red as the view of a tag gets oblique — pose
@@ -21,7 +21,7 @@ function roomAngleColor(angleDeg) {
 }
 
 function createSceneView(canvas) {
-  const PHONE_COLORS = ROOM_PHONE_COLORS;
+  const CLIENT_COLORS = ROOM_CLIENT_COLORS;
   const POSE_STALE_MS = ROOM_POSE_STALE_MS;
   const SMOOTH_TAU_MS = 120;
   const FLOOR_Y = -1.5;         // tags mount roughly at eye height; cosmetic only
@@ -30,7 +30,7 @@ function createSceneView(canvas) {
   let active = false;
   let markerMapPending = null;
   let wallsPending = null;
-  const phones = new Map();     // phoneId -> { group, cone, label, target, at, colorHex }
+  const clients = new Map();     // clientId -> { group, cone, label, target, at, colorHex }
 
   // Billboard text that can be rewritten cheaply; set() no-ops on unchanged
   // text so it is safe to call every frame.
@@ -107,9 +107,9 @@ function createSceneView(canvas) {
 
     three = { renderer, scene, camera, controls, markerGroup, wallGroup, voxelState };
 
-    // Phones whose poses arrived before the 3D view was first opened already
+    // Clients whose poses arrived before the 3D view was first opened already
     // have groups — they were parked outside any scene until now.
-    for (const ph of phones.values()) {
+    for (const ph of clients.values()) {
       scene.add(ph.group, ph.tagLines);
       for (const label of ph.distLabels.values()) scene.add(label.sprite);
     }
@@ -142,7 +142,7 @@ function createSceneView(canvas) {
     vs.capacity = capacity;
   }
 
-  // id -> { pos: Vector3, normal: Vector3 } for the phone→tag lines.
+  // id -> { pos: Vector3, normal: Vector3 } for the client→tag lines.
   const markerInfo = new Map();
 
   function rebuildMarkers(map) {
@@ -213,10 +213,10 @@ function createSceneView(canvas) {
     }
   }
 
-  function ensurePhone(phoneId) {
-    let ph = phones.get(phoneId);
+  function ensureClient(clientId) {
+    let ph = clients.get(clientId);
     if (ph) return ph;
-    const colorHex = PHONE_COLORS[phoneId % PHONE_COLORS.length];
+    const colorHex = CLIENT_COLORS[clientId % CLIENT_COLORS.length];
     const group = new THREE.Group();
     // Camera frustum wireframe in OpenCV camera axes: apex at the camera,
     // opening toward +z, wider than tall, a tick marking up (-y).
@@ -232,13 +232,13 @@ function createSceneView(canvas) {
       pts.map((p) => new THREE.Vector3(...p)));
     const cone = new THREE.LineSegments(geo, new THREE.LineBasicMaterial({ color: colorHex }));
     const colorCss = `#${colorHex.toString(16).padStart(6, '0')}`;
-    const label = makeTextSprite(`P${phoneId}`, colorCss);
+    const label = makeTextSprite(`C${clientId}`, colorCss);
     label.sprite.position.set(0, 0.25, 0);
     group.add(cone, label.sprite);
     group.visible = false;
 
-    // Lines to the tags this phone currently sees. Positions are rewritten
-    // every frame from the smoothed phone position; the labels ride midway.
+    // Lines to the tags this client currently sees. Positions are rewritten
+    // every frame from the smoothed client position; the labels ride midway.
     const tagLineGeo = new THREE.BufferGeometry();
     tagLineGeo.setAttribute('position',
       new THREE.BufferAttribute(new Float32Array(ROOM_LINE_MAX * 2 * 3), 3));
@@ -249,18 +249,18 @@ function createSceneView(canvas) {
 
     three?.scene.add(group, tagLines);
     ph = {
-      id: phoneId, group, cone, label, tagLines, colorCss,
+      id: clientId, group, cone, label, tagLines, colorCss,
       distLabels: new Map(),      // tag id -> text sprite at the line midpoint
       seenTags: [],
       target: null, at: 0, colorHex, lastDraw: 0,
     };
-    phones.set(phoneId, ph);
+    clients.set(clientId, ph);
     return ph;
   }
 
   const ROOM_LINE_MAX = 16;
 
-  // Lines + midpoint labels from a phone to every mapped tag it is seeing:
+  // Lines + midpoint labels from a client to every mapped tag it is seeing:
   // distance, and how obliquely the tag is being viewed (0° = straight on —
   // pose quality falls off past ~60°).
   function updateTagLines(ph) {
@@ -273,10 +273,10 @@ function createSceneView(canvas) {
       const info = markerInfo.get(id);
       posAttr.setXYZ(i * 2, from.x, from.y, from.z);
       posAttr.setXYZ(i * 2 + 1, info.pos.x, info.pos.y, info.pos.z);
-      const toPhone = new THREE.Vector3().subVectors(from, info.pos);
-      const dist = toPhone.length();
-      const angle = toPhone.lengthSq() > 1e-6
-        ? THREE.MathUtils.radToDeg(info.normal.angleTo(toPhone.normalize()))
+      const toClient = new THREE.Vector3().subVectors(from, info.pos);
+      const dist = toClient.length();
+      const angle = toClient.lengthSq() > 1e-6
+        ? THREE.MathUtils.radToDeg(info.normal.angleTo(toClient.normalize()))
         : 0;
       let label = ph.distLabels.get(id);
       if (!label) {
@@ -320,7 +320,7 @@ function createSceneView(canvas) {
     }
 
     const alpha = 1 - Math.exp(-dt / SMOOTH_TAU_MS);
-    for (const ph of phones.values()) {
+    for (const ph of clients.values()) {
       if (!ph.target) continue;
       ph.group.visible = true;
       ph.group.position.lerp(ph.targetPos, alpha);
@@ -329,7 +329,7 @@ function createSceneView(canvas) {
       const stale = performance.now() - ph.at > POSE_STALE_MS;
       ph.cone.material.color.setHex(stale ? 0x555555 : ph.colorHex);
       const p = ph.group.position;
-      ph.label.set(`P${ph.id} · ${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)}`);
+      ph.label.set(`C${ph.id} · ${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)}`);
       updateTagLines(ph);
     }
 
@@ -373,8 +373,8 @@ function createSceneView(canvas) {
       else wallsPending = walls || [];
     },
 
-    updatePhone(phoneId, pose, seenTagIds = []) {
-      const ph = ensurePhone(phoneId);
+    updateClient(clientId, pose, seenTagIds = []) {
+      const ph = ensureClient(clientId);
       ph.target = pose;
       ph.targetPos = new THREE.Vector3(...pose.p);
       ph.targetQuat = new THREE.Quaternion(...pose.q);
@@ -387,8 +387,8 @@ function createSceneView(canvas) {
       }
     },
 
-    removePhone(phoneId) {
-      const ph = phones.get(phoneId);
+    removeClient(clientId) {
+      const ph = clients.get(clientId);
       if (!ph) return;
       three?.scene.remove(ph.group, ph.tagLines);
       ph.cone.geometry.dispose();
@@ -400,7 +400,7 @@ function createSceneView(canvas) {
         three?.scene.remove(label.sprite);
         label.dispose();
       }
-      phones.delete(phoneId);
+      clients.delete(clientId);
     },
 
     // Incremental voxel updates from the mapping worker. reset drops

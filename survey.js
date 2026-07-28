@@ -1,6 +1,6 @@
 'use strict';
 
-// Marker-map survey and phone localization, all in the room frame.
+// Marker-map survey and client localization, all in the room frame.
 //
 // The map is built by co-visibility chaining: the first well-observed tag
 // becomes the room origin; whenever a localized frame also sees an unknown
@@ -39,7 +39,7 @@ const REFINE_ALPHA = 0.02;
 // Single-tag planar pose has a mirror-solution ambiguity; a wrong pick
 // teleports the camera to the "opposite side" for a frame or two. A fix that
 // jumps implausibly far from a fresh previous fix is held back unless it
-// persists — walking moves a phone ~0.3 m between poses, never a meter.
+// persists — walking moves a client ~0.3 m between poses, never a meter.
 const JUMP_REJECT_M = 1.0;
 const JUMP_HISTORY_TTL_MS = 1500;
 const JUMP_CONFIRM_SAMPLES = 3;
@@ -57,7 +57,7 @@ function createSurvey({ file, markerSizeM, log }) {
   let anchorId = null;
   const markers = new Map();      // id -> { pose: {p,q}, nObs }
   const candidates = new Map();   // id -> [{p,q}, ...] ring
-  const lastFix = new Map();      // phoneId -> { pose, at, rejectStreak }
+  const lastFix = new Map();      // clientId -> { pose, at, rejectStreak }
   let saveTimer = null;
 
   function load() {
@@ -149,7 +149,7 @@ function createSurvey({ file, markerSizeM, log }) {
     for (const t of tags || []) {
       // A tag may carry two PnP solutions (planar mirror ambiguity). Both
       // are kept while they pass the gates; pickSolutions decides later with
-      // room-frame context this side has and the phone does not.
+      // room-frame context this side has and the client does not.
       const sols = [t, ...(t.alt ? [t.alt] : [])]
         .map((s) => ({
           err: s.err,
@@ -172,7 +172,7 @@ function createSurvey({ file, markerSizeM, log }) {
 
   // Resolve the mirror ambiguity per tag: the wrong solution teleports the
   // implied camera, so pick whichever agrees with the pose implied by the
-  // *other* tags — or, alone, with the reference (the phone's last fix).
+  // *other* tags — or, alone, with the reference (the client's last fix).
   function pickSolutions(known, ref) {
     for (const o of known) {
       if (o.sols.length < 2) continue;
@@ -202,10 +202,10 @@ function createSurvey({ file, markerSizeM, log }) {
       return { pose: fuseCameraPose(known), tagObs: known };
     },
 
-    // One pose message from a phone. Returns the enrichment for the viewer:
+    // One pose message from a client. Returns the enrichment for the viewer:
     // { pose, quality, mapChanged }. pose is the camera's room-frame pose or
     // null; mapChanged says the marker map gained/moved a tag.
-    handlePose(msg, phoneId) {
+    handlePose(msg, clientId) {
       let mapChanged = false;
       const obs = buildObs(msg.tags);
 
@@ -223,7 +223,7 @@ function createSurvey({ file, markerSizeM, log }) {
 
       const known = obs.filter((o) => markers.has(o.id));
       const unknown = obs.filter((o) => !markers.has(o.id));
-      const prev = phoneId !== undefined ? lastFix.get(phoneId) : undefined;
+      const prev = clientId !== undefined ? lastFix.get(clientId) : undefined;
       const prevFresh = prev && Date.now() - prev.at < JUMP_HISTORY_TTL_MS;
       pickSolutions(known, prevFresh ? prev.pose : null);
       let pose = fuseCameraPose(known);
@@ -232,7 +232,7 @@ function createSurvey({ file, markerSizeM, log }) {
       // and keep the rejected sample away from survey extension/refinement.
       // pickSolutions makes flips rare; this stays as the backstop for a
       // frame whose wrong solution was the only one to pass the gates.
-      if (pose && phoneId !== undefined) {
+      if (pose && clientId !== undefined) {
         const now = Date.now();
         if (prevFresh) {
           const jump = Math.hypot(
@@ -245,7 +245,7 @@ function createSurvey({ file, markerSizeM, log }) {
             return { pose: prev.pose, quality: 'weak', mapChanged };
           }
         }
-        lastFix.set(phoneId, { pose, at: now, rejectStreak: 0 });
+        lastFix.set(clientId, { pose, at: now, rejectStreak: 0 });
       }
 
       if (pose) {

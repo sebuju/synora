@@ -61,7 +61,7 @@ header .home:hover {
 }
 
 #status,
-#phoneLabel,
+#clientLabel,
 #syncLabel {
   font-size: 13px;
   color: #9a9a9a;
@@ -71,7 +71,7 @@ header .home:hover {
   color: #6fae7f;
 }
 
-#phoneLabel {
+#clientLabel {
   color: #eee;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 13px;
@@ -82,7 +82,7 @@ header .home:hover {
 }
 
 /* Empty until the server hands out an id — no bare chip in the meantime. */
-#phoneLabel:empty {
+#clientLabel:empty {
   display: none;
 }
 
@@ -101,7 +101,7 @@ button:active {
   background: #3a3a3a;
 }
 
-/* Toggle-on state, shared by the phone's icon buttons and the dashboard's
+/* Toggle-on state, shared by the client's icon buttons and the dashboard's
    per-tile webcam button. */
 button.active {
   background: #1d5c2e;
@@ -157,12 +157,12 @@ video {
   background: #000;
 }
 
-/* Phone preview: tapping the feed toggles pause. */
+/* Client preview: tapping the feed toggles pause. */
 main.tappable {
   cursor: pointer;
 }
 
-/* Live marker-tracking stats over the phone preview. */
+/* Live marker-tracking stats over the client preview. */
 #poseStats {
   position: absolute;
   left: 8px;

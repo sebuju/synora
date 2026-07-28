@@ -135,7 +135,7 @@ function detectTick() {
 
 captureBtn.onclick = () => {
   if (!lastCorners) return;
-  // Acknowledge the tap — on a phone it is easy to doubt anything happened.
+  // Acknowledge the tap — on a client it is easy to doubt anything happened.
   captureBtn.classList.add('active');
   setTimeout(() => captureBtn.classList.remove('active'), 300);
   const w = calVideo.videoWidth;
@@ -212,7 +212,7 @@ saveBtn.onclick = () => {
   saveIntrinsics(facingSelect.value, { ...calib, savedAtMs: Date.now() });
   setResult(
     `Saved for ${facingSelect.value} @ ${calib.w}x${calib.h} (RMS ${calib.rms.toFixed(2)} px).` +
-    '\nThe phone page picks this up automatically. Calibrate the other lens too if you use it.');
+    '\nThe client page picks this up automatically. Calibrate the other lens too if you use it.');
 };
 
 clearBtn.onclick = () => {
@@ -222,7 +222,7 @@ clearBtn.onclick = () => {
 
 printBtn.onclick = () => print();
 
-// Board on this screen, for a phone to film when there is no printer. Click
+// Board on this screen, for a client to film when there is no printer. Click
 // anywhere on it to come back.
 const showBoardBtn = document.getElementById('showBoardBtn');
 showBoardBtn.onclick = () => document.body.classList.add('show-board');

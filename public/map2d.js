@@ -3,7 +3,7 @@
 // Orthographic 2D room views, one renderer for both projections:
 //   'top'  — the floor plan, x-z plane (y collapsed)
 //   'side' — the elevation, x-y plane (z collapsed), y drawn upward
-// Same data feeds as the 3D scene — markers, phone poses, voxels — rendered
+// Same data feeds as the 3D scene — markers, client poses, voxels — rendered
 // with plain canvas 2D. Viewport auto-fits whatever exists.
 
 function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
@@ -19,8 +19,8 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
   let markerMap = null;
   // id -> { pos:[3], normal:[3], ax3:[3] (marker x-axis, room frame) }
   const markers = new Map();
-  // phoneId -> { target, cur {p:[3], fwd:[3]}, seen, at, color }
-  const phones = new Map();
+  // clientId -> { target, cur {p:[3], fwd:[3]}, seen, at, color }
+  const clients = new Map();
   // Voxels collapse along the unviewed axis: "ai,bi" -> count. Column
   // density is all a projection needs, and it survives removals cheaply.
   const columns = new Map();
@@ -75,9 +75,9 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
       canvas.height = h;
     }
 
-    // Smooth phones toward their latest pose (same time constant as 3D).
+    // Smooth clients toward their latest pose (same time constant as 3D).
     const alpha = 1 - Math.exp(-dt / SMOOTH_TAU_MS);
-    for (const ph of phones.values()) {
+    for (const ph of clients.values()) {
       if (!ph.target) continue;
       const fwd = quatRotate(ph.target.q, [0, 0, 1]);
       for (let k = 0; k < 3; k++) {
@@ -93,7 +93,7 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
       minB = Math.min(minB, b); maxB = Math.max(maxB, b);
     };
     for (const m of markers.values()) grow(...proj(m.pos));
-    for (const ph of phones.values()) {
+    for (const ph of clients.values()) {
       if (ph.target) grow(...proj(ph.cur.p));
     }
     for (const key of columns.keys()) {
@@ -193,8 +193,8 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
       ctx.fillText(String(id), lx, ly - 8);
     }
 
-    // Phones: dot + heading + label, lines to the tags they see.
-    for (const ph of phones.values()) {
+    // Clients: dot + heading + label, lines to the tags they see.
+    for (const ph of clients.values()) {
       if (!ph.target) continue;
       const stale = performance.now() - ph.at > ROOM_POSE_STALE_MS;
       const color = stale ? '#555' : ph.color;
@@ -242,7 +242,7 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
       ctx.arc(sx, sy, 6, 0, Math.PI * 2);
       ctx.fill();
       const [pa, pb] = proj(ph.cur.p);
-      ctx.fillText(`P${ph.id} · ${pa.toFixed(1)}, ${pb.toFixed(1)}`, sx, sy - 12);
+      ctx.fillText(`C${ph.id} · ${pa.toFixed(1)}, ${pb.toFixed(1)}`, sx, sy - 12);
     }
 
     schedule();
@@ -277,25 +277,25 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
       }
     },
 
-    updatePhone(phoneId, pose, seenTagIds = []) {
-      let ph = phones.get(phoneId);
+    updateClient(clientId, pose, seenTagIds = []) {
+      let ph = clients.get(clientId);
       if (!ph) {
-        const colorHex = ROOM_PHONE_COLORS[phoneId % ROOM_PHONE_COLORS.length];
+        const colorHex = ROOM_CLIENT_COLORS[clientId % ROOM_CLIENT_COLORS.length];
         ph = {
-          id: phoneId,
+          id: clientId,
           color: `#${colorHex.toString(16).padStart(6, '0')}`,
           cur: { p: [...pose.p], fwd: [0, 0, 1] },
           target: null, seen: [], at: 0,
         };
-        phones.set(phoneId, ph);
+        clients.set(clientId, ph);
       }
       ph.target = pose;
       ph.seen = seenTagIds;
       ph.at = performance.now();
     },
 
-    removePhone(phoneId) {
-      phones.delete(phoneId);
+    removeClient(clientId) {
+      clients.delete(clientId);
     },
 
     setWalls(next) {

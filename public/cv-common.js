@@ -1,6 +1,6 @@
 'use strict';
 
-// Shared by the calibration page and the phone's pose pipeline: on-demand
+// Shared by the calibration page and the client's pose pipeline: on-demand
 // OpenCV loading, camera intrinsics persistence, and the marker/board
 // definitions both sides must agree on.
 
@@ -20,7 +20,7 @@ const BOARD_SQUARES_Y = 10;
 const BOARD_SQUARE_M = 0.026;   // 26 mm squares -> 182x260 mm, fits A4 portrait
 const BOARD_MARKER_M = 0.019;
 
-// Fallback when a device has never been calibrated: a typical phone main
+// Fallback when a device has never been calibrated: a typical client main
 // camera is ~66 degrees horizontal FOV. Good to maybe 5%, which the viewer is
 // told about via calibrated:false.
 const DEFAULT_HFOV_DEG = 66;
@@ -63,7 +63,7 @@ function loadOpenCv() {
 
 // ---------------------------------------------------------------------------
 // Intrinsics persistence. Keyed by lens and resolution, not device identity:
-// the same phone has independent front/back cameras, and fx/fy/cx/cy are
+// the same client has independent front/back cameras, and fx/fy/cx/cy are
 // resolution-dependent. Same try/catch shape as loadClientId.
 function intrinsicsKey(facing, w, h) {
   return `streamer-intrinsics:${facing}:${w}x${h}`;
@@ -89,7 +89,7 @@ function loadStoredIntrinsics(facing, w, h) {
 // A calibration rotated 90° (portrait <-> landscape): the axes swap, so
 // fx/fy and cx/cy trade places. Radial distortion (k1,k2,k3) is
 // rotation-invariant; the tangential pair (p1,p2) swaps — its sign depends
-// on rotation direction, but at phone-lens magnitudes (~1e-4) the
+// on rotation direction, but at client-lens magnitudes (~1e-4) the
 // approximation is far below calibration noise.
 function rotateIntrinsics(c) {
   const d = c.dist;
@@ -150,7 +150,7 @@ function makeRoomDetector(cv) {
   params.cornerRefinementMethod = cv.CORNER_REFINE_SUBPIX;
   // ArUco3 mode: candidate search happens on a downscaled image, corners are
   // still refined at full resolution — several times faster at 1080p on a
-  // phone, which is where this runs per frame.
+  // client, which is where this runs per frame.
   params.useAruco3Detection = true;
   return new cv.aruco_ArucoDetector(dict, params, new cv.aruco_RefineParameters(10, 3, true));
 }

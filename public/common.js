@@ -1,16 +1,16 @@
 'use strict';
 
-// Shared between phone and viewer pages: signaling connection + WebRTC config.
+// Shared between client and viewer pages: signaling connection + WebRTC config.
 
 const RTC_CONFIG = {
   iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
 };
 
 // RTP header extension carrying each frame's capture instant on the sender's
-// clock — the basis for aligning feeds from several phones.
+// clock — the basis for aligning feeds from several clients.
 const ABS_CAPTURE_TIME_URI = 'http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time';
 
-// A phone that switches apps gets its page frozen, and the OS tears the
+// A client that switches apps gets its page frozen, and the OS tears the
 // connection down underneath it — the socket stays nominally OPEN and no close
 // event ever arrives, so nothing triggers a reconnect. A ping/pong probe is the
 // only reliable liveness signal; an unanswered one means the socket is dead.
@@ -18,17 +18,18 @@ const PROBE_INTERVAL_MS = 5000;
 const PROBE_TIMEOUT_MS = 8000;
 const RECONNECT_DELAY_MS = 2000;
 
-// A client id that survives reloads, so the server can hand a device the phone
+// A client id that survives reloads, so the server can hand a device the client
 // number it had before instead of burning a fresh one on every refresh.
-function loadClientId(role) {
-  const key = `streamer-client-id:${role}`;
+function loadDeviceId(role) {
+  const key = `streamer-device-id:${role}`;
+  // Devices that predate the phone→client rename keep their identity: read
+  // the uuid from the old role's key once and copy it under the new one.
+  const legacy = `streamer-client-id:${role.replace(/^client/, 'phone')}`;
   let id = null;
   try {
-    id = localStorage.getItem(key);
-    if (!id) {
-      id = crypto.randomUUID();
-      localStorage.setItem(key, id);
-    }
+    id = localStorage.getItem(key) || localStorage.getItem(legacy);
+    if (!id) id = crypto.randomUUID();
+    localStorage.setItem(key, id);
   } catch {
     // Storage unavailable (private mode, blocked cookies): a per-load id still
     // works, it just does not survive a refresh.
@@ -39,10 +40,10 @@ function loadClientId(role) {
 
 // Opens the signaling WebSocket, announces our role, auto-reconnects.
 // handlers: { onMessage(msg), onOpen(), onClose(), onPong(msg) } — optional.
-// clientId can be passed so a page's secondary socket (bulk uploads) presents
+// deviceId can be passed so a page's secondary socket (bulk uploads) presents
 // the same identity as its primary one.
 // Returns { send(obj), sendBinary(blob), close() }.
-function connectSignaling(role, handlers = {}, clientId = loadClientId(role)) {
+function connectSignaling(role, handlers = {}, deviceId = loadDeviceId(role)) {
   let ws = null;
   let closedByUs = false;
   let reconnectTimer = null;
@@ -62,7 +63,7 @@ function connectSignaling(role, handlers = {}, clientId = loadClientId(role)) {
     const sock = new WebSocket(`wss://${location.host}`);
     ws = sock;
     sock.onopen = () => {
-      sock.send(JSON.stringify({ type: 'role', role, clientId }));
+      sock.send(JSON.stringify({ type: 'role', role, deviceId }));
       handlers.onOpen?.();
     };
     sock.onmessage = (ev) => {
@@ -142,13 +143,13 @@ function setStatus(text) {
 }
 
 // ---------------------------------------------------------------------------
-// Clock sync. Phones and the dashboard run on independent clocks, so frames
+// Clock sync. Clients and the dashboard run on independent clocks, so frames
 // can only be aligned against a shared reference: the server's clock. Probes
 // are NTP-style — the sample with the lowest round trip carries the least
 // uncertainty — but a single such sample is not enough to hold a session
 // together: these clocks drift tens of ppm against the server, so an offset
 // measured at startup is tens of milliseconds stale a few minutes later, and
-// two phones drifting opposite ways pull their feeds that far apart. Samples
+// two clients drifting opposite ways pull their feeds that far apart. Samples
 // are kept in a sliding window instead; the low-RTT ones are fitted with a
 // line, and its slope is the drift.
 const CLOCK_BURST = 8;                 // probes on start and on becoming visible

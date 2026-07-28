@@ -1,6 +1,6 @@
 'use strict';
 
-// Phone-side marker pose pipeline: watches the preview video, detects room
+// Client-side marker pose pipeline: watches the preview video, detects room
 // tags, solves each tag's camera-frame pose, and publishes the observations.
 // All room-frame math happens on the server — this side deliberately knows
 // nothing about the marker map.
@@ -18,7 +18,7 @@ const posePipeline = (() => {
   let signaling = null;
   let bulk = null;       // bulk-upload socket — keyframes must not delay poses
   let clockSync = null;
-  let onState = null;      // notifies phone.js so it can report client-state
+  let onState = null;      // notifies client.js so it can report client-state
 
   let enabled = false;
   let config = { markerSizeM: 0.15, poseRateMs: 150, keyframeMs: 1000 };
@@ -86,7 +86,7 @@ const posePipeline = (() => {
   // Planar single-tag PnP (IPPE) has a two-fold mirror ambiguity, and the
   // wrong pick teleports the camera. When the build exposes solvePnPGeneric,
   // both solutions are returned (best reprojection first) so the server —
-  // which knows the marker map and the phone's recent pose — can pick the
+  // which knows the marker map and the client's recent pose — can pick the
   // consistent one instead of this side guessing blind.
   function solveTag(cornerMat) {
     if (genericPnP) {
@@ -137,7 +137,7 @@ const posePipeline = (() => {
   // Detection runs at native resolution — tag corner accuracy (and with it
   // every room-frame pose and the map built on them) scales with pixels on
   // the tag, and pose beats streaming here. Detect cost grows with area;
-  // the overlay's "detect N ms" shows what the phone is paying. The cap only
+  // the overlay's "detect N ms" shows what the client is paying. The cap only
   // guards pathological sources. Intrinsics come from intrinsicsFor at the
   // detection size, which rescales a stored calibration linearly.
   const DETECT_MAX_DIM = 4096;
@@ -204,7 +204,7 @@ const posePipeline = (() => {
   }
 
   // On-screen diagnostics — makes "why is nothing happening" answerable from
-  // the phone alone.
+  // the client alone.
   function updateStats(tags, vw, vh, w, h, detectMs) {
     if (!statsEl) return;
     const size = w < vw ? `${vw}x${vh} (detect ${w}x${h})` : `${w}x${h}`;
