@@ -1,323 +1,285 @@
 'use strict';
 
-// Client-side marker pose pipeline: watches the preview video, detects room
-// tags, solves each tag's camera-frame pose, and publishes the observations.
-// All room-frame math happens on the server — this side deliberately knows
-// nothing about the marker map.
+// Client-side marker pose pipeline: watches the camera, detects room tags,
+// solves each tag's camera-frame pose, and publishes the observations. All
+// room-frame math happens on the server — this side deliberately knows nothing
+// about the marker map.
 //
-// The detection loop rides requestVideoFrameCallback on the preview element.
-// The callback chain belongs to the element, not the stream, so it survives
-// srcObject swaps (camera switch, recovery) on its own; re-arming is still
-// idempotent because backgrounding can end the chain silently.
+// The detection itself lives in detect-core.js and runs in detect-worker.js,
+// fed straight from the camera track. This file is the part that has to stay on
+// the page: the sockets, the clock, localStorage-backed intrinsics, and the
+// stats overlay.
+//
+// Where a worker cannot be fed camera frames (no MediaStreamTrackProcessor),
+// the same core runs here instead, driven by requestVideoFrameCallback on the
+// preview element. The callback chain belongs to the element, not the stream,
+// so it survives srcObject swaps (camera switch, recovery) on its own;
+// re-arming is still idempotent because backgrounding can end it silently.
 
 const posePipeline = (() => {
-  // cv objects live for the page's lifetime once created; per-frame Mats are
-  // the ones that leak wasm heap if not deleted, so they are created once and
-  // reused, and temporaries are deleted in finally blocks.
   let video = null;
   let signaling = null;
   let bulk = null;       // bulk-upload socket — keyframes must not delay poses
   let clockSync = null;
-  let onState = null;      // notifies client.js so it can report client-state
+  let onState = null;    // notifies client.js so it can report client-state
 
   let enabled = false;
+  let paused = false;
   let config = { markerSizeM: 0.15, poseRateMs: 150, keyframeMs: 1000 };
   let facing = 'environment';
-  let lastKeyframe = 0;
-  let keyframeBusy = false;
 
-  let cv = null;
-  let loading = false;
-  let detector = null;
-  let grabber = null;
-  let corners = null;
-  let ids = null;
-  let rejected = null;
-  let objPts = null;
-  let KMat = null;
-  let distMat = null;
-  let rvec = null;
-  let tvec = null;
-  let projected = null;
-
-  let genericPnP = false;
+  // Intrinsics are read from localStorage, so the page owns them whichever
+  // thread does the detecting. They always describe the full frame — crops
+  // offset corners, they never rescale the camera model.
   let intr = null;
   let intrW = 0;
   let intrH = 0;
+
+  let worker = null;
+  let workerFailed = false;
+  let fedTrack = null;
+
+  // Main-thread fallback only.
+  let core = null;
+  let coreStarting = null;
+  let canvasSource = null;
   let armed = false;
+  let busy = false;
   let lastDetect = 0;
-  let lastMarkerSize = 0;
+  let lastKeyframe = 0;
+
+  // Keyframes ride the bulk socket, which the recorder keeps busy at ~500 KB/s
+  // — demanding an empty buffer starves them entirely. A modest backlog is fine
+  // (nothing latency-critical sits behind them there); the cap only stops a
+  // link that cannot keep up from accumulating an unbounded queue of stale
+  // frames.
+  const KEYFRAME_MAX_BUFFERED = 1.5 * 1024 * 1024;
+  let keyframesAllowed = true;
+
   const statsEl = document.getElementById('poseStats');
   let roomPose = null;   // echoed back by the server; the map lives there
 
-  function buildObjPoints() {
-    const s = config.markerSizeM / 2;
-    objPts?.delete();
-    // ArUco corner order TL,TR,BR,BL; marker frame x right, y up, z out.
-    objPts = cv.matFromArray(4, 3, cv.CV_32F, [
-      -s, s, 0, s, s, 0, s, -s, 0, -s, -s, 0,
-    ]);
-    lastMarkerSize = config.markerSizeM;
-  }
-
-  function refreshIntrinsics(w, h) {
-    intr = intrinsicsFor(facing, w, h);
-    intrW = w;
-    intrH = h;
-    KMat?.delete();
-    distMat?.delete();
-    KMat = cv.matFromArray(3, 3, cv.CV_64F, [
-      intr.fx, 0, intr.cx, 0, intr.fy, intr.cy, 0, 0, 1,
-    ]);
-    distMat = cv.matFromArray(1, 5, cv.CV_64F, intr.dist);
-  }
-
-  function meanReprojErr(cornerMat, r, t) {
-    cv.projectPoints(objPts, r, t, KMat, distMat, projected);
-    const det = cornerMat.data32F;
-    const prj = projected.data32F;
-    let sum = 0;
-    for (let i = 0; i < 4; i++) {
-      sum += Math.hypot(det[i * 2] - prj[i * 2], det[i * 2 + 1] - prj[i * 2 + 1]);
+  function intrinsicsAt(w, h) {
+    if (!intr || intrW !== w || intrH !== h) {
+      intr = intrinsicsFor(facing, w, h);
+      intrW = w;
+      intrH = h;
     }
-    return sum / 4;
+    return intr;
   }
 
-  // Planar single-tag PnP (IPPE) has a two-fold mirror ambiguity, and the
-  // wrong pick teleports the camera. When the build exposes solvePnPGeneric,
-  // both solutions are returned (best reprojection first) so the server —
-  // which knows the marker map and the client's recent pose — can pick the
-  // consistent one instead of this side guessing blind.
-  function solveTag(cornerMat) {
-    if (genericPnP) {
-      const rvecs = new cv.MatVector();
-      const tvecs = new cv.MatVector();
-      try {
-        const n = cv.solvePnPGeneric(objPts, cornerMat, KMat, distMat,
-          rvecs, tvecs, false, cv.SOLVEPNP_IPPE_SQUARE);
-        const sols = [];
-        for (let i = 0; i < n && i < 2; i++) {
-          const r = rvecs.get(i);
-          const t = tvecs.get(i);
-          try {
-            sols.push({
-              rvec: [...r.data64F],
-              tvec: [...t.data64F],
-              err: meanReprojErr(cornerMat, r, t),
-            });
-          } finally {
-            r.delete();
-            t.delete();
-          }
-        }
-        if (sols.length) return sols.sort((a, b) => a.err - b.err);
-      } catch {
-        genericPnP = false;   // binding missing/incompatible in this build
-      } finally {
-        rvecs.delete();
-        tvecs.delete();
-      }
-    }
-    const ok = cv.solvePnP(objPts, cornerMat, KMat, distMat, rvec, tvec,
-      false, cv.SOLVEPNP_IPPE_SQUARE);
-    if (!ok) return null;
-    return [{
-      rvec: [...rvec.data64F],
-      tvec: [...tvec.data64F],
-      err: meanReprojErr(cornerMat, rvec, tvec),
-    }];
+  function currentTrack() {
+    return video?.srcObject?.getVideoTracks?.()[0] ?? null;
   }
 
-  const roundSol = (s) => ({
-    rvec: s.rvec.map((v) => Math.round(v * 1e5) / 1e5),
-    tvec: s.tvec.map((v) => Math.round(v * 1e4) / 1e4),
-    err: Math.round(s.err * 100) / 100,
-  });
+  // -------------------------------------------------------------------------
+  // Results, from whichever thread produced them.
 
-  // Detection runs at native resolution — tag corner accuracy (and with it
-  // every room-frame pose and the map built on them) scales with pixels on
-  // the tag, and pose beats streaming here. Detect cost grows with area;
-  // the overlay's "detect N ms" shows what the client is paying. The cap only
-  // guards pathological sources. Intrinsics come from intrinsicsFor at the
-  // detection size, which rescales a stored calibration linearly.
-  const DETECT_MAX_DIM = 4096;
-
-  function detectFrame() {
-    const t0 = performance.now();
-    const vw = video.videoWidth;
-    const vh = video.videoHeight;
-    if (!vw || !vh) return;
-    const ds = Math.min(1, DETECT_MAX_DIM / Math.max(vw, vh));
-    const w = Math.round(vw * ds);
-    const h = Math.round(vh * ds);
-    if (w !== intrW || h !== intrH) refreshIntrinsics(w, h);
-    if (config.markerSizeM !== lastMarkerSize) buildObjPoints();
-
-    const gray = grabber.grab(video, ds < 1 ? w : 0, ds < 1 ? h : 0);
-    if (!gray) return;
-    detector.detectMarkers(gray, corners, ids, rejected);
-
-    const tags = [];
-    for (let i = 0; i < ids.rows; i++) {
-      const id = ids.data32S[i];
-      if (id >= ROOM_TAG_COUNT) continue;
-      const cornerMat = corners.get(i);
-      try {
-        const sols = solveTag(cornerMat);
-        if (!sols) continue;
-        const tag = { id, ...roundSol(sols[0]) };
-        // The runner-up only matters while it is plausible — a clearly worse
-        // reprojection is not an ambiguity worth the bytes.
-        if (sols[1] && sols[1].err < 8) tag.alt = roundSol(sols[1]);
-        tags.push(tag);
-      } finally {
-        cornerMat.delete();
-      }
-    }
-
+  function publishPose(res) {
     signaling.send({
       type: 'pose',
-      t: clockSync.synced ? clockSync.now() : null,
-      w, h,
-      calibrated: intr.calibrated,
+      t: clockSync.synced ? clockSync.at(res.at) : null,
+      w: res.w,
+      h: res.h,
+      calibrated: res.calibrated,
       unc: clockSync.synced ? Math.round(clockSync.uncertaintyMs * 10) / 10 : null,
-      tags,
+      tags: res.tags,
     });
-
-    // Keyframes feed the server's room mapping. Only frames that see a tag
-    // are worth sending — the server can pose those exactly, from the tags in
-    // this very frame.
-    // Keyframes ride the bulk socket, which the recorder keeps busy at
-    // ~500 KB/s — demanding an empty buffer starves them entirely. A modest
-    // backlog is fine (nothing latency-critical sits behind them there);
-    // the cap only stops a link that cannot keep up from accumulating an
-    // unbounded queue of stale frames.
-    const now = performance.now();
-    if (config.keyframeMs > 0 && tags.length && !keyframeBusy &&
-      bulk.bufferedAmount < KEYFRAME_MAX_BUFFERED &&
-      now - lastKeyframe >= config.keyframeMs) {
-      lastKeyframe = now;
-      sendKeyframe(tags, w, h);
-    }
-
-    updateStats(tags, vw, vh, w, h, now - t0);
-  }
-
-  // On-screen diagnostics — makes "why is nothing happening" answerable from
-  // the client alone.
-  function updateStats(tags, vw, vh, w, h, detectMs) {
-    if (!statsEl) return;
-    const size = w < vw ? `${vw}x${vh} (detect ${w}x${h})` : `${w}x${h}`;
-    const lines = [
-      `${size} · ${intr.calibrated ? 'calibrated' : 'UNCALIBRATED'} · ` +
-      `detect ${Math.round(detectMs)} ms · ` +
-      `clock ${clockSync.synced ? `±${clockSync.uncertaintyMs.toFixed(0)} ms` : 'unsynced'}`,
-    ];
-    lines.push(roomPose?.pose
-      ? `room: ${roomPose.pose.p.map((v) => v.toFixed(2)).join(', ')} · ${roomPose.quality}`
-      : 'room: unlocalized');
-    for (const t of tags) {
-      // Viewing angle off the tag's normal: 0° is straight on, past ~60° the
-      // pose degrades — same number the dashboard's 3D view colors.
-      const n = quatRotate(quatFromRvec(t.rvec), [0, 0, 1]);
-      const d = Math.hypot(...t.tvec);
-      const cosA = d > 1e-6
-        ? -(n[0] * t.tvec[0] + n[1] * t.tvec[1] + n[2] * t.tvec[2]) / d
-        : 1;
-      const ang = Math.acos(Math.min(1, Math.max(-1, cosA))) * 180 / Math.PI;
-      lines.push(
-        `tag ${t.id}: ${d.toFixed(2)} m · ${Math.round(ang)}° · err ${t.err.toFixed(1)} px`);
-    }
-    if (!tags.length) lines.push('no tags in view');
-    statsEl.textContent = lines.join('\n');
+    updateStats(res);
+    updateKeyframePermission();
   }
 
   // Binary envelope: 'KFR1' | uint32 LE header length | JSON header | JPEG.
   // Rides the same socket as recording chunks; the magic is what keeps the
-  // server from appending it to the recording. The image is downscaled to
-  // just above the depth model's input size — a full-res JPEG is 3-5x the
-  // bytes for zero extra information, and those bytes delay pose messages.
-  const KEYFRAME_MAX_W = 672;
-  // ~2-3 s of recorder output; see the gate in detectFrame.
-  const KEYFRAME_MAX_BUFFERED = 1.5 * 1024 * 1024;
-  let kfCanvas = null;
-  let kfCtx = null;
+  // server from appending it to the recording.
+  function sendKeyframe(kf) {
+    const cam = intrinsicsAt(kf.w, kf.h);
+    const header = new TextEncoder().encode(JSON.stringify({
+      t: clockSync.synced ? clockSync.at(kf.at) : null,
+      w: kf.kw,
+      h: kf.kh,
+      // Intrinsics scale with pixel pitch; tag poses are metric and do not.
+      intrinsics: {
+        fx: cam.fx * kf.scale, fy: cam.fy * kf.scale,
+        cx: cam.cx * kf.scale, cy: cam.cy * kf.scale,
+        dist: cam.dist,
+      },
+      tags: kf.tags,
+    }));
+    const head = new Uint8Array(8);
+    head[0] = 0x4b; head[1] = 0x46; head[2] = 0x52; head[3] = 0x31;   // KFR1
+    new DataView(head.buffer).setUint32(4, header.length, true);
+    bulk.sendBinary(new Blob([head, header, kf.bytes]));
+  }
 
-  function sendKeyframe(tags, w, h) {
-    keyframeBusy = true;
-    const s = Math.min(1, KEYFRAME_MAX_W / w);
-    const kw = Math.round(w * s);
-    const kh = Math.round(h * s);
-    if (!kfCanvas) {
-      kfCanvas = document.createElement('canvas');
-      kfCtx = kfCanvas.getContext('2d');
+  function updateKeyframePermission() {
+    const allowed = bulk.bufferedAmount < KEYFRAME_MAX_BUFFERED;
+    if (allowed === keyframesAllowed) return;
+    keyframesAllowed = allowed;
+    worker?.postMessage({ type: 'keyframes', allowed });
+  }
+
+  // On-screen diagnostics — makes "why is nothing happening" answerable from
+  // the client alone, and "why is it slow" answerable without a profiler: the
+  // timing breakdown separates getting the pixels from searching them.
+  function updateStats(res) {
+    if (!statsEl) return;
+    const t = res.timing;
+    const scan = res.mode === 'roi'
+      ? `roi ${Math.round(res.scanned.w)}x${Math.round(res.scanned.h)}`
+      : `full${res.retried ? ' (roi missed)' : ''}${res.idle ? ', idle rate' : ''}`;
+    const lines = [
+      `${res.w}x${res.h} · ${res.calibrated ? 'calibrated' : 'UNCALIBRATED'} · ` +
+      `clock ${clockSync.synced ? `±${clockSync.uncertaintyMs.toFixed(0)} ms` : 'unsynced'}`,
+      `${scan} · ${Math.round(t.total)} ms ` +
+      `(grab ${Math.round(t.grab)} · find ${Math.round(t.detect)} · pnp ${Math.round(t.solve)})` +
+      (worker ? '' : ' · on-page'),
+    ];
+    lines.push(roomPose?.pose
+      ? `room: ${roomPose.pose.p.map((v) => v.toFixed(2)).join(', ')} · ${roomPose.quality}`
+      : 'room: unlocalized');
+    for (const tag of res.tags) {
+      // Viewing angle off the tag's normal: 0° is straight on, past ~60° the
+      // pose degrades — same number the dashboard's 3D view colors.
+      const n = quatRotate(quatFromRvec(tag.rvec), [0, 0, 1]);
+      const d = Math.hypot(...tag.tvec);
+      const cosA = d > 1e-6
+        ? -(n[0] * tag.tvec[0] + n[1] * tag.tvec[1] + n[2] * tag.tvec[2]) / d
+        : 1;
+      const ang = Math.acos(Math.min(1, Math.max(-1, cosA))) * 180 / Math.PI;
+      lines.push(
+        `tag ${tag.id}: ${d.toFixed(2)} m · ${Math.round(ang)}° · err ${tag.err.toFixed(1)} px`);
     }
-    if (kfCanvas.width !== kw || kfCanvas.height !== kh) {
-      kfCanvas.width = kw;
-      kfCanvas.height = kh;
+    if (!res.tags.length) lines.push('no tags in view');
+    statsEl.textContent = lines.join('\n');
+  }
+
+  // -------------------------------------------------------------------------
+  // Worker path.
+
+  function handleWorkerMessage(msg) {
+    if (msg.type === 'pose') {
+      publishPose(msg);
+    } else if (msg.type === 'keyframe') {
+      sendKeyframe(msg);
+    } else if (msg.type === 'need-intrinsics') {
+      worker?.postMessage({
+        type: 'intrinsics', w: msg.w, h: msg.h, intr: intrinsicsAt(msg.w, msg.h),
+      });
+    } else if (msg.type === 'fatal') {
+      failWorker();
     }
-    kfCtx.drawImage(grabber.canvas, 0, 0, kw, kh);
-    kfCanvas.toBlob((jpeg) => {
-      keyframeBusy = false;
-      if (!jpeg) return;
-      const header = new TextEncoder().encode(JSON.stringify({
-        t: clockSync.synced ? clockSync.now() : null,
-        w: kw,
-        h: kh,
-        // Intrinsics scale with pixel pitch; tag poses are metric and do not.
-        intrinsics: {
-          fx: intr.fx * s, fy: intr.fy * s, cx: intr.cx * s, cy: intr.cy * s,
-          dist: intr.dist,
-        },
-        tags,
-      }));
-      const head = new Uint8Array(8);
-      head[0] = 0x4b; head[1] = 0x46; head[2] = 0x52; head[3] = 0x31;   // KFR1
-      new DataView(head.buffer).setUint32(4, header.length, true);
-      bulk.sendBinary(new Blob([head, header, jpeg]));
-    }, 'image/jpeg', 0.8);
+  }
+
+  // Anything that goes wrong in the worker costs detection entirely, so it is
+  // never left broken: the page picks the work up itself instead.
+  function failWorker() {
+    worker?.terminate();
+    worker = null;
+    workerFailed = true;
+    fedTrack = null;
+    if (enabled) {
+      startFallback().catch((err) => setStatus(`marker tracking failed: ${err.message}`));
+    }
+  }
+
+  function ensureWorker() {
+    if (worker || workerFailed) return worker;
+    // Without a track processor the worker has no way to see camera frames, and
+    // shipping them through the page would cost more than it saves.
+    if (typeof Worker !== 'function' || typeof MediaStreamTrackProcessor !== 'function') {
+      workerFailed = true;
+      return null;
+    }
+    try {
+      worker = new Worker('/detect-worker.js');
+    } catch {
+      workerFailed = true;
+      return null;
+    }
+    worker.onerror = () => failWorker();
+    worker.onmessage = (ev) => handleWorkerMessage(ev.data);
+    worker.postMessage({
+      type: 'init',
+      timeOrigin: performance.timeOrigin,
+      markerSizeM: config.markerSizeM,
+      poseRateMs: config.poseRateMs,
+      keyframeMs: config.keyframeMs,
+    });
+    return worker;
+  }
+
+  function feedWorker() {
+    const track = currentTrack();
+    if (!worker || !track || track === fedTrack) return;
+    let processor;
+    try {
+      processor = new MediaStreamTrackProcessor({ track });
+    } catch {
+      failWorker();
+      return;
+    }
+    fedTrack = track;
+    worker.postMessage({ type: 'track', readable: processor.readable }, [processor.readable]);
+  }
+
+  // -------------------------------------------------------------------------
+  // Main-thread fallback: the same core, fed from the preview element.
+
+  function startFallback() {
+    coreStarting ??= (async () => {
+      core ??= createDetectCore();
+      await core.ensureReady();
+      canvasSource ??= createCanvasLumaSource(core.cv);
+      core.setMarkerSize(config.markerSizeM);
+    })().finally(() => {
+      coreStarting = null;
+    });
+    return coreStarting.then(armLoop);
+  }
+
+  async function fallbackDetect(now) {
+    const w = video.videoWidth;
+    const h = video.videoHeight;
+    if (!w || !h) return;
+    if (!core.hasIntrinsics(w, h)) core.setIntrinsics(w, h, intrinsicsAt(w, h));
+    const res = await core.detect(canvasSource, video, w, h, now);
+    if (!res) return;
+    publishPose({ ...res, at: now });
+
+    if (!res.tags.length || !keyframesAllowed || config.keyframeMs <= 0) return;
+    if (now - lastKeyframe < config.keyframeMs) return;
+    lastKeyframe = now;
+    const kf = await core.encodeKeyframe(video, w, h);
+    if (kf) sendKeyframe({ ...kf, at: now, tags: res.tags, w, h });
   }
 
   function armLoop() {
-    if (armed || !video.requestVideoFrameCallback) return;
+    if (armed || worker || !video.requestVideoFrameCallback) return;
     armed = true;
-    const onFrame = () => {
-      if (!enabled || !cv) {
+    const onFrame = async () => {
+      if (!enabled || worker) {
         armed = false;   // chain parks; setEnabled re-arms
         return;
       }
       const now = performance.now();
-      if (now - lastDetect >= config.poseRateMs) {
+      // `busy` matters here in a way it did not when detection was synchronous:
+      // a detect that outruns the frame interval must not be started twice.
+      if (core?.ready && !busy && !paused
+        && now - lastDetect >= core.intervalMs(config.poseRateMs, now)) {
         lastDetect = now;
+        busy = true;
         try {
-          detectFrame();
+          await fallbackDetect(now);
         } catch {
           // A single bad frame (mid-switch, zero-size) must not kill the loop.
+        } finally {
+          busy = false;
         }
       }
       video.requestVideoFrameCallback(onFrame);
     };
     video.requestVideoFrameCallback(onFrame);
-  }
-
-  async function ensureCv() {
-    if (cv || loading) return;
-    loading = true;
-    try {
-      cv = await loadOpenCv();
-      genericPnP = typeof cv.solvePnPGeneric === 'function';
-      detector = makeRoomDetector(cv);
-      grabber = createFrameGrabber(cv);
-      corners = new cv.MatVector();
-      ids = new cv.Mat();
-      rejected = new cv.MatVector();
-      rvec = new cv.Mat();
-      tvec = new cv.Mat();
-      projected = new cv.Mat();
-      buildObjPoints();
-    } finally {
-      loading = false;
-    }
   }
 
   return {
@@ -336,26 +298,43 @@ const posePipeline = (() => {
       if (cfg.poseRateMs) config.poseRateMs = cfg.poseRateMs;
       // 0 is meaningful: mapping is off, stop producing keyframes.
       if (cfg.keyframeMs !== undefined) config.keyframeMs = cfg.keyframeMs;
+      core?.setMarkerSize(config.markerSizeM);
+      worker?.postMessage({ type: 'config', ...config });
     },
     async setEnabled(on) {
       enabled = on;
       onState?.();
-      if (!on && statsEl) statsEl.textContent = '';
-      if (on) {
-        await ensureCv();
-        // Intrinsics may be stale if the user calibrated while pose was off.
-        intrW = 0;
-        armLoop();
+      if (!on) {
+        if (statsEl) statsEl.textContent = '';
+        worker?.postMessage({ type: 'enabled', on: false });
+        return;
       }
+      if (ensureWorker()) {
+        worker.postMessage({ type: 'enabled', on: true });
+        feedWorker();
+        return;
+      }
+      await startFallback();
     },
     get enabled() {
       return enabled;
     },
+    // A paused client has its tracks disabled, so every frame is black.
+    setPaused(on) {
+      paused = on;
+      worker?.postMessage({ type: 'paused', paused: on });
+    },
     // Called after startCamera(): new track, maybe new lens or resolution.
     onCameraChanged(newFacing) {
       facing = newFacing;
-      intrW = 0;         // force intrinsics re-read at next frame
-      if (enabled && cv) armLoop();
+      intrW = 0;         // force intrinsics re-read at the next frame
+      intr = null;
+      core?.clearIntrinsics();
+      core?.resetScan();
+      worker?.postMessage({ type: 'reset-intrinsics' });
+      if (!enabled) return;
+      if (worker) feedWorker();
+      else armLoop();
     },
   };
 })();

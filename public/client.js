@@ -138,6 +138,9 @@ function applyPaused() {
   stream?.getTracks().forEach((t) => { t.enabled = !paused; });
   if (paused && recorder?.state === 'recording') recorder.pause();
   else if (!paused && recorder?.state === 'paused') recorder.resume();
+  // Disabled tracks still deliver frames, they are just black — detecting tags
+  // in them costs the same as detecting them in the real picture.
+  posePipeline.setPaused(paused);
   document.body.classList.toggle('paused', paused);
 }
 

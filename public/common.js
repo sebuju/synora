@@ -266,6 +266,12 @@ function createClockSync(signaling) {
         });
       }
     },
+    // Server-clock time for an instant on the local clock. Detection runs on a
+    // worker thread and stamps a frame when it grabs it, so the moment being
+    // converted is not always "now" by the time anything asks.
+    at(t) {
+      return t + offsetAt(t);
+    },
     now() {
       const t = localNow();
       return t + offsetAt(t);
