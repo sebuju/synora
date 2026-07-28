@@ -75,7 +75,7 @@ function loadOrCreateCert() {
     return { key: fs.readFileSync(keyPath), cert: fs.readFileSync(certPath) };
   }
   const selfsigned = require('selfsigned');
-  const attrs = [{ name: 'commonName', value: 'android-streamer.local' }];
+  const attrs = [{ name: 'commonName', value: 'synora.local' }];
   const pems = selfsigned.generate(attrs, {
     algorithm: 'sha256',
     keySize: 2048,
