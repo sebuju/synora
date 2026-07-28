@@ -7,8 +7,10 @@ const https = require('https');
 const { spawn, spawnSync } = require('child_process');
 const { WebSocketServer } = require('ws');
 const qrcode = require('qrcode-terminal');
+const { createSurvey } = require('./survey.js');
+const { createMapping } = require('./mapping.js');
 
-const PORT = 8443;
+const PORT = Number(process.env.PORT) || 8443;
 const CERT_DIR = path.join(__dirname, 'certs');
 const RECORDINGS_DIR = path.join(__dirname, 'recordings');
 const PUBLIC_DIR = path.join(__dirname, 'public');
@@ -18,6 +20,34 @@ const AKVCAM_MANAGER = path.join(
 const VCAM_WIDTH = 1280;
 const VCAM_HEIGHT = 720;
 const VCAM_FPS = 30;
+const VENDOR_DIR = path.join(PUBLIC_DIR, 'vendor');
+const MODELS_DIR = path.join(__dirname, 'models');
+const DEPTH_MODEL = path.join(MODELS_DIR, 'depth.onnx');
+// Metric variant (metres out): preferred when present — a single tag then
+// suffices to calibrate each keyframe's depth.
+const DEPTH_MODEL_METRIC = path.join(MODELS_DIR, 'depth-metric.onnx');
+const MARKER_MAP_FILE = path.join(__dirname, 'markers.json');
+const LOG_FILE = path.join(__dirname, 'server.log');
+// Physical marker edge length in meters — must match the printed size from
+// /markers, or every distance in the room frame scales by the same error.
+const POSE_CONFIG = {
+  markerSizeM: 0.15,
+  dictionary: 'DICT_4X4_50',
+  // 10 Hz: more samples per second converges the survey and the jump gate
+  // faster; detection itself costs a phone a few tens of ms per frame.
+  poseRateMs: 100,
+  keyframeMs: 1000,
+};
+
+// Every device aligns its frames against this clock, so it must not step:
+// Windows resyncs the wall clock on its own schedule, and each phone would
+// chase the jump separately, tearing the composite apart for as long as they
+// took to reconverge. Anchor to the wall clock once, advance monotonically.
+const CLOCK_EPOCH = Date.now() - performance.now();
+
+function serverNow() {
+  return CLOCK_EPOCH + performance.now();
+}
 
 // ---------------------------------------------------------------------------
 // Shared date/time formatting (24h, dd/mm/yy) — keep all formatting here.
@@ -87,18 +117,46 @@ const MIME = {
   '.css': 'text/css; charset=utf-8',
   '.png': 'image/png',
   '.ico': 'image/x-icon',
+  '.json': 'application/json; charset=utf-8',
+  '.jpeg': 'image/jpeg',
+  '.jpg': 'image/jpeg',
+  // Required for WebAssembly.instantiateStreaming, which rejects any other
+  // content type. The vendored opencv.js inlines its wasm today, but a split
+  // build (the fallback path) would need this.
+  '.wasm': 'application/wasm',
 };
 
 function serveStatic(req, res) {
   let urlPath = req.url.split('?')[0];
-  if (urlPath === '/') urlPath = '/viewer.html';
+  if (urlPath === '/') urlPath = '/index.html';
   if (urlPath === '/phone') urlPath = '/phone.html';
   if (urlPath === '/viewer' || urlPath === '/dashboard') urlPath = '/viewer.html';
+  if (urlPath === '/calibrate') urlPath = '/calibrate.html';
+  if (urlPath === '/markers') urlPath = '/markers.html';
+  if (urlPath === '/digital') urlPath = '/digital.html';
 
   const filePath = path.join(PUBLIC_DIR, path.normalize(urlPath));
   if (!filePath.startsWith(PUBLIC_DIR)) {
     res.writeHead(403);
     res.end('Forbidden');
+    return;
+  }
+  const headers = { 'Content-Type': MIME[path.extname(filePath)] || 'application/octet-stream' };
+  // Vendored libs are ~10 MB and immutable-in-practice; stream them instead
+  // of buffering whole files per request, and let the browser cache them so a
+  // phone reload does not re-pull opencv.js over the LAN every time.
+  if (urlPath.startsWith('/vendor/')) {
+    fs.stat(filePath, (err, stat) => {
+      if (err || !stat.isFile()) {
+        res.writeHead(404);
+        res.end('Not found');
+        return;
+      }
+      headers['Content-Length'] = stat.size;
+      headers['Cache-Control'] = 'public, max-age=86400';
+      res.writeHead(200, headers);
+      fs.createReadStream(filePath).pipe(res);
+    });
     return;
   }
   fs.readFile(filePath, (err, data) => {
@@ -107,7 +165,7 @@ function serveStatic(req, res) {
       res.end('Not found');
       return;
     }
-    res.writeHead(200, { 'Content-Type': MIME[path.extname(filePath)] || 'application/octet-stream' });
+    res.writeHead(200, headers);
     res.end(data);
   });
 }
@@ -126,8 +184,14 @@ const phoneIdsByClient = new Map();
 let nextPhoneId = 1;
 let viewerSocket = null;
 
+// Everything log() prints also lands in server.log; the file starts fresh on
+// every boot ('w'), so it holds exactly this run.
+const logStream = fs.createWriteStream(LOG_FILE, { flags: 'w' });
+
 function log(msg) {
-  console.log(`[${fmtDateTime(new Date())}] ${msg}`);
+  const line = `[${fmtDateTime(new Date())}] ${msg}`;
+  console.log(line);
+  logStream.write(`${line}\n`);
 }
 
 // Roster of connected phones, printed whenever it changes. Settings come from
@@ -136,6 +200,7 @@ const CLIENT_COLUMNS = [
   ['id', (id) => String(id)],
   ['resolution', (id, s) => s.res || '?'],
   ['mic', (id, s) => (s.mic === undefined ? '?' : s.mic ? 'on' : 'off')],
+  ['pose', (id, s) => (s.pose === undefined ? '?' : s.pose ? 'on' : 'off')],
 ];
 const CLIENT_COL_WIDTH = 12;
 
@@ -149,10 +214,14 @@ function logClients() {
     return;
   }
   log(`Clients (${phones.size}):`);
-  console.log(clientRow(CLIENT_COLUMNS.map(([name]) => name)));
+  const rows = [clientRow(CLIENT_COLUMNS.map(([name]) => name))];
   for (const id of [...phones.keys()].sort((a, b) => a - b)) {
     const state = phones.get(id).clientState || {};
-    console.log(clientRow(CLIENT_COLUMNS.map(([, value]) => value(id, state))));
+    rows.push(clientRow(CLIENT_COLUMNS.map(([, value]) => value(id, state))));
+  }
+  for (const row of rows) {
+    console.log(row);
+    logStream.write(`${row}\n`);
   }
 }
 
@@ -179,6 +248,49 @@ function send(socket, obj) {
   if (socket && socket.readyState === socket.OPEN) {
     socket.send(JSON.stringify(obj));
   }
+}
+
+// ---------------------------------------------------------------------------
+// Marker survey: turns per-tag camera-frame observations from the phones into
+// a persistent room-frame marker map and room-frame phone poses.
+const survey = createSurvey({
+  file: MARKER_MAP_FILE,
+  markerSizeM: POSE_CONFIG.markerSizeM,
+  log,
+});
+
+// Room mapping: posed keyframes -> depth inference -> voxel grid, streamed to
+// the viewer as deltas. Enabled only when the depth model is present.
+const mapping = createMapping({
+  modelPath: fs.existsSync(DEPTH_MODEL_METRIC) ? DEPTH_MODEL_METRIC : DEPTH_MODEL,
+  metric: fs.existsSync(DEPTH_MODEL_METRIC),
+  survey,
+  log,
+  onDelta: (delta) => send(viewerSocket, { type: 'map-delta', ...delta }),
+  onSnapshot: (parts) => parts.forEach((p) => send(viewerSocket, p)),
+  onWalls: (walls) => send(viewerSocket, { type: 'walls', walls }),
+});
+
+// A keyframe binary frame: 'KFR1' magic, uint32 LE header length, JSON
+// header, JPEG. Returns true if the frame was consumed as a keyframe. A
+// recording chunk opening with the same four bytes (p ~ 2^-32) falls through
+// on the JSON parse and lands in the recording as it should.
+function tryKeyframe(ws, data) {
+  if (data.length < 9 || data[0] !== 0x4b || data[1] !== 0x46 ||
+    data[2] !== 0x52 || data[3] !== 0x31) return false;
+  const headerLen = data.readUInt32LE(4);
+  if (headerLen <= 0 || 8 + headerLen > data.length) return false;
+  let header;
+  try {
+    header = JSON.parse(data.subarray(8, 8 + headerLen).toString('utf8'));
+  } catch {
+    return false;
+  }
+  if (!header.intrinsics || !Array.isArray(header.tags)) return false;
+  // Copy the JPEG out: the worker takes ownership of the buffer it gets, and
+  // a subarray would hand it the whole socket message's memory.
+  mapping.handleKeyframe(ws.phoneId, header, Buffer.from(data.subarray(8 + headerLen)));
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -289,7 +401,21 @@ function handleSignal(ws, msg) {
       // The id is the server's to hand out, and the phone shows it so a device
       // can be matched with its tile and its recordings.
       send(ws, { type: 'phone-id', phoneId: ws.phoneId });
+      // The printed marker size is the server's to declare — a phone assuming
+      // a different size would scale every distance it reports.
+      send(ws, {
+        type: 'pose-config',
+        ...POSE_CONFIG,
+        keyframeMs: mapping.isActive() ? POSE_CONFIG.keyframeMs : 0,
+      });
       if (viewerSocket) send(ws, { type: 'viewer-ready' });
+    } else if (msg.role === 'phone-bulk') {
+      // A phone's second socket, carrying only bulk binary (recorder chunks,
+      // keyframes) so they cannot queue ahead of the phone's JSON traffic.
+      // Same clientId as the main socket -> same phoneId; recording state
+      // stays on the main socket.
+      ws.role = 'phone-bulk';
+      ws.phoneId = phoneIdFor(msg.clientId);
     } else if (msg.role === 'viewer') {
       if (viewerSocket && viewerSocket !== ws) viewerSocket.close();
       viewerSocket = ws;
@@ -299,13 +425,16 @@ function handleSignal(ws, msg) {
       // id it is streaming to, so leave that case alone.
       if (!vcamDeviceId) detectVcam();
       send(ws, { type: 'vcam-state', phoneId: vcamPhoneId, available: !!vcamDeviceId });
+      send(ws, { type: 'marker-map', ...survey.getMarkerMap() });
+      for (const part of mapping.snapshotParts()) send(ws, part);
+      send(ws, { type: 'walls', walls: mapping.getWalls() });
       for (const phone of phones.values()) send(phone, { type: 'viewer-ready' });
     }
     return;
   }
   if (msg.type === 'client-state') {
     if (ws.role === 'phone') {
-      ws.clientState = { res: msg.res, mic: !!msg.mic };
+      ws.clientState = { res: msg.res, mic: !!msg.mic, pose: !!msg.pose };
       logClients();
     }
     return;
@@ -315,20 +444,56 @@ function handleSignal(ws, msg) {
     return;
   }
   if (msg.type === 'ping') {
-    // Liveness probe: clients treat an unanswered ping as a dead socket.
-    send(ws, { type: 'pong' });
+    // Liveness probe: clients treat an unanswered ping as a dead socket. The
+    // reply carries viewer presence so a phone that missed a viewer-ready
+    // (frozen page, swapped socket) converges within one probe interval.
+    send(ws, { type: 'pong', viewer: !!viewerSocket });
     return;
   }
   if (msg.type === 'time-ping') {
     // NTP-style probe: clients use the server clock as the common timebase
     // for aligning frames captured on different devices.
-    send(ws, { type: 'time-pong', t0: msg.t0, tServer: Date.now() });
+    send(ws, { type: 'time-pong', t0: msg.t0, tServer: serverNow() });
     return;
   }
   if (msg.type === 'vcam') {
     if (ws.role === 'viewer') {
       if (msg.phoneId === null) stopVcam();
       else startVcam(msg.phoneId);
+    }
+    return;
+  }
+  if (msg.type === 'marker-remove') {
+    if (ws.role === 'viewer' && Number.isInteger(msg.id)) {
+      survey.removeMarker(msg.id);
+      send(ws, { type: 'marker-map', ...survey.getMarkerMap() });
+    }
+    return;
+  }
+  if (msg.type === 'map-clear') {
+    if (ws.role === 'viewer') mapping.clear().forEach((p) => send(ws, p));
+    return;
+  }
+  if (msg.type === 'map-view') {
+    if (ws.role === 'viewer') {
+      mapping.setViewMode(msg.mode).forEach((p) => send(ws, p));
+      // Keyframes are pure waste while mapping is off — tell the phones.
+      for (const phone of phones.values()) {
+        send(phone, { type: 'pose-config', keyframeMs: mapping.isActive() ? POSE_CONFIG.keyframeMs : 0 });
+      }
+    }
+    return;
+  }
+  if (msg.type === 'pose') {
+    if (ws.role === 'phone') {
+      // The survey consumes the camera-frame observations and hands back the
+      // room-frame pose; the viewer gets both in one message.
+      const { pose, quality, mapChanged } = survey.handlePose(msg, ws.phoneId);
+      send(viewerSocket, { ...msg, phoneId: ws.phoneId, room: { pose, quality } });
+      // The phone cannot know its room pose on its own (the marker map lives
+      // here) — reflect it back for the on-phone stats overlay.
+      send(ws, { type: 'room-pose', pose, quality });
+      if (mapChanged) send(viewerSocket, { type: 'marker-map', ...survey.getMarkerMap() });
     }
     return;
   }
@@ -340,8 +505,25 @@ function handleSignal(ws, msg) {
   }
 }
 
+// Pose/mapping assets are gitignored (large binaries); report what is missing
+// once at startup so a fresh checkout knows why those features are dark.
+function probeAssets() {
+  const missing = [];
+  for (const f of ['opencv.js', 'three.min.js', 'OrbitControls.js']) {
+    if (!fs.existsSync(path.join(VENDOR_DIR, f))) missing.push(`public/vendor/${f}`);
+  }
+  if (missing.length) {
+    log(`Pose features disabled: missing ${missing.join(', ')} — run "npm run fetch-vendor"`);
+  }
+  if (!fs.existsSync(DEPTH_MODEL_METRIC) && !fs.existsSync(DEPTH_MODEL)) {
+    log('Mapping disabled: no depth model in models/ — run "npm run fetch-vendor"');
+  }
+}
+
 function main() {
   detectVcam();
+  probeAssets();
+  survey.load();
   const tls = loadOrCreateCert();
   const server = https.createServer(tls, serveStatic);
   const wss = new WebSocketServer({ server });
@@ -349,9 +531,16 @@ function main() {
   wss.on('connection', (ws) => {
     ws.on('message', (data, isBinary) => {
       if (isBinary) {
-        if (ws.role === 'phone' && ws.recordingStream) {
-          ws.recordingStream.write(data);
-          ws.recordingBytes += data.length;
+        if (ws.role !== 'phone' && ws.role !== 'phone-bulk') return;
+        // Keyframes must be picked off before the recording sink — they are
+        // not WebM data, and they arrive whether or not a recording is open.
+        if (tryKeyframe(ws, data)) return;
+        // Recording state lives on the phone's main socket, wherever the
+        // bytes arrive.
+        const main = ws.role === 'phone' ? ws : phones.get(ws.phoneId);
+        if (main?.recordingStream) {
+          main.recordingStream.write(data);
+          main.recordingBytes += data.length;
           if (ws.phoneId === vcamPhoneId && vcamFfmpeg) vcamFfmpeg.stdin.write(data);
         }
         return;

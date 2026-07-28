@@ -10,6 +10,8 @@ const devices = new Map();
 let soundOn = false;
 let vcamAvailable = false;
 let vcamPhoneId = null;
+// Room-frame marker map, as surveyed by the server. Null until it arrives.
+let markerMap = null;
 
 const signaling = connectSignaling('viewer', {
   onOpen() {
@@ -24,7 +26,41 @@ const signaling = connectSignaling('viewer', {
     if (clockSync.handle(msg)) return;
     if (msg.type === 'rtp-map') {
       const dev = devices.get(msg.phoneId);
-      if (dev) updateRtpMap(dev, { rtp: msg.rtp, serverTime: msg.serverTime });
+      if (dev) {
+        updateRtpMap(dev, { rtp: msg.rtp, serverTime: msg.serverTime });
+        if (msg.unc !== undefined) dev.clockUnc = msg.unc;
+      }
+      return;
+    }
+    if (msg.type === 'pose') {
+      updatePoseLabel(msg.phoneId, msg);
+      return;
+    }
+    if (msg.type === 'marker-map') {
+      markerMap = msg;
+      roomViewList.forEach((v) => v.setMarkerMap(msg));
+      return;
+    }
+    if (msg.type === 'map-snapshot') {
+      // Chunked full map: the first part replaces whatever is shown.
+      roomViewList.forEach((v) => v.applyVoxels({
+        voxelSizeM: msg.voxelSizeM,
+        added: msg.voxels,
+        reset: msg.part === 1,
+      }));
+      return;
+    }
+    if (msg.type === 'map-delta') {
+      roomViewList.forEach((v) => v.applyVoxels({
+        voxelSizeM: msg.voxelSizeM,
+        added: msg.added,
+        removed: msg.removed,
+      }));
+      return;
+    }
+    if (msg.type === 'walls') {
+      // Fitted room-shell segments — a separate layer over the raw voxels.
+      roomViewList.forEach((v) => v.setWalls(msg.walls));
       return;
     }
     if (msg.type === 'offer') {
@@ -54,6 +90,36 @@ function updateCamBtn(phoneId, dev) {
   dev.camBtn.classList.toggle('active', phoneId === vcamPhoneId);
 }
 
+// Camera-frame readout on the tile: which tags this phone sees and how far
+// the nearest one is. Goes stale quickly — a phone that stops reporting
+// (disabled, backgrounded) must not keep showing a distance.
+const POSE_LABEL_TTL_MS = 2000;
+
+function updatePoseLabel(phoneId, msg) {
+  const dev = devices.get(phoneId);
+  if (!dev) return;
+  dev.lastPoseMsg = msg;
+  dev.lastPoseAt = performance.now();
+  if (msg.room?.pose) {
+    const seen = msg.tags.map((t) => t.id);
+    roomViewList.forEach((v) => v.updatePhone(phoneId, msg.room.pose, seen));
+  }
+  clearTimeout(dev.poseLabelTimer);
+  if (msg.tags.length) {
+    const ids = msg.tags.map((t) => t.id).join(',');
+    const room = msg.room?.pose
+      ? ` · [${msg.room.pose.p.map((v) => v.toFixed(1)).join(', ')}] ${msg.room.quality}`
+      : '';
+    dev.poseLabel.textContent =
+      `tags ${ids}${room}${msg.calibrated ? '' : ' · uncalibrated'}`;
+  } else {
+    dev.poseLabel.textContent = 'no tags';
+  }
+  dev.poseLabelTimer = setTimeout(() => {
+    dev.poseLabel.textContent = '';
+  }, POSE_LABEL_TTL_MS);
+}
+
 function updateStatus() {
   const n = devices.size;
   setStatus(n === 0 ? 'no devices' : `${n} device${n === 1 ? '' : 's'} live`);
@@ -79,7 +145,9 @@ function ensureDevice(phoneId) {
     ev.stopPropagation();
     signaling.send({ type: 'vcam', phoneId: phoneId === vcamPhoneId ? null : phoneId });
   };
-  tile.append(video, label, camBtn);
+  const poseLabel = document.createElement('div');
+  poseLabel.className = 'pose-label';
+  tile.append(video, label, poseLabel, camBtn);
   // Click a tile to enlarge it; click again to go back to the grid.
   tile.onclick = () => {
     const zoomed = tile.classList.contains('zoom');
@@ -89,8 +157,10 @@ function ensureDevice(phoneId) {
   grid.append(tile);
 
   dev = {
-    pc: null, tile, video, label, camBtn,
-    frames: [], lastFrame: null, latency: null, capturing: false, rtpMap: null,
+    pc: null, tile, video, label, camBtn, poseLabel,
+    frames: [], lastFrame: null, latency: null, capturing: false,
+    rtpMap: null, rtpSamples: [], clockUnc: null,
+    lastPoseMsg: null, poseLabelTimer: null,
   };
   devices.set(phoneId, dev);
   updateCamBtn(phoneId, dev);
@@ -102,6 +172,8 @@ function removeDevice(phoneId) {
   const dev = devices.get(phoneId);
   if (!dev) return;
   dev.pc?.close();
+  clearTimeout(dev.poseLabelTimer);
+  roomViewList.forEach((v) => v.removePhone(phoneId));
   dev.tile.remove();
   dropFrames(dev);
   devices.delete(phoneId);
@@ -112,9 +184,14 @@ async function acceptOffer(phoneId, description) {
   const dev = ensureDevice(phoneId);
   dev.pc?.close();
   // A phone keeps its id across reloads, so a device can be handed a second
-  // connection. Its RTP clock and buffered frames belong to the old one.
+  // connection. Its RTP clock, buffered frames and pose all belong to the old
+  // one.
   dev.rtpMap = null;
+  dev.rtpSamples = [];
   dev.latency = null;
+  dev.lastPoseMsg = null;
+  clearTimeout(dev.poseLabelTimer);
+  dev.poseLabel.textContent = '';
   dropFrames(dev);
   dev.pc = new RTCPeerConnection(RTC_CONFIG);
   dev.pc.ontrack = (ev) => {
@@ -142,10 +219,27 @@ async function acceptOffer(phoneId, description) {
 // surface tiling all devices, drawn each frame.
 const combined = document.getElementById('combined');
 const combinedBtn = document.getElementById('combinedBtn');
+const sceneBtn = document.getElementById('sceneBtn');
+const map2dBtn = document.getElementById('map2dBtn');
+const sideBtn = document.getElementById('sideBtn');
+const sceneCanvas = document.getElementById('scene');
+const map2dCanvas = document.getElementById('map2d');
+const mapSideCanvas = document.getElementById('mapSide');
+const maps2d = document.getElementById('maps2d');
+const roomViews = document.getElementById('roomViews');
 const backdrop = document.getElementById('backdrop');
 const syncLabel = document.getElementById('syncLabel');
 const ctx = combined.getContext('2d');
-let combinedActive = false;
+let combinedActive = true;   // starts as the pip over the room views
+const sceneView = createSceneView(sceneCanvas);
+// Double-clicking a tag in the top view forgets it — the escape hatch for
+// tags that are gone from the room (e.g. one that was shown on a screen).
+// Forgetting the anchor resets the whole survey.
+const forgetMarker = (id) => signaling.send({ type: 'marker-remove', id });
+const map2dView = createMap2dView(map2dCanvas, 'top', { onMarkerDblClick: forgetMarker });
+const mapSideView = createMap2dView(mapSideCanvas, 'side', { onMarkerDblClick: forgetMarker });
+// All room views consume identical updates.
+const roomViewList = [sceneView, map2dView, mapSideView];
 
 // --- Frame synchronisation -------------------------------------------------
 // Phones deliver frames with different end-to-end latency, so a naive
@@ -159,22 +253,44 @@ const SYNC_BUFFER_MAX = 20;    // frames held per device
 // frame can be picked from either side of it; a shorter cushion leaves only
 // already-past frames to choose from and the error grows to a full frame.
 const SYNC_MARGIN_MS = 70;
+// History kept behind the presentation instant, so a feed can still be pulled
+// backwards when another one stalls. Bounded by SYNC_BUFFER_MAX either way.
+const FRAME_KEEP_BACK_MS = 250;
 let syncTargetLatency = 0;
 let syncSupported = false;
 
 // Pairings are stamped when a frame is encoded, so each carries the encode
-// delay of that particular frame on top of the capture instant. Encode delay
-// is always positive, so the sample implying the earliest capture is the
-// truest one — the same reasoning that makes the lowest-RTT clock probe win.
-const RTP_MAP_RELAX_MS = 0.3;  // per sample, so slow clock drift is tracked
+// delay of that particular frame on top of the capture instant, and the
+// phone's own clock error on top of that. Encode delay is always positive, so
+// the sample implying the earliest capture is the truest one — the same
+// reasoning that makes the lowest-RTT clock probe win.
+//
+// The catch is that a lower envelope taken over all of time never lets go of
+// its winner: once the phone's clock estimate moves, that one sample keeps a
+// bias no later sample can outbid, and the feed sits wrong indefinitely. Only
+// a recent window is considered, so the mapping reconverges on its own.
+const RTP_MAP_WINDOW_MS = 20000;
+const RTP_MAP_MAX_SAMPLES = 400;
 
 function updateRtpMap(dev, sample) {
-  if (!dev.rtpMap) {
-    dev.rtpMap = sample;
-    return;
+  const samples = dev.rtpSamples;
+  samples.push(sample);
+  while (samples.length > RTP_MAP_MAX_SAMPLES ||
+    (samples.length && sample.serverTime - samples[0].serverTime > RTP_MAP_WINDOW_MS)) {
+    samples.shift();
   }
-  const predicted = dev.rtpMap.serverTime + rtpDeltaMs(sample.rtp, dev.rtpMap.rtp);
-  if (sample.serverTime <= predicted + RTP_MAP_RELAX_MS) dev.rtpMap = sample;
+  // Put the samples on a common footing — what each implies for the newest
+  // frame's capture instant — and keep the earliest.
+  let best = samples[0];
+  let bestImplied = Infinity;
+  for (const s of samples) {
+    const implied = s.serverTime + rtpDeltaMs(sample.rtp, s.rtp);
+    if (implied < bestImplied) {
+      bestImplied = implied;
+      best = s;
+    }
+  }
+  dev.rtpMap = best;
 }
 
 // Capture instant of a frame, on the server clock — null until the owning
@@ -210,9 +326,23 @@ function startFrameCapture(phoneId, dev) {
   dev.video.requestVideoFrameCallback(onFrame);
 }
 
+// Buffered bitmaps are capped: the sync buffer holds SYNC_BUFFER_MAX frames
+// per device and a full 4K bitmap pins ~30 MB of GPU memory — the composite
+// never draws a tile anywhere near that size anyway.
+const BITMAP_MAX_DIM = 1920;
+
 function bufferFrame(dev, captureTime) {
-  if (dev.video.videoWidth === 0) return;
-  createImageBitmap(dev.video).then((bitmap) => {
+  const vw = dev.video.videoWidth;
+  const vh = dev.video.videoHeight;
+  if (vw === 0) return;
+  const s = Math.min(1, BITMAP_MAX_DIM / Math.max(vw, vh));
+  const make = s < 1
+    ? createImageBitmap(dev.video, {
+      resizeWidth: Math.round(vw * s),
+      resizeHeight: Math.round(vh * s),
+    })
+    : createImageBitmap(dev.video);
+  make.then((bitmap) => {
     if (!dev.frames) {
       bitmap.close();
       return;
@@ -234,10 +364,9 @@ function dropFrames(dev) {
 // closest to the shared presentation instant. Picking the nearest frame rather
 // than the newest already-due one halves the alignment error, since the
 // nearest may sit just after the instant rather than up to a frame before it.
-function dueFrame(dev, now) {
+function dueFrame(dev, target) {
   const frames = dev.frames;
   if (!frames?.length) return dev.lastFrame;
-  const target = now - syncTargetLatency;
 
   let bestIdx = 0;
   let bestErr = Infinity;
@@ -247,11 +376,43 @@ function dueFrame(dev, now) {
     bestErr = err;
     bestIdx = i;
   }
+  const chosen = frames[bestIdx];
 
-  for (let i = 0; i < bestIdx; i++) frames[i].bitmap.close();
-  frames.splice(0, bestIdx);
-  dev.lastFrame = frames[0];
-  return dev.lastFrame;
+  // Keep a little history behind the presentation instant instead of dropping
+  // everything already shown: a latency spike on any one feed drags the shared
+  // instant backwards, and the feeds that had discarded those frames would
+  // have nothing left to offer but their oldest one.
+  let drop = 0;
+  while (drop < bestIdx && frames[drop].captureTime < target - FRAME_KEEP_BACK_MS) drop++;
+  for (let i = 0; i < drop; i++) frames[i].bitmap.close();
+  frames.splice(0, drop);
+
+  dev.lastFrame = chosen;
+  return chosen;
+}
+
+// What the header reports is the alignment of the frames actually drawn: how
+// far the worst of them sits from the shared presentation instant. The
+// dashboard's own clock error shifts that instant for every feed at once, so
+// it cancels here and this number cannot see it; the phones' clock error does
+// not cancel, and is reported beside it rather than quietly left out.
+let syncErrPeak = 0;
+let syncLabelAt = 0;
+
+function updateSyncLabel(feeds, latencies, worstErr) {
+  // Peak-hold with a slow decay: a per-frame number changes far too fast to
+  // read, and the peak is the honest one to quote.
+  syncErrPeak = Math.max(worstErr, syncErrPeak * 0.99);
+  if (performance.now() - syncLabelAt < 250) return;
+  syncLabelAt = performance.now();
+  if (!syncSupported) {
+    syncLabel.textContent = feeds.length ? 'sync unavailable' : '';
+    return;
+  }
+  const spread = Math.round(Math.max(...latencies) - Math.min(...latencies));
+  const uncs = feeds.map(([, d]) => d.clockUnc).filter((u) => u !== null && isFinite(u));
+  const clock = uncs.length ? ` · clock ±${Math.round(Math.max(...uncs))} ms` : '';
+  syncLabel.textContent = `sync ±${Math.round(syncErrPeak)} ms · lag spread ${spread} ms${clock}`;
 }
 
 function drawCombined() {
@@ -261,14 +422,10 @@ function drawCombined() {
 
   const latencies = feeds.map(([, d]) => d.latency).filter((l) => l !== null);
   syncSupported = latencies.length === feeds.length && feeds.length > 0;
-  if (syncSupported) {
-    syncTargetLatency = Math.max(...latencies) + SYNC_MARGIN_MS;
-    const spread = Math.round(Math.max(...latencies) - Math.min(...latencies));
-    syncLabel.textContent = `sync ±${spread} ms`;
-  } else {
-    feeds.forEach(([, d]) => dropFrames(d));
-    syncLabel.textContent = feeds.length ? 'sync unavailable' : '';
-  }
+  if (syncSupported) syncTargetLatency = Math.max(...latencies) + SYNC_MARGIN_MS;
+  else feeds.forEach(([, d]) => dropFrames(d));
+  const target = now - syncTargetLatency;
+  let worstErr = 0;
 
   ctx.fillStyle = '#000';
   ctx.fillRect(0, 0, combined.width, combined.height);
@@ -283,7 +440,8 @@ function drawCombined() {
       const cx = (i % cols) * cw;
       const cy = Math.floor(i / cols) * ch;
       // Synced feeds draw a buffered frame; otherwise fall back to live video.
-      const frame = syncSupported ? dueFrame(d, now) : null;
+      const frame = syncSupported ? dueFrame(d, target) : null;
+      if (frame) worstErr = Math.max(worstErr, Math.abs(frame.captureTime - target));
       const source = frame ? frame.bitmap : d.video;
       const sw = frame ? frame.bitmap.width : d.video.videoWidth;
       const sh = frame ? frame.bitmap.height : d.video.videoHeight;
@@ -298,29 +456,121 @@ function drawCombined() {
       ctx.fillText(`Phone ${id}`, cx + 20, cy + ch - 22);
     });
   }
+  updateSyncLabel(feeds, latencies, worstErr);
   requestAnimationFrame(drawCombined);
+}
+
+// Overlay views above the tile grid: the combined canvas and/or the room
+// views (3D scene and 2D floor plan — independently toggleable, side by side
+// when both are on). Combined alongside a room view shrinks into a floating
+// pip in the top-left. The grid keeps rendering underneath behind the opaque
+// backdrop.
+let show3d = true;
+let show2d = true;      // top-down floor plan
+let showSide = false;   // side elevation (height)
+
+// Age of a pose in one-character units, one decimal: 3.2s, 1.5m, 2.0h, 1.1d.
+function fmtAge(ms) {
+  const s = ms / 1000;
+  if (s < 60) return `${s.toFixed(1)}s`;
+  if (s < 3600) return `${(s / 60).toFixed(1)}m`;
+  if (s < 86400) return `${(s / 3600).toFixed(1)}h`;
+  return `${(s / 86400).toFixed(1)}d`;
+}
+
+// Client roster over the room views: who is where, facing which way, and how
+// fresh the fix is. Yaw is the heading in the floor plane (0° = along room z,
+// toward the room from the anchor wall), pitch positive looking up.
+const roomStats = document.getElementById('roomStats');
+setInterval(() => {
+  if (!show3d && !show2d && !showSide) {
+    roomStats.textContent = '';
+    return;
+  }
+  const rows = [];
+  for (const [id, dev] of [...devices.entries()].sort((a, b) => a[0] - b[0])) {
+    const room = dev.lastPoseMsg?.room;
+    if (!room?.pose) continue;
+    const age = performance.now() - dev.lastPoseAt;
+    const stale = age > 2000;
+    const colorHex = ROOM_PHONE_COLORS[id % ROOM_PHONE_COLORS.length];
+    const color = stale ? '#777' : `#${colorHex.toString(16).padStart(6, '0')}`;
+    const p = room.pose.p;
+    const f = quatRotate(room.pose.q, [0, 0, 1]);
+    const yaw = Math.atan2(f[0], f[2]) * 180 / Math.PI;
+    const pitch = Math.asin(Math.max(-1, Math.min(1, f[1]))) * 180 / Math.PI;
+    const row = document.createElement('div');
+    row.style.color = color;
+    row.textContent =
+      `P${id}  ${p.map((v) => v.toFixed(2)).join(', ')}` +
+      `  yaw ${Math.round(yaw)}°  pitch ${Math.round(pitch)}°` +
+      `  ${dev.lastPoseMsg.tags.length} tags  ${fmtAge(age)}`;
+    rows.push(row);
+  }
+  roomStats.replaceChildren(...rows);
+}, 100);
+
+function refreshViews() {
+  const room = show3d || show2d || showSide;
+  combinedBtn.classList.toggle('on', combinedActive);
+  sceneBtn.classList.toggle('on', show3d);
+  map2dBtn.classList.toggle('on', show2d);
+  sideBtn.classList.toggle('on', showSide);
+  backdrop.style.display = combinedActive || room ? 'block' : '';
+  combined.style.display = combinedActive ? 'block' : '';
+  combined.classList.toggle('pip', combinedActive && room);
+  roomViews.classList.toggle('active', room);
+  sceneCanvas.classList.toggle('active', show3d);
+  maps2d.classList.toggle('active', show2d || showSide);
+  map2dCanvas.classList.toggle('active', show2d);
+  mapSideCanvas.classList.toggle('active', showSide);
+  voxelControls.style.display = room ? '' : 'none';
+  sceneView.setActive(show3d);
+  map2dView.setActive(show2d);
+  mapSideView.setActive(showSide);
+  if (combinedActive) drawCombined();
+  else {
+    syncLabel.textContent = '';
+    syncErrPeak = 0;
+    for (const dev of devices.values()) dropFrames(dev);
+  }
 }
 
 combinedBtn.onclick = () => {
   combinedActive = !combinedActive;
-  combinedBtn.textContent = `Combined: ${combinedActive ? 'on' : 'off'}`;
-  backdrop.style.display = combinedActive ? 'block' : '';
-  combined.style.display = combinedActive ? 'block' : '';
-  if (combinedActive) {
-    drawCombined();
-  } else {
-    syncLabel.textContent = '';
-    for (const dev of devices.values()) dropFrames(dev);
-  }
+  refreshViews();
+};
+sceneBtn.onclick = () => {
+  show3d = !show3d;
+  refreshViews();
+};
+map2dBtn.onclick = () => {
+  show2d = !show2d;
+  refreshViews();
+};
+sideBtn.onclick = () => {
+  showSide = !showSide;
+  refreshViews();
 };
 
-// Fullscreen the active view: the combined canvas, or the tile grid.
+// Voxel-map controls only make sense while the 3D view is up.
+const voxelControls = document.getElementById('voxelControls');
+const voxelViewSelect = document.getElementById('voxelViewSelect');
+document.getElementById('clearVoxelsBtn').onclick = () => signaling.send({ type: 'map-clear' });
+voxelViewSelect.onchange = () => signaling.send({ type: 'map-view', mode: voxelViewSelect.value });
+
+// Fullscreen the active view. Overlays (combined, room views, pip) all live
+// inside <main>, so fullscreening it keeps whatever combination is showing.
 fullscreenBtn.onclick = () => {
-  (combinedActive ? combined : grid).requestFullscreen?.();
+  const overlayActive = combinedActive || show3d || show2d || showSide;
+  (overlayActive ? document.querySelector('main') : grid).requestFullscreen?.();
 };
 
 muteBtn.onclick = () => {
   soundOn = !soundOn;
-  muteBtn.textContent = `Sound: ${soundOn ? 'on' : 'off'}`;
+  muteBtn.classList.toggle('on', soundOn);
   for (const dev of devices.values()) dev.video.muted = !soundOn;
 };
+
+// Room views start on — must run after every const above is initialized.
+refreshViews();

@@ -8,12 +8,15 @@
 </head>
 <body>
   <header>
+    <a class="home" href="/" title="Back to start">Phone</a>
     <span id="phoneLabel"></span>
     <span id="status" class="grow">starting…</span>
     <select id="resSelect">
       <option value="480p">480p</option>
-      <option value="720p" selected>720p</option>
+      <option value="720p">720p</option>
       <option value="1080p">1080p</option>
+      <option value="1440p">1440p</option>
+      <option value="4K" selected>4K</option>
     </select>
     <button id="micBtn" class="icon-btn" type="button" title="Microphone" aria-label="Microphone">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
@@ -42,9 +45,20 @@
         <circle cx="12" cy="12" r="4.2" fill="currentColor" stroke="none"/>
       </svg>
     </button>
+    <button id="poseBtn" class="icon-btn" type="button" title="Marker tracking" aria-label="Marker tracking">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M4 8V5.5A1.5 1.5 0 0 1 5.5 4H8"/>
+        <path d="M16 4h2.5A1.5 1.5 0 0 1 20 5.5V8"/>
+        <path d="M20 16v2.5a1.5 1.5 0 0 1-1.5 1.5H16"/>
+        <path d="M8 20H5.5A1.5 1.5 0 0 1 4 18.5V16"/>
+        <rect x="9" y="9" width="6" height="6"/>
+      </svg>
+    </button>
   </header>
   <main class="tappable">
     <video id="preview" autoplay playsinline muted></video>
+    <div id="poseStats"></div>
     <div id="pauseOverlay">
       <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
         <path d="M8 5l11 7-11 7z"/>
@@ -52,6 +66,9 @@
     </div>
   </main>
   <script src="/common.js"></script>
+  <script src="/cv-common.js"></script>
+  <script src="/pose-math.js"></script>
+  <script src="/pose.js"></script>
   <script src="/phone.js"></script>
 </body>
 </html>

@@ -17,17 +17,42 @@ body {
   flex-direction: column;
 }
 
+/* Every page: one fixed-height topnav, content below it. The home link is
+   always the first element. */
 header {
   display: flex;
   align-items: center;
+  flex-shrink: 0;
   gap: 12px;
-  padding: 10px 14px;
+  height: 52px;
+  padding: 0 14px;
   background: #1c1c1c;
 }
 
 header h1 {
   font-size: 16px;
   font-weight: 600;
+}
+
+/* The page heading doubles as the way back to the landing page. */
+header .home {
+  flex-shrink: 0;
+  color: #eee;
+  text-decoration: none;
+  font-size: 16px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+header .home:hover {
+  text-decoration: underline;
+}
+
+/* Paper gets content only, never the page chrome. */
+@media print {
+  header {
+    display: none;
+  }
 }
 
 /* Takes the header's slack, so whatever follows it sits on the right. */
@@ -67,7 +92,7 @@ select {
   color: #eee;
   border: 1px solid #444;
   border-radius: 6px;
-  padding: 8px 14px;
+  padding: 4px 9px;
   font-size: 14px;
   cursor: pointer;
 }
@@ -81,6 +106,22 @@ button:active {
 button.active {
   background: #1d5c2e;
   border-color: #2e8b47;
+}
+
+/* Text toggles show their state as a dot instead of on/off wording. */
+button.toggle::before {
+  content: '';
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #666;
+  margin-right: 7px;
+  vertical-align: 1px;
+}
+
+button.toggle.on::before {
+  background: #4caf50;
 }
 
 .icon-btn {
@@ -119,6 +160,26 @@ video {
 /* Phone preview: tapping the feed toggles pause. */
 main.tappable {
   cursor: pointer;
+}
+
+/* Live marker-tracking stats over the phone preview. */
+#poseStats {
+  position: absolute;
+  left: 8px;
+  top: 8px;
+  padding: 4px 8px;
+  background: rgba(0, 0, 0, 0.55);
+  border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #8fc79d;
+  white-space: pre;
+  pointer-events: none;
+}
+
+#poseStats:empty {
+  display: none;
 }
 
 #pauseOverlay {
@@ -181,6 +242,23 @@ body.paused #pauseOverlay {
   pointer-events: none;
 }
 
+.tile .pose-label {
+  position: absolute;
+  left: 8px;
+  top: 8px;
+  padding: 3px 8px;
+  background: rgba(0, 0, 0, 0.6);
+  border-radius: 4px;
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: #8fc79d;
+  pointer-events: none;
+}
+
+.tile .pose-label:empty {
+  display: none;
+}
+
 .tile .cam-btn {
   position: absolute;
   right: 8px;
@@ -222,6 +300,90 @@ body.paused #pauseOverlay {
   max-height: 100%;
   background: #000;
   z-index: 2;
+}
+
+/* Combined stream floating over the room views: picture-in-picture in the
+   top-left. The canvas keeps its 1920x1080 backing store; CSS just shrinks
+   it. */
+#combined.pip {
+  position: absolute;
+  left: 12px;
+  top: 12px;
+  width: 384px;
+  max-width: 30vw;
+  height: auto;
+  z-index: 3;
+  border: 1px solid #333;
+  border-radius: 6px;
+}
+
+/* Room views (3D scene and/or 2D floor plan side by side): same layering
+   trick as the combined canvas. */
+#roomViews {
+  display: none;
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+}
+
+#roomViews.active {
+  display: flex;
+}
+
+#roomViews > canvas,
+#maps2d {
+  display: none;
+  flex: 1 1 50%;
+  min-width: 0;
+  height: 100%;
+}
+
+#roomViews > canvas.active {
+  display: block;
+}
+
+/* The two 2D projections stack vertically and split the pane when both are
+   on. */
+#maps2d.active {
+  display: flex;
+  flex-direction: column;
+}
+
+#roomViews > canvas.active ~ #maps2d.active {
+  border-left: 1px solid #333;
+}
+
+#maps2d canvas {
+  display: none;
+  flex: 1 1 50%;
+  min-height: 0;
+  width: 100%;
+}
+
+#maps2d canvas.active {
+  display: block;
+}
+
+#maps2d canvas.active + canvas.active {
+  border-top: 1px solid #333;
+}
+
+/* Client roster overlaying the room views. */
+#roomStats {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  padding: 8px 10px;
+  background: rgba(0, 0, 0, 0.55);
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  pointer-events: none;
+}
+
+#roomStats:empty {
+  display: none;
 }
 
 #empty {

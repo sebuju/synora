@@ -6,12 +6,17 @@ const phoneLabel = document.getElementById('phoneLabel');
 const switchBtn = document.getElementById('switchBtn');
 const micBtn = document.getElementById('micBtn');
 const recBtn = document.getElementById('recBtn');
+const poseBtn = document.getElementById('poseBtn');
 const resSelect = document.getElementById('resSelect');
 
+// Constraints use `ideal`, so a phone that cannot do the asked size degrades
+// to the closest it can rather than failing.
 const RESOLUTIONS = {
   '480p': { width: 854, height: 480 },
   '720p': { width: 1280, height: 720 },
   '1080p': { width: 1920, height: 1080 },
+  '1440p': { width: 2560, height: 1440 },
+  '4K': { width: 3840, height: 2160 },
 };
 
 let facing = 'environment';
@@ -44,6 +49,19 @@ const signaling = connectSignaling('phone', {
     setStatus('signaling lost, reconnecting…');
     stopRecorder();
   },
+  onPong(msg) {
+    // Belt and suspenders for viewer-ready: the pong says whether a viewer is
+    // connected right now, so a missed viewer-ready (page was frozen, socket
+    // was being swapped) heals within one probe interval instead of needing
+    // a manual reload.
+    if (msg.viewer === undefined) return;
+    if (msg.viewer && (!viewerWaiting || pcDead())) {
+      viewerWaiting = true;
+      restartCall();
+    } else if (!msg.viewer) {
+      viewerWaiting = false;
+    }
+  },
   async onMessage(msg) {
     if (clockSync.handle(msg)) return;
     if (msg.type === 'phone-id') {
@@ -54,6 +72,10 @@ const signaling = connectSignaling('phone', {
       await restartCall();
     } else if (msg.type === 'restart-recorder') {
       startRecorder();
+    } else if (msg.type === 'pose-config') {
+      posePipeline.setConfig(msg);
+    } else if (msg.type === 'room-pose') {
+      posePipeline.setRoomPose(msg);
     } else if (msg.type === 'answer' && pc) {
       await pc.setRemoteDescription(msg.description);
     } else if (msg.type === 'ice' && pc) {
@@ -68,10 +90,22 @@ const signaling = connectSignaling('phone', {
 
 const clockSync = createClockSync(signaling);
 
+// Bulk uploads (recorder chunks, keyframes) get their own socket. They share
+// one TCP stream's ordering, but more importantly they no longer sit in front
+// of pose and signaling messages — half a megabyte of WebM per second queued
+// ahead of a pose message is exactly the lag it caused. Same clientId, so the
+// server maps both sockets to the same phone.
+const bulk = connectSignaling('phone-bulk', {}, loadClientId('phone'));
+
 // The server keeps a roster of connected phones; it only learns the settings a
 // phone chose for itself if the phone reports them, on connect and on change.
 function sendClientState() {
-  signaling.send({ type: 'client-state', res: resSelect.value, mic: audioEnabled });
+  signaling.send({
+    type: 'client-state',
+    res: resSelect.value,
+    mic: audioEnabled,
+    pose: posePipeline.enabled,
+  });
 }
 
 // Android hands the camera to whatever app is in the foreground, so a
@@ -129,6 +163,10 @@ async function startCamera() {
       if (sender) await sender.replaceTrack(track);
     }
   }
+
+  // New tracks may mean a different lens or resolution; the pose pipeline
+  // must re-read its intrinsics and make sure its frame loop is armed.
+  posePipeline.onCameraChanged(facing);
 }
 
 // Advertise the absolute-capture-time RTP header extension on the video
@@ -181,15 +219,27 @@ function pipeEncoded(sender, onFrame) {
 // The dashboard sees each frame's RTP timestamp but has no way to know when it
 // was captured. Encoded-frame access gives us both at the sending end, so we
 // publish the pairing and let the dashboard interpolate the rest.
+// Each pairing carries that frame's encode delay on top of the capture
+// instant, and the dashboard can only cancel it by taking the smallest one it
+// has seen recently — so what matters is how many samples land inside its
+// window, not how often the mapping strictly needs refreshing. These cost ~70
+// bytes each.
+const RTP_MAP_PUBLISH_MS = 125;
+
 function frameTimingPublisher() {
   let lastSent = 0;
   return (frame) => {
     const now = clockSync.now();
-    // The RTP clock is exact between pairings, so these are only needed often
-    // enough for the dashboard to find a low-encode-delay sample.
-    if (clockSync.synced && now - lastSent > 250) {
+    if (clockSync.synced && now - lastSent > RTP_MAP_PUBLISH_MS) {
       lastSent = now;
-      signaling.send({ type: 'rtp-map', rtp: frame.timestamp, serverTime: now });
+      // Our own clock error biases this phone's feed alone, so the dashboard
+      // cannot see it in the alignment it measures — send the bound along.
+      signaling.send({
+        type: 'rtp-map',
+        rtp: frame.timestamp,
+        serverTime: now,
+        unc: Math.round(clockSync.uncertaintyMs * 10) / 10,
+      });
     }
   };
 }
@@ -243,12 +293,22 @@ function startRecorder() {
   if (!stream || !wsOpen) return;
   stopRecorder();
   signaling.send({ type: 'recording-start' });
+  // Bitrate tracks the actual capture size — a flat rate turns 4K into mush.
+  // Tiers rather than a formula: encoder efficiency is not linear in pixels.
+  // Read from the track, not the select: the camera may have degraded the
+  // request to whatever it could actually do.
+  const { width = 1280, height = 720 } =
+    stream.getVideoTracks()[0]?.getSettings() ?? {};
+  const px = width * height;
   recorder = new MediaRecorder(stream, {
     mimeType: pickMime(),
-    videoBitsPerSecond: 4_000_000,
+    videoBitsPerSecond:
+      px >= 3840 * 2160 * 0.9 ? 16_000_000
+        : px >= 2560 * 1440 * 0.9 ? 8_000_000
+          : 4_000_000,
   });
   recorder.ondataavailable = (ev) => {
-    if (ev.data.size > 0) signaling.sendBinary(ev.data);
+    if (ev.data.size > 0) bulk.sendBinary(ev.data);
   };
   recorder.start(1000);
   applyPaused();
@@ -297,6 +357,22 @@ recBtn.onclick = async () => {
 feed.onclick = () => {
   paused = !paused;
   applyPaused();
+};
+
+poseBtn.onclick = async () => {
+  const on = !posePipeline.enabled;
+  poseBtn.classList.toggle('active', on);
+  try {
+    localStorage.setItem('streamer-pose-enabled', on ? '1' : '0');
+  } catch {
+    // Storage unavailable — the toggle just does not survive a reload.
+  }
+  try {
+    await posePipeline.setEnabled(on);
+  } catch (err) {
+    poseBtn.classList.remove('active');
+    setStatus(`marker tracking failed: ${err.message}`);
+  }
 };
 
 resSelect.onchange = async () => {
@@ -365,6 +441,28 @@ document.addEventListener('visibilitychange', async () => {
 });
 
 (async () => {
+  posePipeline.init({
+    video: preview,
+    signaling,
+    bulk,
+    clockSync,
+    onState: sendClientState,
+  });
+  // On unless explicitly turned off — the room features are the point.
+  let poseWanted = true;
+  try {
+    poseWanted = localStorage.getItem('streamer-pose-enabled') !== '0';
+  } catch {
+    // Storage unavailable — default on.
+  }
+  if (poseWanted) {
+    poseBtn.classList.add('active');
+    // Loads opencv.js in the background; detection starts once frames flow.
+    posePipeline.setEnabled(true).catch((err) => {
+      poseBtn.classList.remove('active');
+      setStatus(`marker tracking failed: ${err.message}`);
+    });
+  }
   if (!(await ensureCamera())) return;
   keepAwake();
   ensureRecorder();
