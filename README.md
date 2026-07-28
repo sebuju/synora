@@ -93,9 +93,17 @@ Clients detect ArUco tags fixed to the room and the server maintains a persisten
 
 1. Print tags from `/markers`. Tag edge must be exactly 150 mm including the black border (`markerSizeM` in `server.js`); any scale error multiplies every distance in the room frame. A screen showing `/digital` also works as a tag.
 2. Calibrate each client at `/calibrate` (ChArUco board from the same page). Intrinsics are stored per lens and per resolution in `localStorage`. Uncalibrated clients fall back to a generic FOV model and are flagged `calibrated:false` end to end.
-3. Marker tracking is on by default (toggle on the client header). The client-side overlay reports resolution, detect time, per-tag distance / viewing angle / reprojection error, and the current room fix.
+3. Marker tracking is on by default (toggle on the client header). The client-side overlay reports resolution, scan mode, a detect-time breakdown (pixel grab / tag search / PnP), per-tag distance / viewing angle / reprojection error, and the current room fix.
 
-**Detection** (`pose.js`, client). Runs on the preview element via `requestVideoFrameCallback` at ~10 Hz, at native capture resolution. OpenCV's ArUco3 mode keeps the candidate search on a downscaled image while corners refine at full resolution. Per tag, pose comes from `SOLVEPNP_IPPE_SQUARE`. Planar PnP has a two-fold mirror ambiguity; when the OpenCV build exposes `solvePnPGeneric`, both solutions are sent with per-solution reprojection error. The client knows nothing about the marker map — all room-frame math is server-side.
+**Detection** (`detect-worker.js` + `detect-core.js`, client). Runs at ~10 Hz on raw camera frames at native capture resolution, on a worker thread fed by a `MediaStreamTrackProcessor` — detection is the most expensive thing the client does per frame and it must not stall the encoded-frame transform, the recorder or the UI. Where a track processor is unavailable, `pose.js` runs the same core on the page via `requestVideoFrameCallback`.
+
+Three things keep it cheap enough to run on a 4K preview, none of them at the cost of pose accuracy:
+
+- **Luma only.** Camera frames are YUV, and plane 0 is already the grayscale image, so `VideoFrame.copyTo` writes it straight into the wasm heap the detector reads from. The old path drew to a canvas, read back 33 MB of RGBA per frame, copied that into the heap and converted it to gray — four passes over eight megapixels to produce one.
+- **Region-of-interest scanning.** After tags have been seen, only a crop around them is scanned; the margin tracks the measured motion of the tags, an empty crop scan immediately retries the whole frame, and a full sweep is forced at least every 700 ms so new tags cannot be missed for long. Crop coordinates are mapped back to full-frame pixels before anything solves a pose, so the rest of the pipeline only ever sees one coordinate space.
+- **ArUco3 on the full sweep.** Candidates are searched on a downscaled copy and corners refined against the full-resolution image. The downscale factor is `32 / (32 + longEdge * minMarkerLengthRatioOriginalImg)`, which with OpenCV's default ratio of `0` is exactly 1 — setting `useAruco3Detection` alone does nothing. At `0.015` a 4K frame is searched at ~0.36 scale (an 8x area cut) while still accepting a marker 58 px across, about 7.5 m out for a 150 mm tag.
+
+Per tag, pose comes from `SOLVEPNP_IPPE_SQUARE`. Planar PnP has a two-fold mirror ambiguity; when the OpenCV build exposes `solvePnPGeneric`, both solutions are sent with per-solution reprojection error. The client knows nothing about the marker map — all room-frame math is server-side.
 
 **Survey** (`survey.js`, server). The first cleanly observed tag is adopted as the room origin (anchor). Each pose message from a localized client that also sees unknown tags contributes room-pose estimates for them; a tag is promoted into the map once enough estimates agree with their own component-wise median. Known tags are continually refined by a slow running average using leave-one-out camera fixes (a tag never feeds back into its own estimate); the anchor is the datum and never moves. The map persists to `markers.json` (debounced atomic writes) and survives restarts.
 
@@ -152,9 +160,11 @@ fetch-vendor.js        downloads opencv.js / three.js / depth models
 public/
   common.js            signaling socket, liveness probe, clock sync
   client.js             camera, MediaRecorder, peer connection, recovery
-  pose.js              tag detection, PnP, keyframe capture
+  pose.js              pose sockets, intrinsics, stats, on-page fallback
+  detect-worker.js     worker thread: camera frames in, tag poses out
+  detect-core.js       detector objects, scan strategy, PnP, keyframe encode
   pose-math.js         quaternion / SE(3) helpers (shared with server)
-  cv-common.js         opencv loading, intrinsics store, detector factories
+  cv-common.js         opencv loading, intrinsics store, detector + luma factories
   viewer.js            tiles, combined canvas, frame buffering + sync
   scene.js             3D room view (three.js)
   map2d.js             floor plan + elevation views
