@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>On-Screen Marker</title>
+  <link rel="stylesheet" href="/style.css">
+  <style>
+    main { flex-direction: column; gap: 12px; }
+    #tagCanvas { image-rendering: pixelated; display: block; }
+    #tagInfo {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 13px;
+      color: #9a9a9a;
+    }
+    #warn { color: #ff8a80; font-size: 14px; max-width: 480px; text-align: center; }
+    #warn:empty { display: none; }
+    /* Screen calibration: match the outline to a real credit card held
+       against the screen. */
+    #calibrateBox {
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      gap: 10px;
+      padding: 14px;
+      border: 1px solid #444;
+      border-radius: 8px;
+      background: #1c1c1c;
+    }
+    body.calibrating #calibrateBox { display: flex; }
+    body.calibrating #tagWrap, body.calibrating #tagInfo, body.calibrating #warn { display: none; }
+    #card {
+      height: 100px;
+      border: 2px solid #4dabf7;
+      border-radius: 8px;
+      background: #223a52;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #4dabf7;
+      font-size: 13px;
+    }
+    #ppmmSlider { width: 320px; max-width: 80vw; }
+    #calibrateBox .hint { font-size: 13px; color: #9a9a9a; max-width: 420px; text-align: center; }
+    /* White panel around the tag IS the quiet zone — the padding is set from
+       the px/mm calibration in digital.js so it stays ~one marker cell wide. */
+    #tagWrap {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #fff;
+      border-radius: 8px;
+    }
+    /* Fullscreen: tag alone, centered on white. */
+    #tagWrap:fullscreen { border-radius: 0; }
+  </style>
+</head>
+<body>
+  <header>
+    <a class="home" href="/" title="Back to start">On-screen tag</a>
+    <span id="status" class="grow">loading…</span>
+    <select id="tagSelect"></select>
+    <button id="calBtn">Screen size</button>
+    <button id="fsBtn">Fullscreen</button>
+  </header>
+  <main>
+    <div id="calibrateBox">
+      <div class="hint">Hold a credit/bank card flat against the screen and drag the slider until
+        the outline matches the card's width exactly. That teaches this page the screen's true
+        pixels-per-millimeter, so the tag can be drawn at its real size.</div>
+      <div id="card">credit card width</div>
+      <input id="ppmmSlider" type="range" min="200" max="1200" step="1">
+      <div id="ppmmLabel" class="hint"></div>
+      <button id="calDone">Done</button>
+    </div>
+    <div id="tagWrap">
+      <canvas id="tagCanvas"></canvas>
+    </div>
+    <div id="tagInfo"></div>
+    <div id="warn"></div>
+  </main>
+  <script src="/common.js"></script>
+  <script src="/cv-common.js"></script>
+  <script src="/digital.js"></script>
+</body>
+</html>

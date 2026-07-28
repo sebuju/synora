@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Room Markers</title>
+  <link rel="stylesheet" href="/style.css">
+  <style>
+    /* Dark on screen like every other page; white is print-only. */
+    main { display: block; overflow-y: auto; }
+    #instructions {
+      max-width: 720px;
+      margin: 24px auto;
+      padding: 0 16px;
+      line-height: 1.5;
+      font-size: 15px;
+    }
+    #instructions h1 { font-size: 20px; margin-bottom: 12px; }
+    #instructions ul { margin: 8px 0 8px 24px; }
+    #genStatus { color: #9a9a9a; }
+    /* On screen the sheets are just small previews, a handful per row; print
+       is where real sizing happens. */
+    /* Same content width as #instructions above. */
+    #sheets {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(124px, 1fr));
+      gap: 12px;
+      max-width: 720px;
+      margin: 0 auto 24px;
+      padding: 0 16px;
+    }
+    .sheet {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      background: #fff;
+      color: #111;
+      border-radius: 8px;
+      padding: 12px;
+    }
+    .sheet canvas {
+      width: 100%;
+      height: auto;
+      image-rendering: pixelated;
+    }
+    .sheet .tag-label {
+      font-size: 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: #111;
+      text-align: center;
+    }
+    .print-only { display: none; }
+    @media print {
+      html, body { background: #fff; }
+      main { overflow: visible; }
+      #instructions { display: none; }
+      #sheets {
+        display: block;
+        max-width: none;
+        margin: 0;
+        padding: 0;
+      }
+      .sheet {
+        border-radius: 0;
+        page-break-after: always;
+        height: 100vh;
+        padding: 0;
+        gap: 8mm;
+      }
+      /* CSS mm are true millimeters in print at 100% scale — the marker edge
+         (black border included) must measure exactly the printed size. */
+      .sheet canvas {
+        width: 150mm;
+        height: 150mm;
+      }
+      .sheet .tag-label { font-size: 14px; }
+      .screen-only { display: none; }
+      .print-only { display: inline; }
+    }
+    @page { size: A4 portrait; margin: 0; }
+  </style>
+</head>
+<body>
+  <header>
+    <a class="home" href="/" title="Back to start">Print room tags</a>
+    <span class="grow"></span>
+    <button id="printBtn">Print</button>
+  </header>
+  <main>
+  <div id="instructions">
+    <h1>Room markers</h1>
+    <p id="genStatus">Generating tags…</p>
+    <ul>
+      <li>Print at <b>100% scale</b> (no "fit to page") on plain white paper, one tag per A4 sheet.</li>
+      <li>After printing, measure a tag's black edge: it must be <b>150 mm</b>. If not, the scale is off and every distance in the room will inherit the error.</li>
+      <li>Mount tags <b>flat</b> (rigid backing, no curl) around the room, roughly at camera height, on more than one wall. Leave the white margin around the black border intact.</li>
+      <li><b>Tag 0 is the room origin.</b> Mount it upright on a wall: the room frame is x right along the wall, y up, z out of the wall into the room. It anchors the whole map — do not move it after surveying starts.</li>
+      <li>Any position in the room should see at least one tag within ~6 m and not too obliquely (under ~60°).</li>
+    </ul>
+  </div>
+  <div id="sheets"></div>
+  </main>
+  <script src="/cv-common.js"></script>
+  <script src="/markers.js"></script>
+</body>
+</html>
