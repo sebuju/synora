@@ -97,7 +97,17 @@ const POSE_LABEL_TTL_MS = 2000;
 
 function updatePoseLabel(clientId, msg) {
   const dev = devices.get(clientId);
-  if (!dev) return;
+  // A client with no tile is not a client with no position: the XR client
+  // positions and maps without streaming, so it never opens a peer connection
+  // and never gets a device entry. The room views take it regardless — only
+  // the per-tile label below needs a tile to live on.
+  if (!dev) {
+    if (msg.room?.pose) {
+      roomViewList.forEach((v) =>
+        v.updateClient(clientId, msg.room.pose, (msg.tags || []).map((t) => t.id)));
+    }
+    return;
+  }
   dev.lastPoseMsg = msg;
   dev.lastPoseAt = performance.now();
   if (msg.room?.pose) {
@@ -458,6 +468,18 @@ function drawCombined() {
   }
   updateSyncLabel(feeds, latencies, worstErr);
   requestAnimationFrame(drawCombined);
+}
+
+// Layer toggles are display-only: the server keeps sending deltas and the
+// renderers keep accumulating, so hiding the voxels to look at the walls does
+// not cost the map any progress.
+for (const [id, layer] of [['voxelLayerBtn', 'voxels'], ['wallLayerBtn', 'walls']]) {
+  const btn = document.getElementById(id);
+  btn.onclick = () => {
+    const on = !btn.classList.contains('active');
+    btn.classList.toggle('active', on);
+    roomViewList.forEach((v) => v.setLayer?.(layer, on));
+  };
 }
 
 // Overlay views above the tile grid: the combined canvas and/or the room

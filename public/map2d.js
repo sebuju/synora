@@ -25,6 +25,10 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
   // density is all a projection needs, and it survives removals cheaply.
   const columns = new Map();
   let voxelSize = 0.075;
+  // Display-only: the layers keep accumulating while hidden, so toggling back
+  // shows the map as it would have been rather than restarting it.
+  let showVoxels = true;
+  let showWalls = true;
   // Wall segments fitted by the server: { a:[x,z], b:[x,z], y0, y1 }.
   let walls = [];
   const SMOOTH_TAU_MS = 120;
@@ -96,11 +100,13 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
     for (const ph of clients.values()) {
       if (ph.target) grow(...proj(ph.cur.p));
     }
-    for (const key of columns.keys()) {
-      const [ai, bi] = key.split(',').map(Number);
-      grow(ai * voxelSize, bi * voxelSize);
+    if (showVoxels) {
+      for (const key of columns.keys()) {
+        const [ai, bi] = key.split(',').map(Number);
+        grow(ai * voxelSize, bi * voxelSize);
+      }
     }
-    for (const wl of walls) {
+    for (const wl of showWalls ? walls : []) {
       if (mode === 'side') {
         grow(wl.a[0], wl.y0);
         grow(wl.b[0], wl.y1);
@@ -139,7 +145,7 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
 
     // Voxel columns, darker with density.
     const cell = Math.max(2, voxelSize * scale);
-    for (const [key, count] of columns) {
+    for (const [key, count] of (showVoxels ? columns : [])) {
       const [ai, bi] = key.split(',').map(Number);
       const [sx, sy] = toPx(ai * voxelSize, bi * voxelSize);
       ctx.fillStyle = `rgba(127, 184, 164, ${Math.min(0.9, 0.2 + count / 12)})`;
@@ -262,6 +268,12 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
         lastFrameAt = 0;
         schedule();
       }
+    },
+
+    setLayer(name, on) {
+      if (name === 'voxels') showVoxels = on;
+      else if (name === 'walls') showWalls = on;
+      schedule();
     },
 
     setMarkerMap(map) {

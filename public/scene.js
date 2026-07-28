@@ -30,6 +30,9 @@ function createSceneView(canvas) {
   let active = false;
   let markerMapPending = null;
   let wallsPending = null;
+  // Display-only, like the 2D views: hiding a layer must not stop it building.
+  let showVoxels = true;
+  let showWalls = true;
   const clients = new Map();     // clientId -> { group, cone, label, target, at, colorHex }
 
   // Billboard text that can be rewritten cheaply; set() no-ops on unchanged
@@ -121,6 +124,7 @@ function createSceneView(canvas) {
 
   function growVoxels(minCapacity) {
     const vs = three.voxelState;
+    if (vs.mesh) vs.mesh.visible = showVoxels;
     const capacity = Math.max(4096, vs.capacity * 2, minCapacity);
     const geo = new THREE.BoxGeometry(vs.sizeM, vs.sizeM, vs.sizeM);
     const mat = new THREE.MeshLambertMaterial({ color: 0x7fb8a4 });
@@ -366,6 +370,14 @@ function createSceneView(canvas) {
     setMarkerMap(map) {
       if (three) rebuildMarkers(map);
       else markerMapPending = map;
+    },
+
+    setLayer(name, on) {
+      if (name === 'voxels') showVoxels = on;
+      else if (name === 'walls') showWalls = on;
+      if (!three) return;
+      three.wallGroup.visible = showWalls;
+      if (three.voxelState?.mesh) three.voxelState.mesh.visible = showVoxels;
     },
 
     setWalls(walls) {
