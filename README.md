@@ -2,180 +2,127 @@
 
 *syn + hórama — "seeing together".*
 
-Turn any number of phones into live cameras on your PC — sub-second latency over your own Wi-Fi, no cloud, no app install. Put ArUco tags on the walls and the same phones also localize themselves in the room and build a live 3D map of it.
+Multi-phone camera system for a local network. N phones stream video peer-to-peer (WebRTC) to a single browser dashboard; the server handles signaling, per-device recording, and optionally exposes a feed as a Windows virtual webcam. With ArUco tags placed in the room, the phones additionally localize themselves in a shared room frame and feed a monocular-depth mapping pipeline that builds a voxel occupancy map and a fitted wall layer.
 
-<p>
-  <img alt="Node.js" src="https://img.shields.io/badge/node-%E2%89%A518-339933?logo=node.js&logoColor=white">
-  <img alt="WebRTC" src="https://img.shields.io/badge/transport-WebRTC%20P2P-333">
-  <img alt="Dependencies" src="https://img.shields.io/badge/dependencies-5-blue">
-  <img alt="Build" src="https://img.shields.io/badge/build-none-lightgrey">
-  <img alt="Platform" src="https://img.shields.io/badge/platform-LAN%20%7C%20Windows%20vcam-informational">
-</p>
+No build step, no phone app: vanilla JS served as static files, phones run a web page.
 
-Phones open a web page, the PC opens a dashboard, and media flows **directly phone → PC** over the LAN. The server relays signaling, writes recordings, surveys the marker map, runs depth inference for the room map, and (optionally) exposes a feed as a virtual webcam.
+## Contents
 
----
-
-## Table of contents
-
-- [Quick start](#quick-start)
-- [Features](#features)
-- [How it works](#how-it-works)
+- [Setup](#setup)
+- [Architecture](#architecture)
 - [Frame sync](#frame-sync)
 - [Room positioning](#room-positioning)
 - [Room mapping](#room-mapping)
-- [Virtual webcam (Windows, optional)](#virtual-webcam-windows-optional)
+- [Virtual webcam](#virtual-webcam)
 - [Recordings](#recordings)
 - [Project layout](#project-layout)
 - [Troubleshooting](#troubleshooting)
 
----
+## Setup
 
-## Quick start
+Requirements: Node ≥ 18. Phones and PC on the same LAN.
 
 ```bash
 npm install
-npm run fetch-vendor   # opencv.js, three.js, depth models (for pose + mapping)
-npm start              # or: npm run dev  (node --watch, restarts on file change)
+npm run fetch-vendor   # opencv.js, three.js, depth models — required for positioning/mapping
+npm start              # or: npm run dev (node --watch)
 ```
 
-`fetch-vendor` is optional for plain streaming — without the assets the server runs fine and just disables the pose/mapping features (the startup log names what is missing).
+`fetch-vendor` downloads third-party assets into gitignored directories (`public/vendor/`, `models/`). Without them the server runs and streams; the positioning and mapping features are disabled, and the startup log lists what is missing.
 
-The server prints both URLs plus a QR code:
+The server listens on `:8443` (HTTPS + WSS) and prints both URLs and a QR code:
 
-```
-Viewer (this PC):  https://localhost:8443/viewer
-Phone (same LAN):  https://192.168.1.42:8443/phone
-```
+- Dashboard: `https://localhost:8443/viewer`
+- Phones: `https://<LAN-IP>:8443/phone` (the QR code encodes this)
 
-1. **PC** — open `https://localhost:8443/viewer` (`/dashboard` works too).
-2. **Phones** — scan the QR code, or open `https://<PC-IP>:8443/phone`. Same Wi-Fi as the PC.
-3. Both devices show a *"connection is not private"* warning once — **Advanced → Proceed**. The certificate is self-signed and generated into `certs/` on first run.
-4. Allow camera access on the phone. Tiles appear on the dashboard immediately.
+The certificate is self-signed, generated into `certs/` on first run; each device accepts the browser warning once. HTTPS is required — browsers refuse `getUserMedia` on non-`localhost` HTTP origins.
 
-> [!NOTE]
-> HTTPS is mandatory, not decoration — browsers refuse `getUserMedia` on a plain-HTTP origin that isn't `localhost`.
+There is no test suite, linter, or build step. Verification is manual: start the server, open both pages, watch the server log (connect/disconnect, client roster, recording byte counts, survey/mapping events, ffmpeg stderr).
 
----
-
-## Features
-
-| | |
-|---|---|
-| **Multi-device dashboard** | Every connected phone gets a live tile; header shows the device count. Click a tile to enlarge, click again to return. |
-| **Combined view** | Composites all feeds onto one canvas in an auto grid, labeled per device. Frame-synced (see below). |
-| **Sub-second latency** | WebRTC peer-to-peer over the LAN. Media never passes through the server. |
-| **Automatic recording** | Every session lands in `recordings/<timestamp>_phone<id>.webm`. No button to forget. |
-| **Stable device identity** | A phone keeps its number, tile, and filename prefix across reloads. |
-| **Camera switch** | Rear ⇄ front. Starts a new recording file. |
-| **Microphone** | Off by default. Toggling includes audio in both the live stream and the recording, and starts a new file. On the dashboard, click **Sound: off** to unmute. |
-| **Resolution** | 480p – 4K (default 4K); the camera picks the closest supported mode. Change starts a new file. Recording bitrate scales with the actual capture size. |
-| **Room positioning** | Phones detect ArUco wall tags and the server surveys a persistent room-frame marker map — each phone shows up as a live pose in a 3D scene, floor plan, and elevation view. |
-| **Room mapping** | Tag-seeing keyframes run through a monocular depth model into a voxel occupancy map, plus a fitted **wall layer** — the room shell as clean segments, separate from the raw voxels. |
-| **Pause** | Tap the phone's feed. Tracks go silent, the recorder parks — the recording stays in *one* file and resuming is instant. |
-| **New-recording button** | Cuts the current file and opens the next one, without touching the stream. |
-| **Recovery** | Auto-reconnect on both sides, plus explicit re-acquisition of camera / recorder / peer connection after Android backgrounds the page. |
-| **Screen wake lock** | Kept while streaming, retaken whenever the page becomes visible again. |
-| **Virtual webcam** | Windows only, optional — route a phone into any app that takes a webcam. |
-
----
-
-## How it works
+## Architecture
 
 ```mermaid
 flowchart LR
-    P1["📱 phone 1<br/><code>/phone</code>"]
-    P2["📱 phone 2"]
-    PN["📱 phone N"]
-    S["🖥️ Node HTTPS + ws<br/><code>server.js</code>:8443"]
-    V["💻 dashboard<br/><code>/viewer</code>"]
+    P1["phone 1..N  /phone"]
+    S["server.js  HTTPS + ws  :8443"]
+    V["dashboard  /viewer"]
     R[("recordings/*.webm")]
-    C["🎥 virtual webcam<br/>ffmpeg → AkVCamManager"]
+    C["ffmpeg → AkVCamManager"]
 
-    P1 & P2 & PN -- "WS: signaling + WebM chunks" --> S
-    V -- "WS: signaling" --> S
+    P1 -- "WS signaling + WS bulk (WebM chunks, keyframes)" --> S
+    V -- "WS signaling" --> S
     S --> R
     S -.optional.-> C
-    P1 == "WebRTC media (P2P, LAN)" ==> V
-    P2 == "WebRTC media" ==> V
-    PN == "WebRTC media" ==> V
+    P1 == "WebRTC media (P2P over LAN)" ==> V
 ```
 
-**Zero build step.** Vanilla JS, no bundler, no modules — the browser pages share globals by load order (`common.js` first, then `phone.js` / `viewer.js`). Five runtime dependencies: `ws`, `selfsigned`, `qrcode-terminal`, and for mapping `onnxruntime-node` + `jpeg-js`.
+Live media is WebRTC peer-to-peer; it does not pass through the server. Each phone holds two WebSockets under one client identity: a signaling socket for small latency-sensitive JSON, and a bulk socket for recorder chunks and mapping keyframes. The split exists so bulk bytes cannot queue ahead of pose or signaling messages.
 
-The server's core jobs:
+Server responsibilities:
 
-**1. Signaling relay.** One WebSocket per client. `offer` / `answer` / `ice` are relayed verbatim; phone→viewer messages are tagged with a `phoneId`, viewer→phone messages carry one for routing. A second viewer displaces the first.
+1. **Signaling relay.** `offer`/`answer`/`ice` relayed verbatim; phone→viewer messages are tagged with a `phoneId`, viewer→phone messages carry one for routing. One viewer at a time — a new one displaces the old.
+2. **Recording sink.** Binary frames on the bulk socket are `MediaRecorder` chunks appended to the phone's current file. Recording state lives on the socket, so a new socket requires a new recorder (the first chunk carries the WebM header); the phone therefore rebuilds its recorder on reconnect, camera switch, mic toggle, and resolution change. Frames beginning with the `KFR1` magic are mapping keyframes and are demuxed before the recording append.
+3. **Room survey and mapping.** See the sections below.
+4. **Virtual webcam tee** (optional, Windows).
 
-**2. Recording sink.** Binary WS frames from a phone are `MediaRecorder` chunks, appended to that phone's current file. Recording state lives on the socket, so a new socket always needs a fresh recorder — the first chunk carries the WebM header. That is why the phone rebuilds its `MediaRecorder` on reconnect, camera switch, mic toggle, and resolution change.
+**Client identity.** Each device persists a UUID in `localStorage` and presents it on every connection; the server maps it to a stable small integer, so a reload keeps its tile and recording filename prefix. A new socket for an existing id closes the old one; the old socket's close handler checks it still owns the id before cleaning up.
 
-**3. Room survey + mapping.** Tag observations from the phones build the marker map and produce room-frame poses ([Room positioning](#room-positioning)); keyframes feed the depth worker and the voxel map ([Room mapping](#room-mapping)). This is the one place media-adjacent data *does* touch the server — small JPEGs, not the streams.
+**Liveness.** Android freezes backgrounded pages and tears down their connections without a `close` event; the socket stays nominally `OPEN`. Both pages run an explicit ping/pong probe plus a probe on `visibilitychange`, and treat an unanswered ping as a dead socket. `readyState` is not trusted.
 
-**4. Virtual webcam tee** (optional, Windows) — see below.
+**Recovery.** Backgrounding can take the camera, recorder, and peer connection at once. `restartCall()` in `phone.js` is the single recovery path, re-entrancy guarded so a request arriving mid-restart is replayed. Pause (tapping the feed) disables tracks and pauses the recorder without tearing anything down, so a recording spans a pause as one file.
 
-**Phone identity.** Each client persists a UUID in `localStorage` and presents it on every connection; the server maps it to a stable small integer. Reload races are handled explicitly: a new socket for an existing id closes the old one, and the old socket's `close` handler bails if it no longer owns the id.
-
-**Liveness.** Android freezes a backgrounded page and the OS tears connections down underneath it — the socket stays nominally `OPEN` and no `close` event ever fires. So both pages run an explicit `ping`/`pong` probe (plus a probe on `visibilitychange`) and treat an unanswered ping as a dead socket. `readyState` alone lies.
-
-**Server logs are the diagnostic surface** — connect/disconnect, a client roster table (id / resolution / mic / pose), recording open/close with byte counts, survey and mapping events, and `ffmpeg` / `AkVCamManager` stderr.
-
----
+**Resolution and bitrate.** Capture defaults to 4K with `ideal` constraints (unsupported phones degrade to their best mode). Recorder bitrate is tiered by the actual capture size: 16 Mbps ≥ 4K, 8 Mbps ≥ 1440p, 4 Mbps below.
 
 ## Frame sync
 
-Naive compositing mixes moments captured milliseconds apart, so the Combined view aligns feeds against a shared timebase:
+The dashboard's combined view composites all feeds onto one canvas. Feeds arrive with different end-to-end latencies, so naive compositing mixes moments captured tens of milliseconds apart. Alignment works as follows:
 
-1. **Clock sync** — phone and dashboard each run an NTP-style `time-ping`/`time-pong` against the server clock, which is the only timebase both sides share (and which advances monotonically from a single anchor, so an OS time resync cannot step it). Low-RTT samples from a two-minute window are fitted with a line: the intercept is the offset, the slope is the drift between the two crystals. Tracking that slope matters — at 50 ppm a fixed offset is 30 ms stale after ten minutes, and two phones drifting opposite ways pull their feeds twice that far apart.
-2. **Phone side** — encoded-frame access exposes each frame's RTP timestamp, which the phone publishes paired with a server-clock instant (8/s), along with its own clock uncertainty.
-   The abs-capture-time extmap is inserted into the SDP with an id free across the *whole* offer (BUNDLE requires one meaning per id).
-3. **Dashboard side** — `requestVideoFrameCallback` gives each displayed frame's RTP timestamp; among the pairings from the last 20 seconds, the one implying the earliest capture wins (encode delay is always positive). The window is what lets the mapping reconverge — a lower envelope kept over all of time can never let go of a stale winner. Frames are buffered per device and the one nearest the shared presentation instant is drawn.
+1. **Clock sync** (`common.js`). Phones and dashboard each run NTP-style probes against the server clock — the only shared timebase. The server clock is anchored once and advances monotonically, so OS time resyncs cannot step it. Clients keep a sliding window of samples on their monotonic clock, fit the low-RTT ones with least squares, and use the slope as crystal drift. A fixed offset alone goes tens of milliseconds stale within minutes at typical drift rates; the fit is what holds long sessions together. A run of samples inconsistent with any round trip (server restart, device suspend) clears the window.
+2. **Phone side.** Encoded-frame access (`encodedInsertableStreams`) exposes each encoded frame's RTP timestamp. The phone publishes `{rtp, serverTime, unc}` pairings at 8/s, and inserts the abs-capture-time RTP header extension with an id free across the whole SDP (BUNDLE requires one meaning per id; ids above 14 need the two-byte form, so allocation stops there).
+3. **Dashboard side.** `requestVideoFrameCallback` reports each displayed frame's RTP timestamp; conversion to capture time goes through the 90 kHz RTP clock, wraparound-aware. Among recent pairings, the one implying the earliest capture wins — encode delay is always positive, and the recency window is what lets the estimate reconverge after the phone's clock estimate moves. Frames are buffered per device and the frame nearest the shared presentation instant (max latency + margin) is drawn.
 
-The header reports `sync ±N ms · lag spread N ms · clock ±N ms`:
+Cost: roughly 70 ms of additional latency in the combined view only; the tile grid stays live.
 
-- **sync** — how far the worst frame actually drawn sat from the shared presentation instant. The floor is half a frame interval (~16 ms at 30 fps), since a feed can only show frames it was sent.
-- **lag spread** — the difference in end-to-end latency between the fastest and slowest phone. This is what the sync corrects for, not an error; tens of milliseconds here is normal and does not mean the feeds are misaligned.
-- **clock** — the worst phone's own clock uncertainty. The dashboard's clock error shifts every feed together and so cancels out of the alignment, but a phone's does not, and the `sync` figure cannot see it.
-
-Cost: roughly **70 ms of extra delay in the Combined view only** — the tile grid stays live.
-
----
+Header readout: `sync ±N` is the worst drawn-frame misalignment (floor: half a frame interval). `lag spread` is the latency difference the sync compensates — not an error. `clock ±N` is the worst phone's clock uncertainty, which the sync figure structurally cannot observe (the dashboard's own clock error shifts all feeds together and cancels; a phone's does not).
 
 ## Room positioning
 
-Phones locate themselves against ArUco tags on the walls; the dashboard shows every phone as a live pose in three views (3D scene, floor plan, elevation).
+Phones detect ArUco tags fixed to the room and the server maintains a persistent room-frame marker map plus a live pose per phone, shown in three dashboard views: 3D scene, floor plan, elevation.
 
-**Setup**
+**Setup.**
 
-1. Print the tag sheet from `/markers` (tags must come out exactly **150 mm** across the black border — check the print scale), tape tags to the walls. A spare monitor or tablet showing `/digital` works as a tag too.
-2. Calibrate each phone once at `/calibrate` (ChArUco board, printed from the same page). Calibration is stored per lens and resolution; uncalibrated phones fall back to a generic FOV guess and are flagged.
-3. Marker tracking is on by default on the phone (frame-corners button toggles it). The overlay shows resolution, detect time, per-tag distance/angle/error, and the phone's room position.
+1. Print tags from `/markers`. Tag edge must be exactly 150 mm including the black border (`markerSizeM` in `server.js`); any scale error multiplies every distance in the room frame. A screen showing `/digital` also works as a tag.
+2. Calibrate each phone at `/calibrate` (ChArUco board from the same page). Intrinsics are stored per lens and per resolution in `localStorage`. Uncalibrated phones fall back to a generic FOV model and are flagged `calibrated:false` end to end.
+3. Marker tracking is on by default (toggle on the phone header). The phone-side overlay reports resolution, detect time, per-tag distance / viewing angle / reprojection error, and the current room fix.
 
-**How the survey works.** The first cleanly-observed tag becomes the room origin. Whenever a localized phone also sees an unknown tag, that sighting estimates the unknown tag's room pose; enough consistent estimates promote it into the map — so coverage spreads tag-by-tag from the anchor with no manual measuring. Known tags keep refining from leave-one-out fixes; the map persists in `markers.json` across restarts. Camera poses fuse across all visible tags, weighted by distance and detection quality; the two-fold mirror ambiguity of a flat tag is resolved against the other tags (or the phone's last fix), with a teleport-reject gate as backstop.
+**Detection** (`pose.js`, phone). Runs on the preview element via `requestVideoFrameCallback` at ~10 Hz, at native capture resolution. OpenCV's ArUco3 mode keeps the candidate search on a downscaled image while corners refine at full resolution. Per tag, pose comes from `SOLVEPNP_IPPE_SQUARE`. Planar PnP has a two-fold mirror ambiguity; when the OpenCV build exposes `solvePnPGeneric`, both solutions are sent with per-solution reprojection error. The phone knows nothing about the marker map — all room-frame math is server-side.
 
-Double-click a tag in the floor plan to forget it (e.g. a screen-tag that's gone). Forgetting the **anchor** resets the whole survey.
+**Survey** (`survey.js`, server). The first cleanly observed tag is adopted as the room origin (anchor). Each pose message from a localized phone that also sees unknown tags contributes room-pose estimates for them; a tag is promoted into the map once enough estimates agree with their own component-wise median. Known tags are continually refined by a slow running average using leave-one-out camera fixes (a tag never feeds back into its own estimate); the anchor is the datum and never moves. The map persists to `markers.json` (debounced atomic writes) and survives restarts.
 
-Accuracy essentials: calibrate at the resolution you stream at, keep the printed size exact, and prefer several tags visible at once — target is decimeter-level at room scale.
+**Localization.** A phone's room pose is fused over all visible mapped tags — `T_room_cam = T_room_tag ∘ inv(T_cam_tag)` per tag, weighted by distance and reprojection error. Mirror-ambiguous observations are resolved by picking, per tag, the solution whose implied camera pose agrees with the pose implied by the other tags, or with the phone's last recent fix when only one tag is visible. A jump-reject gate holds the previous fix when a new one teleports implausibly far, unless the jump persists.
 
----
+Removing a tag: double-click it in the floor plan. Removing the anchor resets the entire survey, since all poses are expressed relative to it.
+
+Expected accuracy is decimeter-level at room scale, dependent on calibration quality, tag print accuracy, viewing angle (degrades hard past ~60° off-normal), and distance.
 
 ## Room mapping
 
-With a depth model present (`npm run fetch-vendor` downloads Depth Anything V2, both relative and metric variants — the metric one is preferred), the server builds a live 3D occupancy map of the room:
+Requires a depth model in `models/` (`fetch-vendor` downloads Depth Anything V2 in relative and metric variants; the metric one is preferred). Pipeline:
 
-1. Once a second, a phone that sees a tag ships that frame as a small JPEG keyframe over its bulk socket.
-2. The server poses the keyframe from the tags *in that same frame*, runs monocular depth inference in a worker thread, and calibrates the depth to metres against those tags — frames that cannot be scaled honestly are rejected rather than painted.
-3. Depth pixels backproject into a 7.5 cm voxel grid. Rays to each surface also vote *free space* for the cells they pass through, so hallucinated blobs get carved away once later frames see through them.
-4. **Wall layer**: columns of voxels with wall-like vertical extent are fitted with line segments (RANSAC over the floor plan) and streamed separately — the room shell as clean quads in the 3D view and thick lines in the 2D views, independent of raw voxel noise.
+1. **Keyframes.** About once per second, a phone that currently sees a tag encodes the frame as a ≤672 px JPEG and sends it over the bulk socket with its tags and intrinsics (`KFR1` framing). Frames without tags are not sent — they could not be posed.
+2. **Posing.** The server poses each keyframe purely from the tags in that frame via the survey (`locate`), independent of the live pose stream.
+3. **Depth.** A worker thread runs inference (~0.5 s CPU). One job at a time; a newer keyframe from the same phone replaces its queued predecessor rather than queuing behind it.
+4. **Metric calibration.** The depth output is fitted against the true tag distances in the same frame. The metric model needs one tag (residual scale correction, rejected if far from 1). The relative model needs two tags at clearly different depths to solve scale and shift exactly; single-tag frames consume a per-phone learned shift, and frames whose fit would be dishonest are rejected outright — a rejected frame is preferable to painted garbage.
+5. **Voxel grid.** Valid depth pixels backproject through the keyframe pose into a 7.5 cm voxel grid. Hits are dilated to face-neighbors because monocular depth wobbles across frames. Each ray also votes free space for the cells it crosses (stopping short of the surface by more than the depth noise); cells seen through far more often than hit are dismissed. This carving is what removes hallucinated geometry.
+6. **Wall layer.** Debounced after occupancy changes: columns of the floor plan whose occupied voxels span wall-like height (≥ 1 m, ≥ 45 % fill) are treated as wall samples; RANSAC fits floor-plan line segments through them (total-least-squares refit, split at gaps, percentile-bounded vertical extent). Segments stream to the dashboard as a separate layer — quads in the 3D view, lines/rectangles in the 2D views — independent of raw voxel noise. Assumes the room's y-axis is vertical, i.e. the anchor tag is mounted roughly upright.
 
-Dashboard controls: a map view select (accumulated map / last-N keyframes debug / off) and a clear button. Turning the map off also stops the phones from producing keyframes.
+Dashboard controls: map view select (accumulated / last-N keyframes debug / off) and a clear button. Turning mapping off also stops phones producing keyframes (server pushes `keyframeMs: 0`).
 
----
+## Virtual webcam
 
-## Virtual webcam (Windows, optional)
+Windows only. Exposes the selected phone's feed as a system webcam device. Enabled when both pieces exist:
 
-Exposes the active phone's feed as a normal webcam device, selectable in Zoom, OBS, Teams, anything. The server enables the feature only when it finds both pieces:
-
-**1. [AkVirtualCamera](https://github.com/webcamoid/akvirtualcamera/releases)** — install, then create the device:
+1. [AkVirtualCamera](https://github.com/webcamoid/akvirtualcamera/releases), with a device created:
 
 ```bat
 "%ProgramFiles%\AkVirtualCamera\x64\AkVCamManager.exe" add-device "Phone Stream"
@@ -183,39 +130,35 @@ Exposes the active phone's feed as a normal webcam device, selectable in Zoom, O
 "%ProgramFiles%\AkVirtualCamera\x64\AkVCamManager.exe" update
 ```
 
-**2. `ffmpeg.exe`** — any recent Windows build, placed in `tools/`.
+2. `ffmpeg.exe` in `tools/`.
 
-The server logs `Virtual cam ready` and a **Webcam** button appears on each dashboard tile. Click one to route that phone in, click again to stop. Detection re-runs whenever a viewer connects, so a driver installed after startup is picked up without a restart.
-
----
+The active phone's WebM chunk stream is teed into `ffmpeg`, decoded, and piped to `AkVCamManager stream` at 1280×720@30. A **Webcam** button appears per tile; detection re-runs when a viewer connects, so a driver installed after startup is picked up without a restart.
 
 ## Recordings
 
-- Path: `recordings/<yyyy-mm-dd>_<hhmmss>_phone<id>.webm` — plays in VLC or any browser.
-- A new file starts on: connect/reconnect, camera switch, mic toggle, resolution change, and the record button. Pausing does **not** start a new file.
-- Only limited by disk space. Delete old files manually.
-- **A 0-byte recording** almost always means the phone's screen was off or the browser was backgrounded — the camera stops delivering frames there. Keep the phone page in the foreground.
-
----
+- Path: `recordings/<stamp>_phone<id>.webm`.
+- A new file starts on connect/reconnect, camera switch, mic toggle, resolution change, and the new-recording button. Pause does not split the file.
+- Retention is manual; disk space is the only limit.
+- A 0-byte file means the phone's screen was off or the page was backgrounded — the camera delivers no frames there.
 
 ## Project layout
 
 ```
-server.js              HTTPS + WS: signaling relay, recording sink, virtual cam
+server.js              HTTPS + WS: signaling relay, recording sink, vcam
 survey.js              marker map + room-frame localization
 mapping.js             voxel occupancy grid + wall-segment extraction
 depth-worker.js        worker thread: depth inference, metric calibration
 fetch-vendor.js        downloads opencv.js / three.js / depth models
 public/
-  common.js            shared: signaling socket, liveness probe, clock sync
+  common.js            signaling socket, liveness probe, clock sync
   phone.js             camera, MediaRecorder, peer connection, recovery
-  pose.js              phone: tag detection, PnP, keyframe capture
-  pose-math.js         quaternion / SE(3) toolbox (shared with the server)
+  pose.js              tag detection, PnP, keyframe capture
+  pose-math.js         quaternion / SE(3) helpers (shared with server)
   cv-common.js         opencv loading, intrinsics store, detector factories
   viewer.js            tiles, combined canvas, frame buffering + sync
   scene.js             3D room view (three.js)
   map2d.js             floor plan + elevation views
-  calibrate.js/.html   ChArUco camera calibration page
+  calibrate.js/.html   ChArUco camera calibration
   markers.js/.html     printable tag sheet
   digital.js/.html     exact-size on-screen tag
   phone.html · viewer.html · index.html · style.css
@@ -224,28 +167,24 @@ recordings/            output                                     (gitignored)
 tools/                 ffmpeg.exe for the virtual webcam          (gitignored)
 public/vendor/         fetched opencv.js / three.js               (gitignored)
 models/                fetched depth models                       (gitignored)
-markers.json           the surveyed marker map                    (gitignored)
+markers.json           surveyed marker map                        (gitignored)
 ```
 
-Conventions: dates/times are 24-hour `dd/mm/yy`, formatted only by the two helpers in `server.js` — no ad-hoc formatting, no `toLocaleString`. Comments explain *why* (the race, the platform quirk, the ordering constraint), not what. Shared phone/viewer logic lives in `common.js`.
-
-There is no test suite, linter, or build step — verification is manual: start the server, open both pages, watch the logs.
-
----
+Conventions: dates/times are 24-hour `dd/mm/yy`, formatted only by the helpers in `server.js` — no `toLocaleString`. Comments explain why, not what. Shared phone/viewer logic lives in `common.js`; shared CV definitions in `cv-common.js`; transform math in `pose-math.js`.
 
 ## Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
-| Certificate warning on every device | Expected — self-signed. **Advanced → Proceed** once per device. |
-| Phone page can't reach the server | Both devices must be on the same Wi-Fi, and the network must not be set to *client isolation*. Check the Windows firewall allows Node on port 8443. |
-| Cert stopped matching after an IP change | Delete `certs/` and restart; it is regenerated with the current LAN addresses in the SAN. |
-| Recording is 0 bytes | Phone screen was off or the page was backgrounded. Keep it foreground. |
-| Dashboard says "sync unavailable" | The browser lacks encoded-frame access, or the abs-capture-time id could not be allocated. Combined view still works, just unsynced. |
-| Second dashboard kicks the first | By design — one viewer at a time. |
-| No **Webcam** button | `tools/ffmpeg.exe` missing, AkVirtualCamera not installed, or no device configured. The startup log names which. |
-| Phone overlay says **UNCALIBRATED** | No stored calibration for that lens/resolution — run `/calibrate` on the phone. Poses still work off a generic FOV guess, just less accurately. |
-| Phone sees tags but stays *unlocalized* | No surveyed tag in view yet. The survey grows from the anchor: show the phone a known tag and a new one together, repeatedly, and the new one gets promoted. |
-| Room distances look uniformly wrong | Printed tag size does not match the configured 150 mm — every distance scales by the mismatch. Reprint at exact scale or fix `markerSizeM`. |
-| Mapping never starts | No depth model — run `npm run fetch-vendor` and restart; the startup log lists missing assets. Also check the map view select isn't on *off*. |
-| Map keyframes rejected in the log | The depth scale could not be pinned. Get two tags at clearly different distances into one view once — after that, single-tag frames work. |
+| Certificate warning | Self-signed; accept once per device. |
+| Phone cannot reach the server | Same Wi-Fi required; AP client isolation must be off; firewall must allow Node on 8443. |
+| Cert invalid after an IP change | Delete `certs/` and restart — regenerated with current addresses in the SAN. |
+| Recording is 0 bytes | Screen off / page backgrounded on the phone. |
+| "sync unavailable" | Browser lacks encoded-frame access, or no free extmap id. Combined view works unsynced. |
+| Second dashboard kicks the first | By design. |
+| No Webcam button | Missing `tools/ffmpeg.exe`, AkVirtualCamera, or device. Startup log names which. |
+| Overlay shows UNCALIBRATED | No stored calibration for that lens/resolution — run `/calibrate`. Poses fall back to a FOV guess. |
+| Tags detected but no room fix | No surveyed tag in view. The survey grows from the anchor: show a known and an unknown tag together repeatedly. |
+| Distances uniformly wrong | Printed tag size ≠ 150 mm. Reprint at exact scale or adjust `markerSizeM`. |
+| Mapping never starts | No depth model (`npm run fetch-vendor`), or map view set to off. |
+| Keyframes rejected in the log | Depth scale could not be pinned. Show two tags at clearly different distances once; single-tag frames work after that. |
