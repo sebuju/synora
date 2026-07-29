@@ -35,6 +35,22 @@ const OUTLIER_ANGLE_DEG = 15;
 // pose derived from *other* tags (excluding the tag itself keeps the update
 // from feeding back into its own estimate).
 const REFINE_ALPHA = 0.02;
+// A knocked tag is not noise, and the slow average is the wrong tool for it:
+// correcting 40 cm at REFINE_ALPHA takes ~200 sightings, and for all of them
+// the tag is wrong and dragging its neighbours through the shared camera fix
+// (measured: 4 cm of pull on an adjacent tag). Past this much disagreement,
+// held for this many consecutive sightings, the tag is not drifting — it moved.
+// Drop it back to a candidate and let it re-promote from scratch, which takes
+// PROMOTE_MIN_ESTIMATES sightings instead.
+const RESEED_DISAGREE_M = 0.25;
+const RESEED_STREAK = 12;
+// Consensus weighting in fuseCameraPose. A tag whose implied camera position
+// disagrees with the other tags' is either stale, knocked, or a mirror pick;
+// distance and reprojection error do not see any of those. Soft, not a reject:
+// with three tags the median is a weak statistic, and hard-dropping the odd one
+// out would make the fix jump as tags enter and leave view.
+const CONSENSUS_SOFT_M = 0.15;
+const CONSENSUS_MIN_OBS = 3;
 
 // Single-tag planar pose has a mirror-solution ambiguity; a wrong pick
 // teleports the camera to the "opposite side" for a frame or two. A fix that
@@ -63,14 +79,6 @@ const POSE_MIN_DT_S = 0.02;       // two fixes in the same millisecond happen
 const POSE_MAX_DT_MS = 1000;      // older than this, restart rather than blend
 // How long a pose may be carried on velocity alone once the tags go away.
 const POSE_EXTRAPOLATE_MS = 1200;
-// How far a keyframe's own fix may sit from the client's live track before the
-// keyframe is refused. The track is good to centimetres while tags are in
-// view, so the budget is really just the motion between the last pose message
-// and the keyframe — hence a small base plus an allowance for actual speed. A
-// mirror flip's displacement grows with viewing obliquity: near zero seen head
-// on (where it also does no harm) and metres seen at an angle.
-const LOCATE_MAX_DISAGREE_M = 0.3;
-const LOCATE_SPEED_ALLOWANCE_S = 0.25;
 const JUMP_HISTORY_TTL_MS = 1500;
 const JUMP_CONFIRM_SAMPLES = 3;
 
@@ -92,6 +100,11 @@ function createSurvey({ file, markerSizeM, log }) {
   // from lastFix, which is the raw fix the ambiguity gate compares against;
   // mixing the two would let the filter's own output veto new measurements.
   const track = new Map();
+  // id -> consecutive sightings that disagreed with the stored pose.
+  const reseedStreak = new Map();
+  // clientId -> recent { at, xr, room } for the rest-jitter measurement.
+  const jitterHist = new Map();
+  let lastJitterLog = 0;
   let saveTimer = null;
 
   function load() {
@@ -111,6 +124,42 @@ function createSurvey({ file, markerSizeM, log }) {
       markers.set(Number(id), { pose: { p: m.p, q: m.q }, nObs: m.nObs || 0 });
     }
     if (markers.size) log(`Marker map loaded: ${markers.size} tags, anchor ${anchorId}`);
+  }
+
+  // Rest jitter, measured rather than eyeballed. Two numbers over the same
+  // window: how far the *phone* actually moved, taken from ARCore's own pose
+  // (visual-inertial — it does not care what the tags say), and how much the
+  // *reported* room pose wandered. Phone still while the pose moves is the
+  // whole question, and it cannot be answered by looking at either alone.
+  // The second number is also the honest radius for a "probably here" marker:
+  // drawing a point implies a precision the fix does not have.
+  const JITTER_WINDOW_MS = 1500;
+  const JITTER_MIN_SAMPLES = 8;
+
+  // RMS distance from the window's mean — the radius that contains the bulk of
+  // the samples, not the worst one, which would report a single mirror flip as
+  // the steady-state spread.
+  function spreadOf(pts) {
+    const m = [0, 1, 2].map((k) => pts.reduce((a, p) => a + p[k], 0) / pts.length);
+    let sum = 0;
+    for (const p of pts) {
+      sum += (p[0] - m[0]) ** 2 + (p[1] - m[1]) ** 2 + (p[2] - m[2]) ** 2;
+    }
+    return Math.sqrt(sum / pts.length);
+  }
+
+  function trackJitter(clientId, xrP, roomP) {
+    const now = Date.now();
+    let h = jitterHist.get(clientId);
+    if (!h) jitterHist.set(clientId, h = []);
+    h.push({ at: now, xr: xrP, room: roomP });
+    while (h.length && now - h[0].at > JITTER_WINDOW_MS) h.shift();
+    if (h.length < JITTER_MIN_SAMPLES) return null;
+    return {
+      movedMm: Math.round(spreadOf(h.map((e) => e.xr)) * 1000),
+      jitterMm: Math.round(spreadOf(h.map((e) => e.room)) * 1000),
+      n: h.length,
+    };
   }
 
   function scheduleSave() {
@@ -149,6 +198,19 @@ function createSurvey({ file, markerSizeM, log }) {
     // pose error actually grows.
     const weights = obs.map((o) =>
       (o.cos * o.cos) / (Math.max(o.dist * o.dist, 1) * (0.5 + o.err) ** 2));
+    // Agreement with the other tags, on top of geometry. Each tag implies a
+    // camera position; a tag sitting somewhere the others say it is not gets
+    // its say reduced for this frame only, so a stale map entry stops steering
+    // the fix (and, through it, the refinement of every other tag) before
+    // anything has corrected it.
+    if (poses.length >= CONSENSUS_MIN_OBS) {
+      const mid = [0, 1, 2].map((k) => median(poses.map((x) => x.p[k])));
+      for (let i = 0; i < poses.length; i++) {
+        const d = Math.hypot(
+          poses[i].p[0] - mid[0], poses[i].p[1] - mid[1], poses[i].p[2] - mid[2]);
+        weights[i] /= 1 + (d / CONSENSUS_SOFT_M) ** 2;
+      }
+    }
     const wsum = weights.reduce((a, b) => a + b, 0);
     const p = [0, 0, 0];
     for (let i = 0; i < poses.length; i++) {
@@ -163,10 +225,15 @@ function createSurvey({ file, markerSizeM, log }) {
   // nudged whenever another one is. It is also the whole of the "tags as
   // anchors" idea — between sightings ARCore carries the pose and this
   // transform stays put; a sighting corrects the drift that accumulated.
-  const xrAlign = new Map();       // clientId -> { T, nObs, at }
+  const xrAlign = new Map();       // clientId -> { T, sid, nObs, at, rej }
   // A fresh alignment jumping this far is a bad tag fix, not drift.
   const XR_ALIGN_JUMP_M = 1.0;
   const XR_ALIGN_ALPHA = 0.25;
+  // ...unless that many fixes in a row agree with each other and not with the
+  // alignment, at which point the alignment is what is wrong. At ~10 poses a
+  // second this is a second of consistent disagreement.
+  const XR_ALIGN_MAX_REJECTS = 10;
+  let lastSeenLog = 0;
   // How long after a confirming tag sighting the alignment is still good
   // enough to survey new tags against.
   const ALIGN_FRESH_MS = 2000;
@@ -274,13 +341,15 @@ function createSurvey({ file, markerSizeM, log }) {
   // where it is continuously, so requiring a second tag in the same frame just
   // makes the tag you are standing next to unsurveyable — which is exactly
   // what it did.
-  function extendSurvey(pose, obs, needKnownTag = true) {
+  function maintainSurvey(pose, obs, needKnownTag = true) {
+    const known = obs.filter((o) => markers.has(o.id));
     if (needKnownTag) {
-      const known = obs.filter((o) => markers.has(o.id));
       const strong = known.filter((o) => o.err <= GOOD_MAX_ERR_PX && o.dist <= GOOD_MAX_DIST_M);
       if (!strong.length) return false;
     }
     let changed = false;
+
+    // Extend: every unknown tag seen from a solid fix contributes one estimate.
     for (const o of obs) {
       if (markers.has(o.id)) continue;
       const est = se3Compose(pose, o.camTag);
@@ -289,6 +358,50 @@ function createSurvey({ file, markerSizeM, log }) {
       ring.push(est);
       if (ring.length > CANDIDATE_RING) ring.shift();
       if (tryPromote(o.id)) changed = true;
+    }
+
+    // Refine: nudge a known tag using a camera fix from the *other* tags only,
+    // so the update cannot feed back into its own estimate. The anchor is the
+    // datum and never moves.
+    if (known.length >= 2) {
+      for (const o of known) {
+        if (o.id === anchorId) continue;
+        const others = known.filter((x) => x.id !== o.id);
+        const fix = fuseCameraPose(others);
+        if (!fix) continue;
+        const est = se3Compose(fix, o.camTag);
+        const m = markers.get(o.id);
+        const off = Math.hypot(
+          est.p[0] - m.pose.p[0], est.p[1] - m.pose.p[1], est.p[2] - m.pose.p[2]);
+
+        // Persistent, large disagreement is a tag that was moved, not one that
+        // is drifting. Averaging towards it would be slow and would drag the
+        // neighbours the whole way; forgetting it re-promotes it in
+        // PROMOTE_MIN_ESTIMATES sightings from where it actually is now.
+        if (off > RESEED_DISAGREE_M) {
+          const n = (reseedStreak.get(o.id) || 0) + 1;
+          reseedStreak.set(o.id, n);
+          if (n >= RESEED_STREAK) {
+            markers.delete(o.id);
+            candidates.delete(o.id);
+            reseedStreak.delete(o.id);
+            log(`Marker ${o.id} disagrees with the map by ${off.toFixed(2)} m over `
+              + `${n} sightings — dropped, will re-survey where it is now`);
+            changed = true;
+            scheduleSave();
+            continue;
+          }
+        } else {
+          reseedStreak.delete(o.id);
+        }
+
+        for (let k = 0; k < 3; k++) {
+          m.pose.p[k] += (est.p[k] - m.pose.p[k]) * REFINE_ALPHA;
+        }
+        m.pose.q = quatNudge(m.pose.q, est.q, REFINE_ALPHA);
+        m.nObs++;
+        scheduleSave();
+      }
     }
     return changed;
   }
@@ -368,12 +481,84 @@ function createSurvey({ file, markerSizeM, log }) {
     load,
     predictPose,
 
+    markerSize() {
+      return markerSizeM;
+    },
+
+    // The printed marker size is the room's only metric datum: every distance
+    // the survey reports scales with it. Changing it therefore cannot keep the
+    // map — those positions were measured in the old scale, and a mixture of
+    // the two is worse than either. Same reset as pulling the anchor.
+    setMarkerSize(m) {
+      if (!(m > 0) || m === markerSizeM) return false;
+      const was = markerSizeM;
+      markerSizeM = m;
+      anchorId = null;
+      markers.clear();
+      candidates.clear();
+      lastFix.clear();
+      track.clear();
+      xrAlign.clear();
+      log(`Marker size ${(was * 1000).toFixed(0)} mm -> ${(m * 1000).toFixed(0)} mm `
+        + '— survey reset, every tag must be re-observed');
+      scheduleSave();
+      return true;
+    },
+
     // One XR pose report: the camera's pose in the session frame, plus any
     // tags visible in that same frame. Returns the room-frame pose.
-    alignXr(clientId, xr, tags) {
+    alignXr(clientId, xr, tags, sessionId = null, intrinsics = null) {
       const xrT = { p: xr.p, q: xr.q };
-      const prev = xrAlign.get(clientId);
+      let prev = xrAlign.get(clientId);
+      // An alignment describes one ARCore session's frame, whose origin is
+      // wherever that session started. A new session picks a new one, so the
+      // old transform is not stale — it is meaningless. It also cannot be
+      // corrected into place: every new fix lands however far the two origins
+      // happen to sit apart, the jump gate below reads that as a bad fix, and
+      // the client keeps reporting a pose in a dead session's frame while
+      // mapping paints through it. Keyed by clientId, which survives a
+      // reconnect, so the socket closing is not the signal — the session id is.
+      if (prev && prev.sid !== sessionId) {
+        xrAlign.delete(clientId);
+        prev = undefined;
+        log(`Client ${clientId} started a new XR session — alignment dropped`);
+      }
+      // The camera model, once per session. Every pose error that is not noise
+      // is either this or the tag size, and both were being assumed rather than
+      // observed. cx/cy far from the image centre, or fx != fy, means the
+      // intrinsics do not describe the image the corners were measured in —
+      // which biases orientation while leaving reprojection error small,
+      // because PnP happily fits the model it is handed.
+      if (intrinsics && loggedIntrinsics.get(clientId) !== sessionId) {
+        loggedIntrinsics.set(clientId, sessionId);
+        const { fx, fy, cx, cy } = intrinsics;
+        log(`Client ${clientId} camera model: fx ${fx.toFixed(1)} fy ${fy.toFixed(1)}`
+          + ` (fy/fx ${(fy / fx).toFixed(4)}), principal point ${cx.toFixed(1)},${cy.toFixed(1)}`);
+      }
       const obs = buildObs(tags);
+      // What the server actually received, as opposed to what was in shot. A
+      // tag in frame but undecoded (small, far, oblique — 640 px camera-access
+      // frames run out of range around 3.7 m) leaves no trace anywhere else,
+      // and "the map only has one tag" looks identical whether the second tag
+      // was never seen, was seen and rejected, or was seen and is still
+      // gathering estimates. Throttled: this is a 10 Hz path.
+      if (Date.now() - lastSeenLog > 3000) {
+        lastSeenLog = Date.now();
+        // Apparent tag size in pixels is what actually bounds a planar pose:
+        // orientation error on a small quad is several degrees however clean
+        // the reprojection residual looks, because PnP fits whatever model it
+        // is handed. Reprojection error says the fit is self-consistent; this
+        // says whether there was enough of a tag to fit.
+        const fx = intrinsics && intrinsics.fx;
+        const seen = obs.map((o) => {
+          const px = fx ? ` ${(markerSizeM * fx / o.dist).toFixed(0)}px` : '';
+          return `${o.id}@${o.dist.toFixed(1)}m${px} ${o.err.toFixed(1)}err`;
+        }).join(', ');
+        const pend = [...candidates].map(([id, r]) => `${id}:${r.length}/${PROMOTE_MIN_ESTIMATES}`);
+        log(`Client ${clientId} sees [${seen || 'nothing'}]`
+          + `, known [${[...markers.keys()].join(' ')}]`
+          + `, promoting [${pend.join(' ') || 'none'}]`);
+      }
       // Without this an XR client can never start a survey, and once the map
       // is emptied it can never recover one either — it consumes markers but
       // had no way to create them.
@@ -386,11 +571,20 @@ function createSurvey({ file, markerSizeM, log }) {
       pickSolutions(known, ref);
       const camRoom = known.length ? fuseCameraPose(known) : null;
 
+      // A tag in this frame only counts as confirming the alignment if its fix
+      // was actually folded in. One thrown away by the jump gate says the
+      // opposite, and reporting that as 'good' is how a wrong room frame looks
+      // healthy on the dashboard.
+      let confirmed = false;
       if (camRoom) {
         const est = se3Compose(camRoom, se3Invert(xrT));
         if (!prev) {
-          xrAlign.set(clientId, { T: est, nObs: 1, at: Date.now() });
-          log(`Client ${clientId} XR frame aligned to the room`);
+          xrAlign.set(clientId, { T: est, sid: sessionId, nObs: 1, at: Date.now(), rej: null });
+          log(`Client ${clientId} XR frame aligned to the room — `
+            + `${known.length} tag(s) [${known.map((o) => o.id).join(', ')}], `
+            + `worst ${Math.max(...known.map((o) => o.err)).toFixed(2)} px `
+            + `at ${Math.max(...known.map((o) => o.dist)).toFixed(2)} m`);
+          confirmed = true;
         } else {
           const jump = Math.hypot(
             est.p[0] - prev.T.p[0], est.p[1] - prev.T.p[1], est.p[2] - prev.T.p[2]);
@@ -413,13 +607,33 @@ function createSurvey({ file, markerSizeM, log }) {
             prev.T.q = quatNudge(prev.T.q, est.q, XR_ALIGN_ALPHA);
             prev.nObs++;
             prev.at = Date.now();
+            prev.rej = null;
+            confirmed = true;
+          } else {
+            // Rejected fixes that agree with each other are not noise: they are
+            // the alignment being wrong in a fixed direction, which is what a
+            // relocalization mid-session looks like (the session id catches a
+            // new session, nothing catches ARCore moving its own origin under
+            // one). Without an escape the gate is a permanent deadlock — it
+            // refuses every correction precisely because the thing it is
+            // protecting has already drifted out of reach.
+            const r = prev.rej;
+            const agrees = r && Math.hypot(
+              est.p[0] - r.p[0], est.p[1] - r.p[1], est.p[2] - r.p[2]) <= XR_ALIGN_JUMP_M;
+            prev.rej = { p: est.p, n: agrees ? r.n + 1 : 1 };
+            if (prev.rej.n >= XR_ALIGN_MAX_REJECTS) {
+              log(`Client ${clientId} XR alignment re-acquired — ` +
+                `${prev.rej.n} consistent fixes disagreed with it by ` +
+                `${jump.toFixed(2)} m`);
+              xrAlign.set(clientId, { T: est, sid: sessionId, nObs: 1, at: Date.now(), rej: null });
+              confirmed = true;
+            }
           }
         }
       }
 
       const A = xrAlign.get(clientId);
-      if (!A) return { pose: null, quality: 'unaligned', mapChanged };
-      const roomPose = se3Compose(A.T, xrT);
+      const roomPose = A ? se3Compose(A.T, xrT) : null;
       // ARCore's pose is steadier than anything the tags alone produce, so a
       // survey grown from it is better, not worse — but only extend while a
       // tag actually confirms the alignment this frame.
@@ -430,49 +644,32 @@ function createSurvey({ file, markerSizeM, log }) {
       // tag you are standing next to with nothing else in view, and it carries
       // the alignment error plus whatever drift has accumulated, so it is used
       // only when there is no alternative and only while a sighting is recent.
-      const alignFresh = Date.now() - A.at < ALIGN_FRESH_MS;
+      //
+      // Extension must not sit behind the alignment. It only needs a room-frame
+      // camera pose and camRoom is one, solved from tags with no alignment in
+      // it at all. Gating it on the alignment deadlocked a fresh map against
+      // the two-tag seed rule: the anchor is the only known tag, the seed wants
+      // two, and the code that would promote a second never ran.
+      const jitter = A && roomPose ? trackJitter(clientId, xrT.p, roomPose.p) : null;
+      if (jitter && Date.now() - lastJitterLog > 3000) {
+        lastJitterLog = Date.now();
+        log(`Client ${clientId} steadiness: phone moved ${jitter.movedMm} mm, `
+          + `reported pose ${jitter.jitterMm} mm (rms over ${jitter.n} fixes / `
+          + `${JITTER_WINDOW_MS / 1000}s, ${known.length} tags)`);
+      }
+      const alignFresh = A && Date.now() - A.at < ALIGN_FRESH_MS;
       const extPose = camRoom || (alignFresh ? roomPose : null);
-      if (extPose && extendSurvey(extPose, obs, false)) mapChanged = true;
+      if (extPose && maintainSurvey(extPose, obs, false)) mapChanged = true;
+      if (!A) return { pose: null, quality: 'unaligned', mapChanged };
       return {
         pose: roomPose,
         mapChanged,
         // 'good' means a tag confirmed this frame; 'tracked' means ARCore is
         // carrying it and the alignment is as old as the last sighting.
-        quality: camRoom ? 'good' : 'tracked',
+        quality: confirmed ? 'good' : 'tracked',
         alignedObs: A.nObs,
+        jitter,
       };
-    },
-
-    // The room pose for an XR keyframe, without touching the alignment.
-    xrPoseOf(clientId, xr) {
-      const A = xrAlign.get(clientId);
-      return A ? se3Compose(A.T, { p: xr.p, q: xr.q }) : null;
-    },
-
-    // Room-frame camera pose for a set of tag observations, no side effects —
-    // used to pose keyframes independently of the live survey stream.
-    locate(tags, clientId) {
-      const known = buildObs(tags).filter((o) => markers.has(o.id));
-      // The client's live track is the reference the mirror ambiguity needs.
-      // Without it a single-tag keyframe can be posed by the flipped IPPE
-      // solution — not a nudge, the other side of the tag plane — and the
-      // whole cloud lands behind the wall it was looking at. handlePose has
-      // had a jump gate against this all along; keyframes, which are what
-      // actually place every depth point, had nothing.
-      const ref = clientId !== undefined ? predictPose(clientId) : null;
-      pickSolutions(known, ref);
-      const pose = fuseCameraPose(known);
-      if (pose && ref) {
-        const jump = Math.hypot(
-          pose.p[0] - ref.p[0], pose.p[1] - ref.p[1], pose.p[2] - ref.p[2]);
-        // A keyframe is refused rather than held: unlike the live pose there
-        // is nothing useful to substitute, and painting a frame posed by a
-        // fix the live track disagrees with is the failure being fixed.
-        const allowed = LOCATE_MAX_DISAGREE_M +
-          (ref.speed || 0) * LOCATE_SPEED_ALLOWANCE_S;
-        if (jump > allowed) return { pose: null, tagObs: known, jump };
-      }
-      return { pose, tagObs: known };
     },
 
     // One pose message from a client. Returns the enrichment for the viewer:
@@ -495,7 +692,6 @@ function createSurvey({ file, markerSizeM, log }) {
       }
 
       const known = obs.filter((o) => markers.has(o.id));
-      const unknown = obs.filter((o) => !markers.has(o.id));
       const prev = clientId !== undefined ? lastFix.get(clientId) : undefined;
       const prevFresh = prev && Date.now() - prev.at < JUMP_HISTORY_TTL_MS;
       pickSolutions(known, prevFresh ? prev.pose : null);
@@ -530,46 +726,16 @@ function createSurvey({ file, markerSizeM, log }) {
       // No tags in view: carry the pose on the track's own velocity rather
       // than going dark. Good for well under a second — it is dead reckoning
       // with no drift correction, so it is reported as such and never used to
-      // extend the survey or to place a keyframe.
+      // extend the survey.
       if (!pose && clientId !== undefined) {
         const guess = predictPose(clientId);
         if (guess) return { pose: guess, quality: 'dead', mapChanged };
       }
 
       if (pose) {
-        const strong = known.filter((o) => o.err <= GOOD_MAX_ERR_PX && o.dist <= GOOD_MAX_DIST_M);
-
-        // Extend: every unknown tag seen from a solid fix contributes one
-        // room-pose estimate.
-        if (strong.length) {
-          for (const o of unknown) {
-            const est = se3Compose(pose, o.camTag);
-            let ring = candidates.get(o.id);
-            if (!ring) candidates.set(o.id, (ring = []));
-            ring.push(est);
-            if (ring.length > CANDIDATE_RING) ring.shift();
-            if (tryPromote(o.id)) mapChanged = true;
-          }
-        }
-
-        // Refine: nudge a known tag using a camera fix computed from the
-        // other tags only. The anchor is the datum and never moves.
-        if (known.length >= 2) {
-          for (const o of known) {
-            if (o.id === anchorId) continue;
-            const others = known.filter((x) => x.id !== o.id);
-            const fix = fuseCameraPose(others);
-            if (!fix) continue;
-            const est = se3Compose(fix, o.camTag);
-            const m = markers.get(o.id);
-            for (let k = 0; k < 3; k++) {
-              m.pose.p[k] += (est.p[k] - m.pose.p[k]) * REFINE_ALPHA;
-            }
-            m.pose.q = quatNudge(m.pose.q, est.q, REFINE_ALPHA);
-            m.nObs++;
-            scheduleSave();
-          }
-        }
+        const strong = known.filter(
+          (o) => o.err <= GOOD_MAX_ERR_PX && o.dist <= GOOD_MAX_DIST_M);
+        if (maintainSurvey(pose, obs)) mapChanged = true;
 
         return {
           pose: smoothed,
