@@ -186,12 +186,41 @@ const DETECT_PROFILES = {
   },
 };
 
-function makeRoomDetector(cv, profile = 'full') {
+// ArUco3 always costs acquisition range; big frames simply have range to
+// spare, so it is a trade to make per resolution rather than a constant.
+// Candidate search and decoding both run on the downscaled copy (OpenCV
+// resizes `grey` in place before `_detectInitialCandidates`), so the floor
+// that matters — roughly 20 px of marker side for a 4x4 dictionary, an
+// empirical limit rather than a parameter — applies there. In original pixels
+// that floor is 20/scale, which is why it moves with the frame: the ratio
+// declares the smallest marker as a *fraction of the long edge*, not as a
+// pixel count. Wanting a constant 20 px original at every resolution is
+// wanting scale = 1, i.e. no ArUco3 at all. A tag that never surfaces in a
+// full sweep never starts the ROI track either, so the range it takes is not
+// recoverable elsewhere. On a 150 mm tag and a 66-degree lens the trade runs:
+//   3840  7.9 m with, ~22 m without   8 MP sweep    keep it
+//   1920  5.8 m with, ~11 m without   2 MP sweep    not worth it
+//   1280  4.6 m with, ~7.4 m without  1 MP sweep    not worth it
+//    640  2.8 m with, ~3.7 m without  0.3 MP sweep  not worth it
+// Only the 4K sweep is expensive enough to buy speed with range it can spare;
+// this threshold sits just under it. The 640 px frame is what WebXR's
+// camera-access hands over, and it has the least range to give away.
+const ARUCO3_MIN_LONG_EDGE = 2560;
+
+function makeRoomDetector(cv, profile = 'full', longEdge = Infinity) {
   const dict = cv.getPredefinedDictionary(cv[ROOM_DICT]);
   const params = new cv.aruco_DetectorParameters();
   // Subpixel corner refinement is most of the pose accuracy at range.
   params.cornerRefinementMethod = cv.CORNER_REFINE_SUBPIX;
-  for (const [key, value] of Object.entries(DETECT_PROFILES[profile])) {
+  const settings = { ...DETECT_PROFILES[profile] };
+  if (settings.useAruco3Detection && longEdge < ARUCO3_MIN_LONG_EDGE) {
+    // Drop the companion settings too: with ArUco3 off OpenCV ignores them,
+    // and leaving them applied would suggest they still gate something.
+    settings.useAruco3Detection = false;
+    delete settings.minSideLengthCanonicalImg;
+    delete settings.minMarkerLengthRatioOriginalImg;
+  }
+  for (const [key, value] of Object.entries(settings)) {
     // opencv.js builds differ in which detector parameters they expose, and an
     // unknown name would land as a plain JS property — silently ignored by the
     // wasm side, which is exactly the failure mode that hid the ArUco3 ratio.
