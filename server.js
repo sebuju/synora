@@ -8,8 +8,6 @@ const { spawn, spawnSync } = require('child_process');
 const { WebSocketServer } = require('ws');
 const qrcode = require('qrcode-terminal');
 const { createSurvey } = require('./survey.js');
-const { createMapping } = require('./mapping.js');
-const { createDepthCal } = require('./depth-cal.js');
 
 const PORT = Number(process.env.PORT) || 8443;
 const CERT_DIR = path.join(__dirname, 'certs');
@@ -22,23 +20,24 @@ const VCAM_WIDTH = 1280;
 const VCAM_HEIGHT = 720;
 const VCAM_FPS = 30;
 const VENDOR_DIR = path.join(PUBLIC_DIR, 'vendor');
-const MODELS_DIR = path.join(__dirname, 'models');
-const DEPTH_MODEL = path.join(MODELS_DIR, 'depth.onnx');
-// Metric variant (metres out): preferred when present — a single tag then
-// suffices to calibrate each keyframe's depth.
-const DEPTH_MODEL_METRIC = path.join(MODELS_DIR, 'depth-metric.onnx');
 const MARKER_MAP_FILE = path.join(__dirname, 'markers.json');
-const DEPTH_CAL_FILE = path.join(__dirname, 'depth-calibration.json');
+const POSE_SETTINGS_FILE = path.join(__dirname, 'pose-settings.json');
 const LOG_FILE = path.join(__dirname, 'server.log');
-// Physical marker edge length in meters — must match the printed size from
+// Physical marker edge length in meters — the outer edge of the black square,
+// not the sheet and not the quiet zone. Must match the printed size from
 // /markers, or every distance in the room frame scales by the same error.
+// Measured 142 mm on the printed set: a 150 mm marker sent through a printer's
+// "fit to page" comes back at about 95%, and nothing downstream can see the
+// difference — it just reports a room 5.6% too big, consistently enough to
+// look right. Changing it invalidates markers.json — the loader checks the
+// size the map was surveyed at and refuses a mismatch.
+// Settable from /markers, so this is the default rather than the value.
 const POSE_CONFIG = {
   markerSizeM: 0.15,
   dictionary: 'DICT_4X4_50',
   // 10 Hz: more samples per second converges the survey and the jump gate
   // faster; detection itself costs a client a few tens of ms per frame.
   poseRateMs: 100,
-  keyframeMs: 1000,
 };
 
 // Every device aligns its frames against this clock, so it must not step:
@@ -130,6 +129,36 @@ const MIME = {
 
 function serveStatic(req, res) {
   let urlPath = req.url.split('?')[0];
+  // /markers is a plain page with no socket of its own, so the marker size it
+  // sets and renders at rides a small JSON route rather than the WS protocol.
+  if (urlPath === '/api/pose-config') {
+    if (req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ markerSizeM: POSE_CONFIG.markerSizeM }));
+      return;
+    }
+    if (req.method === 'POST') {
+      let body = '';
+      req.on('data', (c) => {
+        body += c;
+        if (body.length > 1024) req.destroy();
+      });
+      req.on('end', () => {
+        let out;
+        try {
+          out = applyMarkerSize(Number(JSON.parse(body).markerSizeM));
+        } catch (err) {
+          out = { ok: false, error: err.message };
+        }
+        res.writeHead(out.ok ? 200 : 400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(out));
+      });
+      return;
+    }
+    res.writeHead(405);
+    res.end('Method not allowed');
+    return;
+  }
   if (urlPath === '/') urlPath = '/index.html';
   // Legacy path — printed QR codes and bookmarks from before the rename.
   if (urlPath === '/phone') {
@@ -141,7 +170,6 @@ function serveStatic(req, res) {
   if (urlPath === '/viewer' || urlPath === '/dashboard') urlPath = '/viewer.html';
   if (urlPath === '/calibrate') urlPath = '/calibrate.html';
   if (urlPath === '/markers') urlPath = '/markers.html';
-  if (urlPath === '/depth-calibrate') urlPath = '/depth-calibrate.html';
   if (urlPath === '/xr-probe') urlPath = '/xr-probe.html';
   if (urlPath === '/xr-client') urlPath = '/xr-client.html';
   if (urlPath === '/digital') urlPath = '/digital.html';
@@ -195,9 +223,13 @@ const clientIdsByDevice = new Map();
 let nextClientId = 1;
 let viewerSocket = null;
 
-// Everything log() prints also lands in server.log; the file starts fresh on
-// every boot ('w'), so it holds exactly this run.
-const logStream = fs.createWriteStream(LOG_FILE, { flags: 'w' });
+// Everything log() prints also lands in server.log. Appended, not truncated:
+// `npm run dev` restarts on every file change, and truncating meant the log of
+// the run that showed the problem was gone by the time the fix was typed. The
+// boot banner below is the run separator.
+const logStream = fs.createWriteStream(LOG_FILE, { flags: 'a' });
+
+logStream.write(`\n===== server start ${fmtDateTime(new Date())} =====\n`);
 
 function log(msg) {
   const line = `[${fmtDateTime(new Date())}] ${msg}`;
@@ -264,88 +296,59 @@ function send(socket, obj) {
 // ---------------------------------------------------------------------------
 // Marker survey: turns per-tag camera-frame observations from the clients into
 // a persistent room-frame marker map and room-frame client poses.
+// The printed marker size is measured, not decided: a printer's "fit to page"
+// silently returns a 150 mm marker at ~142 mm, and nothing downstream can tell
+// — the room simply comes out uniformly too big. So it is settable from
+// /markers and persisted here, ahead of the survey that depends on it.
+function loadPoseSettings() {
+  let raw;
+  try {
+    raw = JSON.parse(fs.readFileSync(POSE_SETTINGS_FILE, 'utf8'));
+  } catch {
+    return;   // no settings yet — the defaults above stand
+  }
+  if (raw.markerSizeM > 0) POSE_CONFIG.markerSizeM = raw.markerSizeM;
+}
+
+function savePoseSettings() {
+  const tmp = `${POSE_SETTINGS_FILE}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify({ markerSizeM: POSE_CONFIG.markerSizeM }, null, 1));
+    fs.renameSync(tmp, POSE_SETTINGS_FILE);
+  } catch (err) {
+    log(`Could not save pose settings: ${err.message}`);
+  }
+}
+
+loadPoseSettings();
+
 const survey = createSurvey({
   file: MARKER_MAP_FILE,
   markerSizeM: POSE_CONFIG.markerSizeM,
   log,
 });
 
-// The depth model's scale and shift for one camera at one keyframe size —
-// measured by a deliberate sweep on /depth-calibrate, then frozen.
-const depthCal = createDepthCal({
-  file: DEPTH_CAL_FILE,
-  metric: fs.existsSync(DEPTH_MODEL_METRIC),
-  log,
-  fmtDateTime,
-});
+// Changing the marker size rescales the room, so the survey goes with it:
+// every tag position was measured in the old scale and a mixture of the two is
+// worse than either.
+const MARKER_SIZE_MIN_M = 0.02;
+const MARKER_SIZE_MAX_M = 1;
 
-// Room mapping: posed keyframes -> depth inference -> voxel grid, streamed to
-// the viewer as deltas. Needs the depth model present *and* the keyframe's
-// camera calibrated — an uncalibrated camera's frames are refused, not guessed.
-const mapping = createMapping({
-  modelPath: fs.existsSync(DEPTH_MODEL_METRIC) ? DEPTH_MODEL_METRIC : DEPTH_MODEL,
-  metric: fs.existsSync(DEPTH_MODEL_METRIC),
-  survey,
-  depthCal,
-  log,
-  onCalState: (clientId, deviceId) => sendCalState(clientId, deviceId),
-  onDelta: (delta) => send(viewerSocket, { type: 'map-delta', ...delta }),
-  onSnapshot: (parts) => parts.forEach((p) => send(viewerSocket, p)),
-  onWalls: (walls) => send(viewerSocket, { type: 'walls', walls }),
-});
-
-// A depth frame from an XR client: 'XRD1' magic, uint32 LE header length, JSON
-// header, then a Float32Array of camera-frame points (NaN where ARCore had no
-// depth). No depth model and no calibration involved — ARCore measured these.
-function tryXrFrame(ws, data) {
-  if (data.length < 9 || data[0] !== 0x58 || data[1] !== 0x52 ||
-    data[2] !== 0x44 || data[3] !== 0x31) return false;
-  const headerLen = data.readUInt32LE(4);
-  if (headerLen <= 0 || 8 + headerLen > data.length) return false;
-  let header;
-  try {
-    header = JSON.parse(data.subarray(8, 8 + headerLen).toString('utf8'));
-  } catch {
-    return false;
+function applyMarkerSize(m) {
+  if (!(m >= MARKER_SIZE_MIN_M && m <= MARKER_SIZE_MAX_M)) {
+    return { ok: false, error: `marker size must be ${MARKER_SIZE_MIN_M}-${MARKER_SIZE_MAX_M} m` };
   }
-  if (!header.xr || !header.gw || !header.gh) return false;
-  const body = data.subarray(8 + headerLen);
-  // Copy through a fresh buffer: the socket's memory is not aligned for a
-  // Float32Array view and is reused for the next message.
-  const pts = new Float32Array(header.gw * header.gh * 3);
-  Buffer.from(pts.buffer).set(body.subarray(0, pts.byteLength));
-  mapping.handleXrFrame(ws.clientId, header, pts);
-  return true;
-}
-
-// A keyframe binary frame: 'KFR1' magic, uint32 LE header length, JSON
-// header, JPEG. Returns true if the frame was consumed as a keyframe. A
-// recording chunk opening with the same four bytes (p ~ 2^-32) falls through
-// on the JSON parse and lands in the recording as it should.
-function tryKeyframe(ws, data) {
-  if (data.length < 9 || data[0] !== 0x4b || data[1] !== 0x46 ||
-    data[2] !== 0x52 || data[3] !== 0x31) return false;
-  const headerLen = data.readUInt32LE(4);
-  if (headerLen <= 0 || 8 + headerLen > data.length) return false;
-  let header;
-  try {
-    header = JSON.parse(data.subarray(8, 8 + headerLen).toString('utf8'));
-  } catch {
-    return false;
+  if (m === POSE_CONFIG.markerSizeM) return { ok: true, markerSizeM: m, changed: false };
+  POSE_CONFIG.markerSizeM = m;
+  savePoseSettings();
+  survey.setMarkerSize(m);
+  // Clients scale every distance they report by this, so none may keep the
+  // old value for even one more pose message.
+  for (const client of clients.values()) {
+    send(client, { type: 'pose-config', ...POSE_CONFIG });
   }
-  if (!header.intrinsics || !Array.isArray(header.tags)) return false;
-  // Copy the JPEG out: the worker takes ownership of the buffer it gets, and
-  // a subarray would hand it the whole socket message's memory.
-  mapping.handleKeyframe(
-    ws.clientId, ws.deviceId, header, Buffer.from(data.subarray(8 + headerLen)));
-  return true;
-}
-
-// Calibration state goes to the device doing the sweeping — it is holding the
-// page, and the numbers are only meaningful next to the tag it is pointing at.
-function sendCalState(clientId, deviceId) {
-  const sock = clients.get(clientId);
-  if (sock) send(sock, depthCal.state(deviceId));
+  send(viewerSocket, { type: 'marker-map', ...survey.getMarkerMap() });
+  return { ok: true, markerSizeM: m, changed: true };
 }
 
 // ---------------------------------------------------------------------------
@@ -439,14 +442,6 @@ function clientIdFor(deviceId) {
   return clientIdsByDevice.get(deviceId);
 }
 
-// A device sweeping its depth calibration needs keyframes regardless of what
-// the dashboard's map view is set to — the sweep is the one thing that makes
-// the map possible in the first place.
-function keyframeMsFor(ws) {
-  if (depthCal.isCalibrating(ws.deviceId)) return POSE_CONFIG.keyframeMs;
-  return mapping.isActive() ? POSE_CONFIG.keyframeMs : 0;
-}
-
 function handleSignal(ws, msg) {
   if (msg.type === 'role') {
     if (msg.role === 'client') {
@@ -455,10 +450,6 @@ function handleSignal(ws, msg) {
       // Kept as well as the clientId: depth calibration is a property of the
       // physical camera, so it outlives the session-scoped small integer.
       ws.deviceId = msg.deviceId;
-      // A plain client connection ends any sweep this device left running:
-      // the calibration page re-announces itself on every (re)connect, so
-      // whatever survives this is genuinely still sweeping.
-      depthCal.stop(msg.deviceId);
       // A reload can land the new socket before the old one's close fires, so
       // retire whatever socket still holds the id — only one owns it.
       const prev = clients.get(ws.clientId);
@@ -473,15 +464,11 @@ function handleSignal(ws, msg) {
       send(ws, { type: 'client-id', clientId: ws.clientId });
       // The printed marker size is the server's to declare — a client assuming
       // a different size would scale every distance it reports.
-      send(ws, {
-        type: 'pose-config',
-        ...POSE_CONFIG,
-        keyframeMs: keyframeMsFor(ws),
-      });
+      send(ws, { type: 'pose-config', ...POSE_CONFIG });
       if (viewerSocket) send(ws, { type: 'viewer-ready' });
     } else if (msg.role === 'client-bulk') {
-      // A client's second socket, carrying only bulk binary (recorder chunks,
-      // keyframes) so they cannot queue ahead of the client's JSON traffic.
+      // A client's second socket, carrying only bulk binary (recorder chunks)
+      // so they cannot queue ahead of the client's JSON traffic.
       // Same deviceId as the main socket -> same clientId; recording state
       // stays on the main socket.
       ws.role = 'client-bulk';
@@ -497,8 +484,6 @@ function handleSignal(ws, msg) {
       if (!vcamDeviceId) detectVcam();
       send(ws, { type: 'vcam-state', clientId: vcamClientId, available: !!vcamDeviceId });
       send(ws, { type: 'marker-map', ...survey.getMarkerMap() });
-      for (const part of mapping.snapshotParts()) send(ws, part);
-      send(ws, { type: 'walls', walls: mapping.getWalls() });
       for (const client of clients.values()) send(client, { type: 'viewer-ready' });
     }
     return;
@@ -541,43 +526,17 @@ function handleSignal(ws, msg) {
     }
     return;
   }
-  if (msg.type === 'map-clear') {
-    if (ws.role === 'viewer') mapping.clear().forEach((p) => send(ws, p));
-    return;
-  }
-  if (msg.type === 'map-view') {
-    if (ws.role === 'viewer') {
-      mapping.setViewMode(msg.mode).forEach((p) => send(ws, p));
-      // Keyframes are pure waste while mapping is off — tell the clients.
-      for (const client of clients.values()) {
-        send(client, { type: 'pose-config', keyframeMs: keyframeMsFor(client) });
-      }
-    }
-    return;
-  }
-  if (msg.type === 'depth-cal') {
-    if (ws.role === 'client') {
-      if (msg.action === 'start') depthCal.start(ws.deviceId);
-      else if (msg.action === 'stop') depthCal.stop(ws.deviceId);
-      else if (msg.action === 'clear') depthCal.clear(ws.deviceId);
-      else if (msg.action === 'unfreeze') depthCal.unfreeze(ws.deviceId);
-      else if (msg.action === 'freeze') {
-        const res = depthCal.freeze(ws.deviceId);
-        if (!res.ok) send(ws, { type: 'depth-cal-error', reason: res.reason });
-      }
-      // Starting or stopping changes whether this device owes us keyframes.
-      send(ws, { type: 'pose-config', keyframeMs: keyframeMsFor(ws) });
-      send(ws, depthCal.state(ws.deviceId));
-    }
-    return;
-  }
   if (msg.type === 'xr-pose') {
     if (ws.role === 'client') {
       // ARCore already knows where the camera is; the tags only say where the
       // room is relative to ARCore's frame.
-      const { pose, quality, mapChanged } = survey.alignXr(ws.clientId, msg.xr, msg.tags || []);
-      send(viewerSocket, { ...msg, type: 'pose', clientId: ws.clientId, room: { pose, quality } });
-      send(ws, { type: 'room-pose', pose, quality });
+      const { pose, quality, mapChanged, jitter } =
+        survey.alignXr(ws.clientId, msg.xr, msg.tags || [], msg.sid ?? null, msg.intrinsics);
+      send(viewerSocket, {
+        ...msg, type: 'pose', clientId: ws.clientId, room: { pose, quality, jitter } });
+      // jitter rides back to the client: the measurement needs both the phone's
+      // own pose and the room pose, and only this side has both.
+      send(ws, { type: 'room-pose', pose, quality, jitter });
       if (mapChanged) send(viewerSocket, { type: 'marker-map', ...survey.getMarkerMap() });
     }
     return;
@@ -613,16 +572,12 @@ function probeAssets() {
   if (missing.length) {
     log(`Pose features disabled: missing ${missing.join(', ')} — run "npm run fetch-vendor"`);
   }
-  if (!fs.existsSync(DEPTH_MODEL_METRIC) && !fs.existsSync(DEPTH_MODEL)) {
-    log('Mapping disabled: no depth model in models/ — run "npm run fetch-vendor"');
-  }
 }
 
 function main() {
   detectVcam();
   probeAssets();
   survey.load();
-  depthCal.load();
   const tls = loadOrCreateCert();
   const server = https.createServer(tls, serveStatic);
   const wss = new WebSocketServer({ server });
@@ -631,10 +586,6 @@ function main() {
     ws.on('message', (data, isBinary) => {
       if (isBinary) {
         if (ws.role !== 'client' && ws.role !== 'client-bulk') return;
-        // Keyframes must be picked off before the recording sink — they are
-        // not WebM data, and they arrive whether or not a recording is open.
-        if (tryKeyframe(ws, data)) return;
-        if (tryXrFrame(ws, data)) return;
         // Recording state lives on the client's main socket, wherever the
         // bytes arrive.
         const main = ws.role === 'client' ? ws : clients.get(ws.clientId);

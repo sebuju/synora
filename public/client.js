@@ -90,7 +90,7 @@ const signaling = connectSignaling('client', {
 
 const clockSync = createClockSync(signaling);
 
-// Bulk uploads (recorder chunks, keyframes) get their own socket. They share
+// Bulk uploads (recorder chunks) get their own socket. They share
 // one TCP stream's ordering, but more importantly they no longer sit in front
 // of pose and signaling messages — half a megabyte of WebM per second queued
 // ahead of a pose message is exactly the lag it caused. Same deviceId, so the

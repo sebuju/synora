@@ -126,7 +126,7 @@ function connectSignaling(role, handlers = {}, deviceId = loadDeviceId(role)) {
       if (ws?.readyState === WebSocket.OPEN) ws.send(blob);
     },
     // Unsent bytes sitting in the socket. Senders of bulky, droppable data
-    // (keyframes) must check this — everything shares one socket, and small
+    // must check this — everything shares one socket, and small
     // time-critical messages queue behind whatever was sent before them.
     get bufferedAmount() {
       return ws?.readyState === WebSocket.OPEN ? ws.bufferedAmount : 0;

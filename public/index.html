@@ -66,10 +66,6 @@
           <h2>Camera calibration <span class="path">/calibrate</span></h2>
           <p>One-time per client lens: print the ChArUco board, capture ~15 views, save intrinsics. Marker distances go from ~5% to sub-1% error.</p>
         </a>
-        <a class="card" href="/depth-calibrate">
-          <h2>Depth calibration <span class="path">/depth-calibrate</span></h2>
-          <p>One-time per client lens and resolution: walk a tag from near to far to measure the depth model's scale and shift, then freeze them. Room mapping ignores an uncalibrated camera.</p>
-        </a>
         <a class="card" href="/xr-client">
           <h2>XR client <span class="path">/xr-client</span></h2>
           <p>Positioning and mapping from ARCore: its world tracking carries the pose between tag sightings, its depth replaces the depth model entirely. Does not stream video. Android + ARCore only.</p>

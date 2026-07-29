@@ -19,13 +19,13 @@
 const posePipeline = (() => {
   let video = null;
   let signaling = null;
-  let bulk = null;       // bulk-upload socket — keyframes must not delay poses
+  let bulk = null;       // bulk-upload socket — recorder chunks
   let clockSync = null;
   let onState = null;    // notifies client.js so it can report client-state
 
   let enabled = false;
   let paused = false;
-  let config = { markerSizeM: 0.15, poseRateMs: 150, keyframeMs: 1000 };
+  let config = { markerSizeM: 0.15, poseRateMs: 150 };
   let facing = 'environment';
 
   // Intrinsics are read from localStorage, so the page owns them whichever
@@ -46,15 +46,7 @@ const posePipeline = (() => {
   let armed = false;
   let busy = false;
   let lastDetect = 0;
-  let lastKeyframe = 0;
 
-  // Keyframes ride the bulk socket, which the recorder keeps busy at ~500 KB/s
-  // — demanding an empty buffer starves them entirely. A modest backlog is fine
-  // (nothing latency-critical sits behind them there); the cap only stops a
-  // link that cannot keep up from accumulating an unbounded queue of stale
-  // frames.
-  const KEYFRAME_MAX_BUFFERED = 1.5 * 1024 * 1024;
-  let keyframesAllowed = true;
 
   const statsEl = document.getElementById('poseStats');
   let roomPose = null;   // echoed back by the server; the map lives there
@@ -86,37 +78,6 @@ const posePipeline = (() => {
       tags: res.tags,
     });
     updateStats(res);
-    updateKeyframePermission();
-  }
-
-  // Binary envelope: 'KFR1' | uint32 LE header length | JSON header | JPEG.
-  // Rides the same socket as recording chunks; the magic is what keeps the
-  // server from appending it to the recording.
-  function sendKeyframe(kf) {
-    const cam = intrinsicsAt(kf.w, kf.h);
-    const header = new TextEncoder().encode(JSON.stringify({
-      t: clockSync.synced ? clockSync.at(kf.at) : null,
-      w: kf.kw,
-      h: kf.kh,
-      // Intrinsics scale with pixel pitch; tag poses are metric and do not.
-      intrinsics: {
-        fx: cam.fx * kf.scale, fy: cam.fy * kf.scale,
-        cx: cam.cx * kf.scale, cy: cam.cy * kf.scale,
-        dist: cam.dist,
-      },
-      tags: kf.tags,
-    }));
-    const head = new Uint8Array(8);
-    head[0] = 0x4b; head[1] = 0x46; head[2] = 0x52; head[3] = 0x31;   // KFR1
-    new DataView(head.buffer).setUint32(4, header.length, true);
-    bulk.sendBinary(new Blob([head, header, kf.bytes]));
-  }
-
-  function updateKeyframePermission() {
-    const allowed = bulk.bufferedAmount < KEYFRAME_MAX_BUFFERED;
-    if (allowed === keyframesAllowed) return;
-    keyframesAllowed = allowed;
-    worker?.postMessage({ type: 'keyframes', allowed });
   }
 
   // On-screen diagnostics — makes "why is nothing happening" answerable from
@@ -160,8 +121,6 @@ const posePipeline = (() => {
   function handleWorkerMessage(msg) {
     if (msg.type === 'pose') {
       publishPose(msg);
-    } else if (msg.type === 'keyframe') {
-      sendKeyframe(msg);
     } else if (msg.type === 'need-intrinsics') {
       worker?.postMessage({
         type: 'intrinsics', w: msg.w, h: msg.h, intr: intrinsicsAt(msg.w, msg.h),
@@ -204,7 +163,6 @@ const posePipeline = (() => {
       timeOrigin: performance.timeOrigin,
       markerSizeM: config.markerSizeM,
       poseRateMs: config.poseRateMs,
-      keyframeMs: config.keyframeMs,
     });
     return worker;
   }
@@ -246,12 +204,6 @@ const posePipeline = (() => {
     const res = await core.detect(canvasSource, video, w, h, now);
     if (!res) return;
     publishPose({ ...res, at: now });
-
-    if (!res.tags.length || !keyframesAllowed || config.keyframeMs <= 0) return;
-    if (now - lastKeyframe < config.keyframeMs) return;
-    lastKeyframe = now;
-    const kf = await core.encodeKeyframe(video, w, h);
-    if (kf) sendKeyframe({ ...kf, at: now, tags: res.tags, w, h });
   }
 
   function armLoop() {
@@ -296,8 +248,6 @@ const posePipeline = (() => {
     setConfig(cfg) {
       if (cfg.markerSizeM) config.markerSizeM = cfg.markerSizeM;
       if (cfg.poseRateMs) config.poseRateMs = cfg.poseRateMs;
-      // 0 is meaningful: mapping is off, stop producing keyframes.
-      if (cfg.keyframeMs !== undefined) config.keyframeMs = cfg.keyframeMs;
       core?.setMarkerSize(config.markerSizeM);
       worker?.postMessage({ type: 'config', ...config });
     },

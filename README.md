@@ -2,7 +2,7 @@
 
 *syn + hórama — "seeing together".*
 
-Multi-client camera system for a local network. N clients stream video peer-to-peer (WebRTC) to a single browser dashboard; the server handles signaling, per-device recording, and optionally exposes a feed as a Windows virtual webcam. With ArUco tags placed in the room, the clients additionally localize themselves in a shared room frame and feed a monocular-depth mapping pipeline that builds a voxel occupancy map and a fitted wall layer.
+Multi-client camera system for a local network. N clients stream video peer-to-peer (WebRTC) to a single browser dashboard; the server handles signaling, per-device recording, and optionally exposes a feed as a Windows virtual webcam. With ArUco tags placed in the room, the clients additionally localize themselves in a shared room frame, shown live in 3D and 2D room views.
 
 No build step, no app install: vanilla JS served as static files. A client is any phone (or tablet) pointed at a web page.
 
@@ -12,7 +12,6 @@ No build step, no app install: vanilla JS served as static files. A client is an
 - [Architecture](#architecture)
 - [Frame sync](#frame-sync)
 - [Room positioning](#room-positioning)
-- [Room mapping](#room-mapping)
 - [Virtual webcam](#virtual-webcam)
 - [Recordings](#recordings)
 - [Project layout](#project-layout)
@@ -24,11 +23,11 @@ Requirements: Node ≥ 18. Clients and PC on the same LAN.
 
 ```bash
 npm install
-npm run fetch-vendor   # opencv.js, three.js, depth models — required for positioning/mapping
+npm run fetch-vendor   # opencv.js, three.js — required for positioning
 npm start              # or: npm run dev (node --watch)
 ```
 
-`fetch-vendor` downloads third-party assets into gitignored directories (`public/vendor/`, `models/`). Without them the server runs and streams; the positioning and mapping features are disabled, and the startup log lists what is missing.
+`fetch-vendor` downloads third-party assets into a gitignored directory (`public/vendor/`). Without them the server runs and streams; the positioning features are disabled, and the startup log lists what is missing.
 
 The server listens on `:8443` (HTTPS + WSS) and prints both URLs and a QR code:
 
@@ -37,7 +36,7 @@ The server listens on `:8443` (HTTPS + WSS) and prints both URLs and a QR code:
 
 The certificate is self-signed, generated into `certs/` on first run; each device accepts the browser warning once. HTTPS is required — browsers refuse `getUserMedia` on non-`localhost` HTTP origins.
 
-There is no test suite, linter, or build step. Verification is manual: start the server, open both pages, watch the server log (connect/disconnect, client roster, recording byte counts, survey/mapping events, ffmpeg stderr).
+There is no test suite, linter, or build step. Verification is manual: start the server, open both pages, watch the server log (connect/disconnect, client roster, recording byte counts, survey events, ffmpeg stderr).
 
 ## Architecture
 
@@ -49,20 +48,20 @@ flowchart LR
     R[("recordings/*.webm")]
     C["ffmpeg → AkVCamManager"]
 
-    P1 -- "WS signaling + WS bulk (WebM chunks, keyframes)" --> S
+    P1 -- "WS signaling + WS bulk (WebM chunks)" --> S
     V -- "WS signaling" --> S
     S --> R
     S -.optional.-> C
     P1 == "WebRTC media (P2P over LAN)" ==> V
 ```
 
-Live media is WebRTC peer-to-peer; it does not pass through the server. Each client holds two WebSockets under one client identity: a signaling socket for small latency-sensitive JSON, and a bulk socket for recorder chunks and mapping keyframes. The split exists so bulk bytes cannot queue ahead of pose or signaling messages.
+Live media is WebRTC peer-to-peer; it does not pass through the server. Each client holds two WebSockets under one client identity: a signaling socket for small latency-sensitive JSON, and a bulk socket for recorder chunks. The split exists so bulk bytes cannot queue ahead of pose or signaling messages.
 
 Server responsibilities:
 
 1. **Signaling relay.** `offer`/`answer`/`ice` relayed verbatim; client→viewer messages are tagged with a `clientId`, viewer→client messages carry one for routing. One viewer at a time — a new one displaces the old.
-2. **Recording sink.** Binary frames on the bulk socket are `MediaRecorder` chunks appended to the client's current file. Recording state lives on the socket, so a new socket requires a new recorder (the first chunk carries the WebM header); the client therefore rebuilds its recorder on reconnect, camera switch, mic toggle, and resolution change. Frames beginning with the `KFR1` magic are mapping keyframes and are demuxed before the recording append.
-3. **Room survey and mapping.** See the sections below.
+2. **Recording sink.** Binary frames on the bulk socket are `MediaRecorder` chunks appended to the client's current file. Recording state lives on the socket, so a new socket requires a new recorder (the first chunk carries the WebM header); the client therefore rebuilds its recorder on reconnect, camera switch, mic toggle, and resolution change.
+3. **Room survey and localization.** See the sections below.
 4. **Virtual webcam tee** (optional, Windows).
 
 **Client identity.** Each device persists a UUID in `localStorage` and presents it on every connection; the server maps it to a stable small integer, so a reload keeps its tile and recording filename prefix. A new socket for an existing id closes the old one; the old socket's close handler checks it still owns the id before cleaning up.
@@ -93,7 +92,6 @@ Clients detect ArUco tags fixed to the room and the server maintains a persisten
 
 1. Print tags from `/markers`. Tag edge must be exactly 150 mm including the black border (`markerSizeM` in `server.js`); any scale error multiplies every distance in the room frame. A screen showing `/digital` also works as a tag.
 2. Calibrate each client at `/calibrate` (ChArUco board from the same page). Intrinsics are stored per lens and per resolution in `localStorage`. Uncalibrated clients fall back to a generic FOV model and are flagged `calibrated:false` end to end.
-3. For room mapping, sweep each client at `/depth-calibrate` — one sweep per lens and capture resolution. Until a camera has a frozen calibration its keyframes are ignored, so mapping stays dark. See [Depth calibration](#depth-calibration--depth-calibrate).
 4. Marker tracking is on by default (toggle on the client header). The client-side overlay reports resolution, scan mode, a detect-time breakdown (pixel grab / tag search / PnP), per-tag distance / viewing angle / reprojection error, and the current room fix.
 
 **Detection** (`detect-worker.js` + `detect-core.js`, client). Runs at ~10 Hz on raw camera frames at native capture resolution, on a worker thread fed by a `MediaStreamTrackProcessor` — detection is the most expensive thing the client does per frame and it must not stall the encoded-frame transform, the recorder or the UI. Where a track processor is unavailable, `pose.js` runs the same core on the page via `requestVideoFrameCallback`.
@@ -113,35 +111,6 @@ Per tag, pose comes from `SOLVEPNP_IPPE_SQUARE`. Planar PnP has a two-fold mirro
 Removing a tag: double-click it in the floor plan. Removing the anchor resets the entire survey, since all poses are expressed relative to it.
 
 Expected accuracy is decimeter-level at room scale, dependent on calibration quality, tag print accuracy, viewing angle (degrades hard past ~60° off-normal), and distance.
-
-## Room mapping
-
-Requires a depth model in `models/` (`fetch-vendor` downloads Depth Anything V2 in relative and metric variants; the metric one is preferred). Pipeline:
-
-1. **Keyframes.** About once per second, a client that currently sees a tag encodes the frame as a ≤672 px JPEG and sends it over the bulk socket with its tags and intrinsics (`KFR1` framing). Frames without tags are not sent — they could not be posed.
-2. **Posing.** The server poses each keyframe purely from the tags in that frame via the survey (`locate`), independent of the live pose stream.
-3. **Depth.** A worker thread runs inference (~0.5 s CPU). One job at a time; a newer keyframe from the same client replaces its queued predecessor rather than queuing behind it.
-4. **Metric calibration.** Applied, not fitted. Each keyframe is scaled by the camera's frozen calibration (see below); the tags in the frame only re-check it, and a frame whose *median* tag disagrees by more than 25 % is rejected rather than allowed to bend the calibration to itself. Median, not every tag: a frame showing three tags usually has one at a glancing angle where the depth map is noise, and letting it veto the two that agreed cost 42 % of frames in a real session. The accepted residual is logged per keyframe — it should sit near the one the sweep froze at. A camera with no frozen calibration has its keyframes ignored outright, with a log line pointing at the calibration page.
-5. **Voxel grid.** Valid depth pixels backproject through the keyframe pose into a 7.5 cm voxel grid holding log-odds occupancy. A direct hit and the dilated face-neighbor shell around it are weighted apart: dilation covers monocular wobble between frames, but counting the shell as a hit makes every surface three voxels thick. Each ray also votes free space for the cells it crosses (stopping short of the surface by more than the depth noise), and that evidence subtracts. Log-odds saturates in both directions, so a cell one bad keyframe painted fades once later frames disagree, instead of outliving the session.
-6. **Floor plan.** Fitted to surface evidence rather than to the voxel grid. Every accepted point votes into a 5 cm floor-plane cell carrying its normal; hundreds of keyframes vote into the same cells, so the noise averages out *before* anything is fitted instead of being frozen into occupancy first. Walls are vertical (normals horizontal, within a height band above a measured floor level) and rooms are rectilinear, so the dominant direction is estimated over all the evidence at once — folded mod 90°, which makes perpendicular walls reinforce one estimate instead of splitting it — and walls fall out as peaks in the perpendicular histogram along each axis, split into runs at doorways. Genuinely off-axis walls are picked up afterwards by RANSAC over whatever the axes could not explain (total-least-squares refit, split at gaps, percentile-bounded vertical extent). Candidates are scored by their longest contiguous, dense run rather than by everything an infinite line grazes, and seeds are drawn from a single neighborhood — otherwise a diagonal across the clutter wins and strips the columns of the walls it crossed. An accepted segment takes the slab around its own extent with it, and collinear near-duplicates are merged afterwards, on the grounds that a room with two walls in the same plane a few centimetres apart is not a room. Segments stream to the dashboard as a separate layer — quads in the 3D view, lines/rectangles in the 2D views — independent of raw voxel noise. Assumes the room's y-axis is vertical, i.e. the anchor tag is mounted roughly upright.
-
-The map is never better than the survey under it, and the server warns when fewer than three tags are mapped: a one-tag survey poses every keyframe from a single planar PnP with nothing to check it against.
-
-### Depth calibration — `/depth-calibrate`
-
-Depth from a single image is scale-ambiguous by construction, so the model's output has to be anchored to something metric. The metric model is supposed to remove that need by predicting metres directly, but metric depth from one image is only defined *given the camera's field of view* — it assumes its training cameras, not yours — so its metres come out systematically wrong, and measurably compressed rather than merely scaled. Two numbers describe the correction:
-
-```
-y = A·(1/z) + B        y = raw prediction (relative model) | 1/prediction (metric model)
-```
-
-Both belong to the camera, the model and our preprocessing. They are constants, so they are measured **once**, deliberately, and frozen — not re-derived per keyframe. Re-deriving them per frame from a single tag was what made the scale wander by a third within a minute while the room stood still, and an accumulated map cannot survive that: uniformly a few percent wrong is usable, inconsistent between frames is not.
-
-Open the page on the client, point it at a tag, and walk the tag from as close as it stays readable out to three or four times that distance and back. Every keyframe with a tag in it contributes one `(true distance, model output)` pair, and the server pools them **across frames** — which is why one tag is enough here and never enough inside a single frame: walking sweeps the same axis two tags at different depths would. The scatter plot is the honest picture; the fitted line is its summary. Freezing requires at least 40 agreeing samples over at least a 2.5× distance range, 60 % agreement, and a residual under 15 %. Residuals that refuse to come down mean no such constant exists for that camera, and no calibration would have saved the map.
-
-Calibrations live in `depth-calibration.json`, keyed by device, keyframe resolution and model flavor. Switching lens or capture resolution needs its own sweep.
-
-Dashboard controls: map view select (accumulated / last-N keyframes debug / off) and a clear button. Turning mapping off also stops clients producing keyframes (server pushes `keyframeMs: 0`).
 
 ## Virtual webcam
 
@@ -171,15 +140,13 @@ The active client's WebM chunk stream is teed into `ffmpeg`, decoded, and piped 
 ```
 server.js              HTTPS + WS: signaling relay, recording sink, vcam
 survey.js              marker map + room-frame localization
-mapping.js             voxel occupancy grid + wall-segment extraction
-depth-worker.js        worker thread: depth inference, metric calibration
-fetch-vendor.js        downloads opencv.js / three.js / depth models
+fetch-vendor.js        downloads opencv.js / three.js
 public/
   common.js            signaling socket, liveness probe, clock sync
   client.js             camera, MediaRecorder, peer connection, recovery
   pose.js              pose sockets, intrinsics, stats, on-page fallback
   detect-worker.js     worker thread: camera frames in, tag poses out
-  detect-core.js       detector objects, scan strategy, PnP, keyframe encode
+  detect-core.js       detector objects, scan strategy, PnP
   pose-math.js         quaternion / SE(3) helpers (shared with server)
   cv-common.js         opencv loading, intrinsics store, detector + luma factories
   viewer.js            tiles, combined canvas, frame buffering + sync
@@ -193,7 +160,6 @@ certs/                 self-signed cert, generated on first run   (gitignored)
 recordings/            output                                     (gitignored)
 tools/                 ffmpeg.exe for the virtual webcam          (gitignored)
 public/vendor/         fetched opencv.js / three.js               (gitignored)
-models/                fetched depth models                       (gitignored)
 markers.json           surveyed marker map                        (gitignored)
 ```
 
@@ -213,7 +179,5 @@ Conventions: dates/times are 24-hour `dd/mm/yy`, formatted only by the helpers i
 | Overlay shows UNCALIBRATED | No stored calibration for that lens/resolution — run `/calibrate`. Poses fall back to a FOV guess. |
 | Tags detected but no room fix | No surveyed tag in view. The survey grows from the anchor: show a known and an unknown tag together repeatedly. |
 | Distances uniformly wrong | Printed tag size ≠ 150 mm. Reprint at exact scale or adjust `markerSizeM`. |
-| Mapping never starts | No depth model (`npm run fetch-vendor`), map view set to off, or that camera has no frozen depth calibration — the log says which. |
-| "no depth calibration for …" in the log | That camera has never been swept, or it changed lens/resolution since. Run `/depth-calibrate` on it. |
 | Freeze button will not take | The page lists what is missing — almost always distance range: the sweep needs the tag walked from near to far, not viewed from one spot. |
 | "frame disagrees with the frozen calibration" | The frozen sweep no longer describes this camera (lens moved, different resolution). Sweep again. |

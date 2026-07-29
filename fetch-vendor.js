@@ -12,15 +12,12 @@
 // three.js: 0.147.0 is the last release shipping non-module builds of both
 // the core and OrbitControls; newer releases are ESM-only, which would break
 // the globals-via-script-order convention.
-// depth.onnx: Depth Anything V2 Small — consumed server-side by the mapping
-// worker (onnxruntime-node); missing file just disables mapping.
 
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
 
 const VENDOR_DIR = path.join(__dirname, 'public', 'vendor');
-const MODELS_DIR = path.join(__dirname, 'models');
 
 const ASSETS = [
   {
@@ -39,20 +36,6 @@ const ASSETS = [
     url: 'https://unpkg.com/three@0.147.0/examples/js/controls/OrbitControls.js',
     dest: path.join(VENDOR_DIR, 'OrbitControls.js'),
     minBytes: 10 * 1024,
-  },
-  {
-    url: 'https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx',
-    dest: path.join(MODELS_DIR, 'depth.onnx'),
-    minBytes: 20 * 1024 * 1024,
-  },
-  {
-    // Metric variant (Hypersim indoor, metres out, max 20 m). Preferred by
-    // the server when present: absolute depth means a single tag is enough
-    // to correct residual scale, where the relative model needs two tags at
-    // different depths to pin its scale+shift ambiguity.
-    url: 'https://huggingface.co/77ukhtar/depth-anything-v2-metric-onnx/resolve/main/model.onnx',
-    dest: path.join(MODELS_DIR, 'depth-metric.onnx'),
-    minBytes: 20 * 1024 * 1024,
   },
 ];
 
@@ -107,7 +90,6 @@ function sizeOf(file) {
 
 async function main() {
   fs.mkdirSync(VENDOR_DIR, { recursive: true });
-  fs.mkdirSync(MODELS_DIR, { recursive: true });
   let failed = 0;
   for (const { url, dest, minBytes } of ASSETS) {
     const rel = path.relative(__dirname, dest);

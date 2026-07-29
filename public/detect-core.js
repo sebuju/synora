@@ -15,7 +15,9 @@
 //      that saw tags almost certainly sees them a few pixels away, so the
 //      whole-frame sweep is the exception rather than the rule.
 //   3. The full sweep uses ArUco3, which searches candidates on a downscaled
-//      copy and refines corners against the full-resolution image.
+//      copy and refines corners against the full-resolution image — on frames
+//      large enough for that to be a saving rather than a range limit (see
+//      ARUCO3_MIN_LONG_EDGE).
 //
 // None of it costs pose accuracy: every corner is still refined at native
 // resolution, and crop coordinates are mapped back to full-frame pixels before
@@ -44,14 +46,10 @@ const FULL_SCAN_MS = 700;
 const IDLE_AFTER_MS = 1500;
 const IDLE_SCAN_MS = 350;
 
-// Keyframes are downscaled to just above the depth model's input size — a
-// full-res JPEG is 3-5x the bytes for zero extra information.
-const KEYFRAME_MAX_W = 672;
-const KEYFRAME_QUALITY = 0.8;
-
 function createDetectCore() {
   let cv = null;
   let fullDetector = null;
+  let fullDetectorEdge = 0;
   let roiDetector = null;
   let corners = null;
   let ids = null;
@@ -79,8 +77,6 @@ function createDetectCore() {
   let lastCount = 0;
   let lastSighting = 0;
 
-  let kfCanvas = null;
-  let kfCtx = null;
 
   function buildObjPoints() {
     const s = markerSizeM / 2;
@@ -90,6 +86,17 @@ function createDetectCore() {
       -s, s, 0, s, s, 0, s, -s, 0, -s, -s, 0,
     ]);
     builtSize = markerSizeM;
+  }
+
+  // The full-sweep profile depends on the frame's long edge (ArUco3 gates
+  // acquisition range by it), and the frame size is not known at load time —
+  // it arrives with the first frame and changes on a resolution switch. The
+  // ROI detector has no such dependency and is built once.
+  function ensureFullDetector(longEdge) {
+    if (fullDetector && fullDetectorEdge === longEdge) return;
+    fullDetector?.delete();
+    fullDetector = makeRoomDetector(cv, 'full', longEdge);
+    fullDetectorEdge = longEdge;
   }
 
   function meanReprojErr(cornerMat, r, t) {
@@ -282,7 +289,6 @@ function createDetectCore() {
       if (cv) return;
       cv = await loadOpenCv();
       genericPnP = typeof cv.solvePnPGeneric === 'function';
-      fullDetector = makeRoomDetector(cv, 'full');
       roiDetector = makeRoomDetector(cv, 'roi');
       corners = new cv.MatVector();
       ids = new cv.Mat();
@@ -359,6 +365,7 @@ function createDetectCore() {
     // intrinsics for this exact frame size first.
     async detect(source, frame, fw, fh, now) {
       if (!cv || !fw || !fh || !this.hasIntrinsics(fw, fh)) return null;
+      ensureFullDetector(Math.max(fw, fh));
       if (markerSizeM !== builtSize) buildObjPoints();
       // Starting up counts as having just seen something: acquisition should be
       // as quick as it can be, the backoff is for a client that has been
@@ -389,28 +396,5 @@ function createDetectCore() {
       return result;
     },
 
-    // Encodes the *whole* frame as a JPEG for the server's room mapping — the
-    // crop the detector just scanned is not a picture of the room.
-    async encodeKeyframe(frame, fw, fh) {
-      const scale = Math.min(1, KEYFRAME_MAX_W / fw);
-      const kw = Math.round(fw * scale);
-      const kh = Math.round(fh * scale);
-      if (!kfCanvas) {
-        kfCanvas = typeof OffscreenCanvas === 'function'
-          ? new OffscreenCanvas(kw, kh)
-          : document.createElement('canvas');
-        kfCtx = kfCanvas.getContext('2d');
-      }
-      if (kfCanvas.width !== kw || kfCanvas.height !== kh) {
-        kfCanvas.width = kw;
-        kfCanvas.height = kh;
-      }
-      kfCtx.drawImage(frame, 0, 0, kw, kh);
-      const blob = kfCanvas.convertToBlob
-        ? await kfCanvas.convertToBlob({ type: 'image/jpeg', quality: KEYFRAME_QUALITY })
-        : await new Promise((res) => kfCanvas.toBlob(res, 'image/jpeg', KEYFRAME_QUALITY));
-      if (!blob) return null;
-      return { bytes: await blob.arrayBuffer(), kw, kh, scale };
-    },
   };
 }

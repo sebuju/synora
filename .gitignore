@@ -3,10 +3,9 @@ certs/
 recordings/
 tools/
 public/vendor/
-models/
 markers.json
-depth-calibration.json
 server.log
 .vscode/
 .claude/
 CLAUDE.md
+pose-settings.json

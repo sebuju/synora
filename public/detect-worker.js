@@ -24,14 +24,11 @@ let planeReadable = true;
 
 let mainTimeOrigin = 0;
 let poseRateMs = 100;
-let keyframeMs = 1000;
 let enabled = true;
 let paused = false;
-let keyframesAllowed = true;
 
 let generation = 0;
 let lastDetect = 0;
-let lastKeyframe = 0;
 let intrinsicsAsked = '';
 
 // The page's performance.now() timeline. Both contexts measure their origin
@@ -93,26 +90,6 @@ async function onFrame(frame) {
     scanned: result.scanned,
     timing: result.timing,
   });
-
-  // Keyframes feed the server's room mapping. Only frames that see a tag are
-  // worth sending — the server can pose those exactly, from the tags in this
-  // very frame. The page vetoes them when the bulk socket is backed up.
-  if (!result.tags.length || !keyframesAllowed || keyframeMs <= 0) return;
-  if (now - lastKeyframe < keyframeMs) return;
-  lastKeyframe = now;
-  const kf = await core.encodeKeyframe(frame, fw, fh);
-  if (!kf) return;
-  postMessage({
-    type: 'keyframe',
-    at,
-    w: fw,
-    h: fh,
-    bytes: kf.bytes,
-    kw: kf.kw,
-    kh: kf.kh,
-    scale: kf.scale,
-    tags: result.tags,
-  }, [kf.bytes]);
 }
 
 // Frames keep being read and closed even while detection is off: the track
@@ -152,7 +129,6 @@ onmessage = async (ev) => {
   if (msg.type === 'init') {
     mainTimeOrigin = msg.timeOrigin;
     poseRateMs = msg.poseRateMs ?? poseRateMs;
-    keyframeMs = msg.keyframeMs ?? keyframeMs;
     core.setMarkerSize(msg.markerSizeM);
     try {
       await core.ensureReady();
@@ -181,7 +157,6 @@ onmessage = async (ev) => {
     core.resetScan();
   } else if (msg.type === 'config') {
     if (msg.poseRateMs) poseRateMs = msg.poseRateMs;
-    if (msg.keyframeMs !== undefined) keyframeMs = msg.keyframeMs;
     if (msg.markerSizeM) core.setMarkerSize(msg.markerSizeM);
   } else if (msg.type === 'enabled') {
     enabled = msg.on;
@@ -191,7 +166,5 @@ onmessage = async (ev) => {
     // black — detecting on them is pure waste.
     paused = msg.paused;
     if (!msg.paused) core.resetScan();
-  } else if (msg.type === 'keyframes') {
-    keyframesAllowed = msg.allowed;
   }
 };
