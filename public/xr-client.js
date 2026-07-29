@@ -1,13 +1,12 @@
 'use strict';
 
-// XR client: pose and depth from ARCore instead of from a depth model.
+// XR client: camera pose from ARCore, corrected by room tags.
 //
-// The trade against /client, in one line: ARCore measures what the depth model
-// was guessing, and tracks the camera between tag sightings, so tags become an
-// anchor rather than a continuous requirement — at the cost of a ~640x480
-// camera image instead of 4K, because `camera-access` hands over a GPU texture
-// at ARCore's own resolution. This page does not stream video at all; it is a
-// positioning and mapping client.
+// The trade against /client, in one line: ARCore tracks the camera between tag
+// sightings, so tags become an anchor rather than a continuous requirement — at
+// the cost of a smaller camera image than /client's 4K, because `camera-access`
+// hands over a GPU texture at ARCore's own resolution. This page does not stream
+// video at all; it is a positioning client.
 //
 // Two frames of reference are in play and must not be confused:
 // - the XR frame, whose origin is wherever the session started. Arbitrary, but
@@ -24,33 +23,34 @@ const overlay = document.getElementById('overlay');
 const overlayText = document.getElementById('overlayText');
 
 const POSE_INTERVAL_MS = 100;      // tag detection + pose report
-const DEPTH_INTERVAL_MS = 1000;    // depth frame to the server
-// The ARCore grid is 160x90 — small enough to use whole. Subsampling it also
-// widened the angular gap between neighbours, which is what the normal and
-// edge tests measure across, so it was making every surface look rougher than
-// it is.
-const DEPTH_STRIDE = 1;
-// Motion stereo degrades sharply with range: the baseline a walking phone
-// gives is centimetres, so a point at 8 m is barely constrained. Far junk is
-// most of the noise in the map and none of the information.
-const MAX_DEPTH_M = 4;
 
 let session = null;
+// Identifies this ARCore session to the server. Its frame's origin is wherever
+// the session started, so an alignment learned in one session means nothing in
+// the next — and the server cannot tell the two apart from the poses alone,
+// since a reconnect keeps the same clientId and ARCore's origin is not
+// reported. Minted here because this is the only place that knows a session
+// began.
+let sessionId = null;
 let refSpace = null;
 let gl = null;
 let binding = null;
 let core = null;
+// The server's declared printed marker size, held until the detector exists.
+let markerSizeM = 0.15;
 let lumaSource = null;
 let readCanvas = null;
 let readCtx = null;
 let pixels = null;
 let lastPose = 0;
-let lastDepth = 0;
 let frames = 0;
 let lastTags = [];
 let roomPose = null;
-let sentDepth = 0;
 let busy = false;
+// What ARCore actually handed over, reported rather than assumed: the camera
+// image size is the device's choice, not this page's, and every range figure
+// for tag detection is derived from it and from fx.
+let camInfo = null;
 
 const signaling = connectSignaling('client', {
   onOpen() {
@@ -60,18 +60,20 @@ const signaling = connectSignaling('client', {
   onMessage(msg) {
     if (clockSync.handle(msg)) return;
     if (msg.type === 'room-pose') roomPose = msg;
-    else if (msg.type === 'pose-config') core?.setMarkerSize(msg.markerSizeM);
+    else if (msg.type === 'pose-config') {
+      // Remembered, not just forwarded. pose-config arrives on connect; the
+      // detector does not exist until the user starts the XR session, so
+      // `core?.` dropped the size on the floor and the detector kept its 0.15
+      // default for the whole session. A 142 mm tag solved as 150 mm reports
+      // every distance 5.6% long, and nothing anywhere says so — the room is
+      // just uniformly too big.
+      if (msg.markerSizeM > 0) markerSizeM = msg.markerSizeM;
+      core?.setMarkerSize(markerSizeM);
+    }
   },
 });
 const clockSync = createClockSync(signaling);
-const bulk = connectSignaling('client-bulk', {}, loadDeviceId('client'));
 
-// WebXR view space is +x right, +y UP, -z forward. Every other camera pose in
-// this project is OpenCV — +x right, +y down, +z forward — including the tag
-// poses PnP produces from this very camera image. The two differ by a half
-// turn about x, and converting here means exactly one convention ever leaves
-// this file: leaving it to the server would have the alignment silently absorb
-// the flip and look correct only at the instant a tag is seen.
 // WebXR view space is +x right, +y UP, -z forward. Every other camera pose in
 // this project is OpenCV — +x right, +y down, +z forward — including the tag
 // poses PnP produces from this very camera image. The two differ by a half turn
@@ -163,17 +165,14 @@ async function start() {
   gl = canvas.getContext('webgl', { xrCompatible: true, alpha: true });
   try {
     session = await navigator.xr.requestSession('immersive-ar', {
-      optionalFeatures: ['camera-access', 'depth-sensing', 'anchors', 'dom-overlay', 'hit-test'],
-      depthSensing: {
-        usagePreference: ['cpu-optimized'],
-        dataFormatPreference: ['luminance-alpha', 'float32'],
-      },
+      optionalFeatures: ['camera-access', 'anchors', 'dom-overlay', 'hit-test'],
       domOverlay: { root: overlay },
     });
   } catch (err) {
     report.textContent = `session refused: ${err.message}`;
     return;
   }
+  sessionId = crypto.randomUUID();
   await gl.makeXRCompatible();
   session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
   binding = new XRWebGLBinding(session, gl);
@@ -182,6 +181,7 @@ async function start() {
 
   core = createDetectCore();
   await core.ensureReady();
+  core.setMarkerSize(markerSizeM);
   lumaSource = createCanvasLumaSource(core.cv);
 
   overlay.classList.add('on');
@@ -189,6 +189,8 @@ async function start() {
     overlay.classList.remove('on');
     setStatus('session ended');
     session = null;
+    sessionId = null;
+    camInfo = null;
   });
   session.requestAnimationFrame(onFrame);
   setStatus('session running');
@@ -209,21 +211,21 @@ function onFrame(t, frame) {
   }
   const view = pose.views[0];
   const now = performance.now();
-  // Detection and depth are both far too expensive for every frame, and both
-  // are re-entrant hazards — one at a time, on their own schedules.
+  // Detection is far too expensive for every frame, and is a re-entrant
+  // hazard — one at a time, on its own schedule.
   if (!busy && now - lastPose >= POSE_INTERVAL_MS) {
     lastPose = now;
     busy = true;
     detectAndReport(view, pose).finally(() => { busy = false; });
   }
-  if (now - lastDepth >= DEPTH_INTERVAL_MS) {
-    lastDepth = now;
-    sendDepth(frame, view, pose);
-  }
 
   const p = pose.transform.position;
   overlayText.textContent =
     `xr ${p.x.toFixed(2)} ${p.y.toFixed(2)} ${p.z.toFixed(2)}\n` +
+    (camInfo ? `cam ${camInfo.w}x${camInfo.h} fx ${camInfo.fx.toFixed(0)}\n` : 'cam: no image yet\n') +
+    // The size the detector is actually solving with, not the one the server
+    // meant to send — the gap between those two is silent everywhere else.
+    `tag ${(markerSizeM * 1000).toFixed(0)} mm\n` +
     // Reprojection error and distance per tag: the server's gates are in
     // pixels and this camera is ~640x480, so a fix the 4K client would have
     // accepted can be discarded here — which looks like the tag not existing.
@@ -233,8 +235,16 @@ function onFrame(t, frame) {
       : 'none'}\n` +
     (roomPose?.pose
       ? `room ${roomPose.pose.p.map((v) => v.toFixed(2)).join(' ')} · ${roomPose.quality}`
-      : 'room: not aligned yet — show it a tag') +
-    `\ndepth frames sent ${sentDepth} · ${frames} frames`;
+      : 'room: not aligned yet — show it a known tag') +
+    // Steadiness, both halves side by side. "phone" is ARCore's own movement
+    // over the window, "pose" is how far the reported room pose wandered over
+    // the same one. Bolt the phone down and phone should read ~0; whatever
+    // pose reads then is the fix's own noise, and the number any uncertainty
+    // circle in the viewer should be sized from.
+    (roomPose?.jitter
+      ? `\nsteady: phone ${roomPose.jitter.movedMm} mm · pose ${roomPose.jitter.jitterMm} mm`
+      : '\nsteady: measuring…') +
+    `\n${frames} frames`;
 }
 
 async function detectAndReport(view, pose) {
@@ -246,6 +256,7 @@ async function detectAndReport(view, pose) {
   if (!image) return;
 
   const intr = intrinsicsFromProjection(view.projectionMatrix, camera.width, camera.height);
+  camInfo = { w: camera.width, h: camera.height, fx: intr.fx };
   if (!core.hasIntrinsics(camera.width, camera.height)) {
     core.setIntrinsics(camera.width, camera.height, intr);
   }
@@ -254,63 +265,13 @@ async function detectAndReport(view, pose) {
   signaling.send({
     type: 'xr-pose',
     t: clockSync.synced ? clockSync.at(performance.now()) : null,
+    sid: sessionId,
     xr: cvPose(pose.transform),
     w: camera.width,
     h: camera.height,
     intrinsics: intr,
     tags: res.tags,
   });
-}
-
-// Depth arrives as a small grid (160x90 on a OnePlus 9). Unprojecting here
-// rather than shipping the raw buffer keeps the server out of WebXR's depth
-// coordinate conventions, which are easy to get subtly wrong and produce a
-// map that looks plausible and is wrong.
-function sendDepth(frame, view, pose) {
-  const d = frame.getDepthInformation?.(view);
-  if (!d || bulk.bufferedAmount > 512 * 1024) return;
-  const gw = Math.floor(d.width / DEPTH_STRIDE);
-  const gh = Math.floor(d.height / DEPTH_STRIDE);
-  const intr = intrinsicsFromProjection(view.projectionMatrix, d.width, d.height);
-  const pts = new Float32Array(gw * gh * 3);
-  let valid = 0;
-  for (let j = 0; j < gh; j++) {
-    for (let i = 0; i < gw; i++) {
-      const px = i * DEPTH_STRIDE;
-      const py = j * DEPTH_STRIDE;
-      let z = 0;
-      try {
-        z = d.getDepthInMeters((px + 0.5) / d.width, (py + 0.5) / d.height);
-      } catch {
-        z = 0;
-      }
-      const o = (j * gw + i) * 3;
-      if (!(z > 0.1 && z < MAX_DEPTH_M)) {
-        pts[o] = NaN;
-        continue;
-      }
-      // Camera frame, OpenCV convention (x right, y down, z forward) — the
-      // same one every tag pose and the server's backprojection already use.
-      pts[o] = ((px + 0.5 - intr.cx) / intr.fx) * z;
-      pts[o + 1] = ((py + 0.5 - intr.cy) / intr.fy) * z;
-      pts[o + 2] = z;
-      valid++;
-    }
-  }
-  if (!valid) return;
-
-  const header = new TextEncoder().encode(JSON.stringify({
-    t: clockSync.synced ? clockSync.at(performance.now()) : null,
-    gw,
-    gh,
-    xr: cvPose(pose.transform),
-    tags: lastTags,
-  }));
-  const head = new Uint8Array(8);
-  head[0] = 0x58; head[1] = 0x52; head[2] = 0x44; head[3] = 0x31;   // XRD1
-  new DataView(head.buffer).setUint32(4, header.length, true);
-  bulk.sendBinary(new Blob([head, header, pts.buffer]));
-  sentDepth++;
 }
 
 startBtn.onclick = start;

@@ -14,13 +14,26 @@
     .yes { color: #4fbf6f; }
     .no { color: #c86a6a; }
     button.wide { padding: 8px 16px; font-size: 15px; }
+    /* This element is the domOverlay root, and in an AR session the UA forces
+       the root to fill the viewport — any inset/background/padding put here is
+       discarded for the duration, which is why styling it could never move the
+       text off the punch-hole. It is only a transparent full-screen container;
+       the readable chip is the child. */
     #overlay {
-      position: fixed; inset: auto 8px 8px 8px; z-index: 20;
-      background: rgba(0,0,0,0.72); border-radius: 6px; padding: 10px;
-      font-family: ui-monospace, monospace; font-size: 12px; color: #eee;
-      white-space: pre-line; display: none;
+      position: fixed; inset: 0; z-index: 20; display: none;
     }
     #overlay.on { display: block; }
+    #overlayText {
+      position: absolute;
+      /* Clear the status bar and the punch-hole camera. env() covers the
+         status bar where the UA reports it; the constant is the camera cutout,
+         which no inset describes. */
+      top: calc(env(safe-area-inset-top, 0px) + 56px);
+      left: 8px; right: 8px;
+      background: rgba(0,0,0,0.72); border-radius: 6px; padding: 10px;
+      font-family: ui-monospace, monospace; font-size: 12px; color: #eee;
+      white-space: pre-line;
+    }
   </style>
 </head>
 <body>

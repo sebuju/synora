@@ -1,8 +1,8 @@
 'use strict';
 
-// 3D room view: surveyed markers, live client frusta, and (once mapping runs)
-// the voxel map — all in the room frame the server's survey defines. Pure
-// renderer: everything it shows arrives via the setters below.
+// 3D room view: surveyed markers and live client frusta, in the room frame the
+// server's survey defines. Pure renderer: everything it shows arrives via the
+// setters below.
 //
 // Conventions: room frame is the anchor tag's frame (x right, y up, z out of
 // the wall). A client pose {p,q} maps camera coordinates (OpenCV: +z forward,
@@ -24,15 +24,21 @@ function createSceneView(canvas) {
   const CLIENT_COLORS = ROOM_CLIENT_COLORS;
   const POSE_STALE_MS = ROOM_POSE_STALE_MS;
   const SMOOTH_TAU_MS = 120;
+  // The reported pose is a point; the fix is not. The ring is the measured
+  // spread of the last window of fixes, so it shrinks when the geometry is good
+  // and swells when it is not — drawing a bare point implies a precision that
+  // does not exist. 2x the rms spread contains the large majority of the
+  // samples; the rms alone reads far tighter than the thing actually is.
+  const UNCERTAINTY_SIGMA = 2;
+  // The radius is itself a measurement, so it is smoothed too — an unsmoothed
+  // ring pulses every window and reads as instability that is not there.
+  const RADIUS_TAU_MS = 400;
+  const RADIUS_MIN_M = 0.02;
   const FLOOR_Y = -1.5;         // tags mount roughly at eye height; cosmetic only
 
   let three = null;             // lazy — no WebGL context until first activation
   let active = false;
   let markerMapPending = null;
-  let wallsPending = null;
-  // Display-only, like the 2D views: hiding a layer must not stop it building.
-  let showVoxels = true;
-  let showWalls = true;
   const clients = new Map();     // clientId -> { group, cone, label, target, at, colorHex }
 
   // Billboard text that can be rewritten cheaply; set() no-ops on unchanged
@@ -94,57 +100,18 @@ function createSceneView(canvas) {
 
     const markerGroup = new THREE.Group();
     scene.add(markerGroup);
-    const wallGroup = new THREE.Group();
-    scene.add(wallGroup);
 
-    // Voxel map: one InstancedMesh, grown by doubling; freed slots are filled
-    // by swap-remove so the draw range stays dense.
-    const voxelState = {
-      mesh: null,
-      capacity: 0,
-      count: 0,
-      sizeM: 0.075,
-      indexByKey: new Map(),
-      keyByIndex: [],
-    };
 
-    three = { renderer, scene, camera, controls, markerGroup, wallGroup, voxelState };
+    three = { renderer, scene, camera, controls, markerGroup };
 
     // Clients whose poses arrived before the 3D view was first opened already
     // have groups — they were parked outside any scene until now.
     for (const ph of clients.values()) {
-      scene.add(ph.group, ph.tagLines);
+      scene.add(ph.group, ph.tagLines, ph.ring);
       for (const label of ph.distLabels.values()) scene.add(label.sprite);
     }
   }
 
-  function keyOf(v) {
-    return `${v[0]},${v[1]},${v[2]}`;
-  }
-
-  function growVoxels(minCapacity) {
-    const vs = three.voxelState;
-    if (vs.mesh) vs.mesh.visible = showVoxels;
-    const capacity = Math.max(4096, vs.capacity * 2, minCapacity);
-    const geo = new THREE.BoxGeometry(vs.sizeM, vs.sizeM, vs.sizeM);
-    const mat = new THREE.MeshLambertMaterial({ color: 0x7fb8a4 });
-    const mesh = new THREE.InstancedMesh(geo, mat, capacity);
-    mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-    const m = new THREE.Matrix4();
-    for (let i = 0; i < vs.count; i++) {
-      vs.mesh.getMatrixAt(i, m);
-      mesh.setMatrixAt(i, m);
-    }
-    mesh.count = vs.count;
-    if (vs.mesh) {
-      three.scene.remove(vs.mesh);
-      vs.mesh.geometry.dispose();
-      vs.mesh.material.dispose();
-    }
-    three.scene.add(mesh);
-    vs.mesh = mesh;
-    vs.capacity = capacity;
-  }
 
   // id -> { pos: Vector3, normal: Vector3 } for the client→tag lines.
   const markerInfo = new Map();
@@ -181,42 +148,6 @@ function createSceneView(canvas) {
     }
   }
 
-  // Wall layer: translucent quads for the server's fitted room-shell
-  // segments. Walls change on the order of seconds, so a full rebuild per
-  // update is fine.
-  function rebuildWalls(walls) {
-    const group = three.wallGroup;
-    while (group.children.length) {
-      const child = group.children.pop();
-      child.geometry?.dispose();
-      child.material?.dispose();
-      group.remove(child);
-    }
-    for (const wl of walls) {
-      const dx = wl.b[0] - wl.a[0];
-      const dz = wl.b[1] - wl.a[1];
-      const len = Math.hypot(dx, dz);
-      if (!len) continue;
-      const mesh = new THREE.Mesh(
-        new THREE.PlaneGeometry(len, wl.y1 - wl.y0),
-        new THREE.MeshBasicMaterial({
-          color: 0x8fa8b8, transparent: true, opacity: 0.22,
-          side: THREE.DoubleSide, depthWrite: false,
-        }));
-      mesh.position.set(
-        (wl.a[0] + wl.b[0]) / 2, (wl.y0 + wl.y1) / 2, (wl.a[1] + wl.b[1]) / 2);
-      // Rotating +x by θ about y lands on (cosθ, 0, -sinθ) — solve for the
-      // segment direction in the floor plane.
-      mesh.rotation.y = Math.atan2(-dz, dx);
-      const edges = new THREE.LineSegments(
-        new THREE.EdgesGeometry(mesh.geometry),
-        new THREE.LineBasicMaterial({ color: 0xaec6d4 }));
-      edges.position.copy(mesh.position);
-      edges.rotation.copy(mesh.rotation);
-      group.add(mesh, edges);
-    }
-  }
-
   function ensureClient(clientId) {
     let ph = clients.get(clientId);
     if (ph) return ph;
@@ -241,6 +172,17 @@ function createSceneView(canvas) {
     group.add(cone, label.sprite);
     group.visible = false;
 
+    // Uncertainty ring, horizontal, drawn at the client's own height. Built at
+    // unit radius once and scaled per frame — rebuilding the geometry to resize
+    // it would allocate every frame.
+    const ringGeo = new THREE.RingGeometry(0.97, 1, 48);
+    ringGeo.rotateX(-Math.PI / 2);
+    const ring = new THREE.Mesh(ringGeo, new THREE.MeshBasicMaterial({
+      color: colorHex, transparent: true, opacity: 0.5, side: THREE.DoubleSide,
+      depthWrite: false,
+    }));
+    ring.visible = false;
+
     // Lines to the tags this client currently sees. Positions are rewritten
     // every frame from the smoothed client position; the labels ride midway.
     const tagLineGeo = new THREE.BufferGeometry();
@@ -251,12 +193,13 @@ function createSceneView(canvas) {
     tagLines.frustumCulled = false;
     tagLines.visible = false;
 
-    three?.scene.add(group, tagLines);
+    three?.scene.add(group, tagLines, ring);
     ph = {
-      id: clientId, group, cone, label, tagLines, colorCss,
+      id: clientId, group, cone, label, tagLines, ring, colorCss,
       distLabels: new Map(),      // tag id -> text sprite at the line midpoint
       seenTags: [],
       target: null, at: 0, colorHex, lastDraw: 0,
+      uncertaintyM: 0, shownRadius: 0,
     };
     clients.set(clientId, ph);
     return ph;
@@ -334,6 +277,16 @@ function createSceneView(canvas) {
       ph.cone.material.color.setHex(stale ? 0x555555 : ph.colorHex);
       const p = ph.group.position;
       ph.label.set(`C${ph.id} · ${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)}`);
+
+      const wantR = ph.uncertaintyM * UNCERTAINTY_SIGMA;
+      const rAlpha = 1 - Math.exp(-dt / RADIUS_TAU_MS);
+      ph.shownRadius += (wantR - ph.shownRadius) * rAlpha;
+      ph.ring.visible = ph.shownRadius > RADIUS_MIN_M;
+      if (ph.ring.visible) {
+        ph.ring.position.copy(p);
+        ph.ring.scale.set(ph.shownRadius, 1, ph.shownRadius);
+        ph.ring.material.color.setHex(stale ? 0x555555 : ph.colorHex);
+      }
       updateTagLines(ph);
     }
 
@@ -358,10 +311,6 @@ function createSceneView(canvas) {
           rebuildMarkers(markerMapPending);
           markerMapPending = null;
         }
-        if (wallsPending !== null) {
-          rebuildWalls(wallsPending);
-          wallsPending = null;
-        }
         lastFrameAt = 0;
         scheduleDraw();
       }
@@ -372,21 +321,10 @@ function createSceneView(canvas) {
       else markerMapPending = map;
     },
 
-    setLayer(name, on) {
-      if (name === 'voxels') showVoxels = on;
-      else if (name === 'walls') showWalls = on;
-      if (!three) return;
-      three.wallGroup.visible = showWalls;
-      if (three.voxelState?.mesh) three.voxelState.mesh.visible = showVoxels;
-    },
 
-    setWalls(walls) {
-      if (three) rebuildWalls(walls || []);
-      else wallsPending = walls || [];
-    },
-
-    updateClient(clientId, pose, seenTagIds = []) {
+    updateClient(clientId, pose, seenTagIds = [], uncertaintyM = 0) {
       const ph = ensureClient(clientId);
+      ph.uncertaintyM = uncertaintyM;
       ph.target = pose;
       ph.targetPos = new THREE.Vector3(...pose.p);
       ph.targetQuat = new THREE.Quaternion(...pose.q);
@@ -402,7 +340,9 @@ function createSceneView(canvas) {
     removeClient(clientId) {
       const ph = clients.get(clientId);
       if (!ph) return;
-      three?.scene.remove(ph.group, ph.tagLines);
+      three?.scene.remove(ph.group, ph.tagLines, ph.ring);
+      ph.ring.geometry.dispose();
+      ph.ring.material.dispose();
       ph.cone.geometry.dispose();
       ph.cone.material.dispose();
       ph.label.dispose();
@@ -415,54 +355,5 @@ function createSceneView(canvas) {
       clients.delete(clientId);
     },
 
-    // Incremental voxel updates from the mapping worker. reset drops
-    // everything (new snapshot incoming).
-    applyVoxels({ voxelSizeM, added = [], removed = [], reset = false }) {
-      init();
-      const vs = three.voxelState;
-      if (reset || (voxelSizeM && voxelSizeM !== vs.sizeM)) {
-        vs.indexByKey.clear();
-        vs.keyByIndex = [];
-        vs.count = 0;
-        vs.sizeM = voxelSizeM || vs.sizeM;
-        if (vs.mesh) {
-          three.scene.remove(vs.mesh);
-          vs.mesh.geometry.dispose();
-          vs.mesh.material.dispose();
-          vs.mesh = null;
-          vs.capacity = 0;
-        }
-      }
-      if (added.length + vs.count > vs.capacity) growVoxels(added.length + vs.count);
-      const m = new THREE.Matrix4();
-      for (const v of added) {
-        const key = keyOf(v);
-        if (vs.indexByKey.has(key)) continue;
-        const idx = vs.count++;
-        vs.indexByKey.set(key, idx);
-        vs.keyByIndex[idx] = key;
-        m.makeTranslation(v[0], v[1], v[2]);
-        vs.mesh.setMatrixAt(idx, m);
-      }
-      for (const v of removed) {
-        const key = keyOf(v);
-        const idx = vs.indexByKey.get(key);
-        if (idx === undefined) continue;
-        const lastIdx = --vs.count;
-        const lastKey = vs.keyByIndex[lastIdx];
-        if (idx !== lastIdx) {
-          vs.mesh.getMatrixAt(lastIdx, m);
-          vs.mesh.setMatrixAt(idx, m);
-          vs.indexByKey.set(lastKey, idx);
-          vs.keyByIndex[idx] = lastKey;
-        }
-        vs.indexByKey.delete(key);
-        vs.keyByIndex.length = vs.count;
-      }
-      if (vs.mesh) {
-        vs.mesh.count = vs.count;
-        vs.mesh.instanceMatrix.needsUpdate = true;
-      }
-    },
   };
 }

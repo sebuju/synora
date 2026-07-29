@@ -3,7 +3,7 @@
 // Orthographic 2D room views, one renderer for both projections:
 //   'top'  — the floor plan, x-z plane (y collapsed)
 //   'side' — the elevation, x-y plane (z collapsed), y drawn upward
-// Same data feeds as the 3D scene — markers, client poses, voxels — rendered
+// Same data feeds as the 3D scene — markers and client poses — rendered
 // with plain canvas 2D. Viewport auto-fits whatever exists.
 
 function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
@@ -21,29 +21,14 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
   const markers = new Map();
   // clientId -> { target, cur {p:[3], fwd:[3]}, seen, at, color }
   const clients = new Map();
-  // Voxels collapse along the unviewed axis: "ai,bi" -> count. Column
-  // density is all a projection needs, and it survives removals cheaply.
-  const columns = new Map();
-  let voxelSize = 0.075;
-  // Display-only: the layers keep accumulating while hidden, so toggling back
-  // shows the map as it would have been rather than restarting it.
-  let showVoxels = true;
-  let showWalls = true;
-  // Wall segments fitted by the server: { a:[x,z], b:[x,z], y0, y1 }.
-  let walls = [];
   const SMOOTH_TAU_MS = 120;
-  // Only voxels near this view's plane are shown — a full-room projection
-  // stacks everything into an unreadable smear. The slab is centered on the
-  // room origin's plane: height for the floor plan, the anchor-wall-parallel
-  // plane for the elevation.
-  const SLAB_M = 1.0;
-  const slabCoord = mode === 'side' ? (v) => v[2] : (v) => v[1];
-
-  function colKey(v) {
-    const [a, b] = proj(v);
-    return `${Math.floor(a / voxelSize)},${Math.floor(b / voxelSize)}`;
-  }
-
+  // Measured spread of the recent fixes, drawn rather than hidden: a bare dot
+  // claims a precision the fix does not have. Same convention as the 3D ring —
+  // 2x the rms so it reads as "probably in here", smoothed so the circle does
+  // not pulse with its own measurement window.
+  const UNCERTAINTY_SIGMA = 2;
+  const RADIUS_TAU_MS = 400;
+  const RADIUS_MIN_PX = 3;
   let rafPending = false;
   let lastFrameAt = 0;
   // World->pixel mapping of the last drawn frame, for hit tests.
@@ -88,6 +73,8 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
         ph.cur.p[k] += (ph.target.p[k] - ph.cur.p[k]) * alpha;
         ph.cur.fwd[k] += (fwd[k] - ph.cur.fwd[k]) * alpha;
       }
+      const rAlpha = 1 - Math.exp(-dt / RADIUS_TAU_MS);
+      ph.shownRadius += (ph.uncertaintyM * UNCERTAINTY_SIGMA - ph.shownRadius) * rAlpha;
     }
 
     // Auto-fit: bounds of everything worth seeing, floor of 5 m span.
@@ -99,21 +86,6 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
     for (const m of markers.values()) grow(...proj(m.pos));
     for (const ph of clients.values()) {
       if (ph.target) grow(...proj(ph.cur.p));
-    }
-    if (showVoxels) {
-      for (const key of columns.keys()) {
-        const [ai, bi] = key.split(',').map(Number);
-        grow(ai * voxelSize, bi * voxelSize);
-      }
-    }
-    for (const wl of showWalls ? walls : []) {
-      if (mode === 'side') {
-        grow(wl.a[0], wl.y0);
-        grow(wl.b[0], wl.y1);
-      } else {
-        grow(wl.a[0], wl.a[1]);
-        grow(wl.b[0], wl.b[1]);
-      }
     }
     const spanA = Math.max(maxA - minA, 5);
     const spanB = Math.max(maxB - minB, 5);
@@ -143,42 +115,6 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
     }
     ctx.stroke();
 
-    // Voxel columns, darker with density.
-    const cell = Math.max(2, voxelSize * scale);
-    for (const [key, count] of (showVoxels ? columns : [])) {
-      const [ai, bi] = key.split(',').map(Number);
-      const [sx, sy] = toPx(ai * voxelSize, bi * voxelSize);
-      ctx.fillStyle = `rgba(127, 184, 164, ${Math.min(0.9, 0.2 + count / 12)})`;
-      ctx.fillRect(sx, sy, cell, cell);
-    }
-
-    // Wall layer: the fitted room shell over the raw voxel columns. The
-    // elevation draws each wall as its face rectangle (an end-on wall
-    // collapses to a sliver); the floor plan draws the segment itself.
-    if (mode === 'side') {
-      ctx.strokeStyle = '#dfe7ea';
-      ctx.fillStyle = 'rgba(223, 231, 234, 0.10)';
-      ctx.lineWidth = 1.5;
-      for (const wl of walls) {
-        const [x1, yTop] = toPx(Math.min(wl.a[0], wl.b[0]), wl.y1);
-        const [x2, yBot] = toPx(Math.max(wl.a[0], wl.b[0]), wl.y0);
-        const wpx = Math.max(x2 - x1, 3);
-        ctx.fillRect(x1, yTop, wpx, yBot - yTop);
-        ctx.strokeRect(x1, yTop, wpx, yBot - yTop);
-      }
-    } else if (walls.length) {
-      ctx.strokeStyle = '#dfe7ea';
-      ctx.lineWidth = 4;
-      ctx.lineCap = 'round';
-      ctx.beginPath();
-      for (const wl of walls) {
-        ctx.moveTo(...toPx(wl.a[0], wl.a[1]));
-        ctx.lineTo(...toPx(wl.b[0], wl.b[1]));
-      }
-      ctx.stroke();
-      ctx.lineCap = 'butt';
-    }
-
     // Markers: a stroke along the tag's x axis, projected.
     ctx.font = '12px ui-monospace, monospace';
     ctx.textAlign = 'center';
@@ -205,6 +141,20 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
       const stale = performance.now() - ph.at > ROOM_POSE_STALE_MS;
       const color = stale ? '#555' : ph.color;
       const [sx, sy] = px(ph.cur.p);
+
+      // Uncertainty first, so the dot and heading draw on top of it.
+      const rPx = ph.shownRadius * scale;
+      if (rPx > RADIUS_MIN_PX) {
+        ctx.beginPath();
+        ctx.arc(sx, sy, rPx, 0, Math.PI * 2);
+        ctx.fillStyle = stale ? 'rgba(85,85,85,0.10)' : `${ph.color}22`;
+        ctx.fill();
+        ctx.strokeStyle = color;
+        ctx.globalAlpha = 0.5;
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
 
       if (!stale) {
         for (const id of ph.seen) {
@@ -270,12 +220,6 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
       }
     },
 
-    setLayer(name, on) {
-      if (name === 'voxels') showVoxels = on;
-      else if (name === 'walls') showWalls = on;
-      schedule();
-    },
-
     setMarkerMap(map) {
       markerMap = map;
       markers.clear();
@@ -289,7 +233,7 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
       }
     },
 
-    updateClient(clientId, pose, seenTagIds = []) {
+    updateClient(clientId, pose, seenTagIds = [], uncertaintyM = 0) {
       let ph = clients.get(clientId);
       if (!ph) {
         const colorHex = ROOM_CLIENT_COLORS[clientId % ROOM_CLIENT_COLORS.length];
@@ -298,11 +242,13 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
           color: `#${colorHex.toString(16).padStart(6, '0')}`,
           cur: { p: [...pose.p], fwd: [0, 0, 1] },
           target: null, seen: [], at: 0,
+          uncertaintyM: 0, shownRadius: 0,
         };
         clients.set(clientId, ph);
       }
       ph.target = pose;
       ph.seen = seenTagIds;
+      ph.uncertaintyM = uncertaintyM;
       ph.at = performance.now();
     },
 
@@ -310,27 +256,5 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
       clients.delete(clientId);
     },
 
-    setWalls(next) {
-      walls = next || [];
-    },
-
-    applyVoxels({ voxelSizeM, added = [], removed = [], reset = false }) {
-      if (reset || (voxelSizeM && voxelSizeM !== voxelSize)) {
-        columns.clear();
-        if (voxelSizeM) voxelSize = voxelSizeM;
-      }
-      for (const v of added) {
-        if (Math.abs(slabCoord(v)) > SLAB_M) continue;
-        const key = colKey(v);
-        columns.set(key, (columns.get(key) || 0) + 1);
-      }
-      for (const v of removed) {
-        if (Math.abs(slabCoord(v)) > SLAB_M) continue;
-        const key = colKey(v);
-        const n = (columns.get(key) || 0) - 1;
-        if (n <= 0) columns.delete(key);
-        else columns.set(key, n);
-      }
-    },
   };
 }

@@ -41,28 +41,6 @@ const signaling = connectSignaling('viewer', {
       roomViewList.forEach((v) => v.setMarkerMap(msg));
       return;
     }
-    if (msg.type === 'map-snapshot') {
-      // Chunked full map: the first part replaces whatever is shown.
-      roomViewList.forEach((v) => v.applyVoxels({
-        voxelSizeM: msg.voxelSizeM,
-        added: msg.voxels,
-        reset: msg.part === 1,
-      }));
-      return;
-    }
-    if (msg.type === 'map-delta') {
-      roomViewList.forEach((v) => v.applyVoxels({
-        voxelSizeM: msg.voxelSizeM,
-        added: msg.added,
-        removed: msg.removed,
-      }));
-      return;
-    }
-    if (msg.type === 'walls') {
-      // Fitted room-shell segments — a separate layer over the raw voxels.
-      roomViewList.forEach((v) => v.setWalls(msg.walls));
-      return;
-    }
     if (msg.type === 'offer') {
       await acceptOffer(msg.clientId, msg.description);
     } else if (msg.type === 'ice') {
@@ -95,6 +73,15 @@ function updateCamBtn(clientId, dev) {
 // (disabled, backgrounded) must not keep showing a distance.
 const POSE_LABEL_TTL_MS = 2000;
 
+// Radius for the room views' uncertainty ring, in metres: the measured spread
+// of this client's recent fixes, as the server computed it. Only the XR path
+// reports it (it needs the phone's own pose to separate real motion from fix
+// noise), so anything else falls back to 0 and draws no ring rather than
+// inventing one.
+function uncertaintyOf(msg) {
+  return (msg.room?.jitter?.jitterMm ?? 0) / 1000;
+}
+
 function updatePoseLabel(clientId, msg) {
   const dev = devices.get(clientId);
   // A client with no tile is not a client with no position: the XR client
@@ -103,8 +90,8 @@ function updatePoseLabel(clientId, msg) {
   // the per-tile label below needs a tile to live on.
   if (!dev) {
     if (msg.room?.pose) {
-      roomViewList.forEach((v) =>
-        v.updateClient(clientId, msg.room.pose, (msg.tags || []).map((t) => t.id)));
+      roomViewList.forEach((v) => v.updateClient(
+        clientId, msg.room.pose, (msg.tags || []).map((t) => t.id), uncertaintyOf(msg)));
     }
     return;
   }
@@ -112,7 +99,8 @@ function updatePoseLabel(clientId, msg) {
   dev.lastPoseAt = performance.now();
   if (msg.room?.pose) {
     const seen = msg.tags.map((t) => t.id);
-    roomViewList.forEach((v) => v.updateClient(clientId, msg.room.pose, seen));
+    roomViewList.forEach((v) =>
+      v.updateClient(clientId, msg.room.pose, seen, uncertaintyOf(msg)));
   }
   clearTimeout(dev.poseLabelTimer);
   if (msg.tags.length) {
@@ -470,18 +458,6 @@ function drawCombined() {
   requestAnimationFrame(drawCombined);
 }
 
-// Layer toggles are display-only: the server keeps sending deltas and the
-// renderers keep accumulating, so hiding the voxels to look at the walls does
-// not cost the map any progress.
-for (const [id, layer] of [['voxelLayerBtn', 'voxels'], ['wallLayerBtn', 'walls']]) {
-  const btn = document.getElementById(id);
-  btn.onclick = () => {
-    const on = !btn.classList.contains('active');
-    btn.classList.toggle('active', on);
-    roomViewList.forEach((v) => v.setLayer?.(layer, on));
-  };
-}
-
 // Overlay views above the tile grid: the combined canvas and/or the room
 // views (3D scene and 2D floor plan — independently toggleable, side by side
 // when both are on). Combined alongside a room view shrinks into a floating
@@ -546,7 +522,6 @@ function refreshViews() {
   maps2d.classList.toggle('active', show2d || showSide);
   map2dCanvas.classList.toggle('active', show2d);
   mapSideCanvas.classList.toggle('active', showSide);
-  voxelControls.style.display = room ? '' : 'none';
   sceneView.setActive(show3d);
   map2dView.setActive(show2d);
   mapSideView.setActive(showSide);
@@ -575,11 +550,6 @@ sideBtn.onclick = () => {
   refreshViews();
 };
 
-// Voxel-map controls only make sense while the 3D view is up.
-const voxelControls = document.getElementById('voxelControls');
-const voxelViewSelect = document.getElementById('voxelViewSelect');
-document.getElementById('clearVoxelsBtn').onclick = () => signaling.send({ type: 'map-clear' });
-voxelViewSelect.onchange = () => signaling.send({ type: 'map-view', mode: voxelViewSelect.value });
 
 // Fullscreen the active view. Overlays (combined, room views, pip) all live
 // inside <main>, so fullscreening it keeps whatever combination is showing.
