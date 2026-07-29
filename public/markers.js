@@ -6,8 +6,58 @@
 
 const sheets = document.getElementById('sheets');
 const genStatus = document.getElementById('genStatus');
+const sizeInput = document.getElementById('sizeInput');
+const sizeStatus = document.getElementById('sizeStatus');
+const applyBtn = document.getElementById('applyBtn');
 
 document.getElementById('printBtn').onclick = () => print();
+
+// The sheet prints at whatever size the server is solving for, so the two
+// cannot drift: print at 100%, measure, correct here, reprint or just keep the
+// sheets you have — either way both sides end up describing the same tag.
+function showSize(mm, note = '', bad = false) {
+  document.documentElement.style.setProperty('--marker-mm', `${mm}mm`);
+  sizeInput.value = mm;
+  sizeStatus.textContent = note;
+  sizeStatus.classList.toggle('bad', bad);
+  genStatus.textContent =
+    `${ROOM_TAG_COUNT} tags (${ROOM_DICT}, ${mm} mm). Use the browser's print dialog at 100% scale.`;
+}
+
+async function loadSize() {
+  try {
+    const r = await fetch('/api/pose-config');
+    showSize(Math.round((await r.json()).markerSizeM * 1000));
+  } catch (err) {
+    sizeStatus.textContent = `could not read size: ${err.message}`;
+    sizeStatus.classList.add('bad');
+  }
+}
+
+applyBtn.onclick = async () => {
+  const mm = Number(sizeInput.value);
+  if (!(mm > 0)) return;
+  applyBtn.disabled = true;
+  sizeStatus.classList.remove('bad');
+  sizeStatus.textContent = 'applying…';
+  try {
+    const r = await fetch('/api/pose-config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ markerSizeM: mm / 1000 }),
+    });
+    const out = await r.json();
+    if (!out.ok) showSize(Number(sizeInput.value), out.error, true);
+    else showSize(Math.round(out.markerSizeM * 1000),
+      out.changed ? 'applied — survey reset, map cleared' : 'unchanged');
+  } catch (err) {
+    sizeStatus.textContent = err.message;
+    sizeStatus.classList.add('bad');
+  }
+  applyBtn.disabled = false;
+};
+
+loadSize();
 
 (async () => {
   let cv;
@@ -48,6 +98,7 @@ document.getElementById('printBtn').onclick = () => print();
   }
   img.delete();
   dict.delete();
-  genStatus.textContent =
-    `${ROOM_TAG_COUNT} tags (${ROOM_DICT}, 150 mm). Use the browser's print dialog at 100% scale.`;
+  // The size line is owned by showSize (it reports the configured size, not a
+  // hardcoded one); refresh it now that the tag count line is meaningful.
+  loadSize();
 })();

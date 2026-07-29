@@ -45,6 +45,13 @@
       height: auto;
       image-rendering: pixelated;
     }
+    #sizeInput {
+      width: 5em;
+    }
+    .unit { opacity: 0.7; }
+    .status { font-size: 12px; opacity: 0.8; min-width: 12em; }
+    .status.bad { color: #e08a8a; }
+    .warn-note { opacity: 0.8; }
     .sheet .tag-label {
       font-size: 12px;
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -70,10 +77,13 @@
         gap: 8mm;
       }
       /* CSS mm are true millimeters in print at 100% scale — the marker edge
-         (black border included) must measure exactly the printed size. */
+         (black border included) must measure exactly the printed size. Driven
+         by the configured size so the sheet and the pose math cannot disagree:
+         printing 150 mm while the server solves for 142 mm is exactly the
+         error this control exists to remove. */
       .sheet canvas {
-        width: 150mm;
-        height: 150mm;
+        width: var(--marker-mm, 150mm);
+        height: var(--marker-mm, 150mm);
       }
       .sheet .tag-label { font-size: 14px; }
       .screen-only { display: none; }
@@ -86,6 +96,11 @@
   <header>
     <a class="home" href="/" title="Back to start">Print room tags</a>
     <span class="grow"></span>
+    <label for="sizeInput">Printed edge</label>
+    <input id="sizeInput" type="number" min="20" max="1000" step="1" value="150">
+    <span class="unit">mm</span>
+    <button id="applyBtn">Apply</button>
+    <span id="sizeStatus" class="status"></span>
     <button id="printBtn">Print</button>
   </header>
   <main>
@@ -94,7 +109,8 @@
     <p id="genStatus">Generating tags…</p>
     <ul>
       <li>Print at <b>100% scale</b> (no "fit to page") on plain white paper, one tag per A4 sheet.</li>
-      <li>After printing, measure a tag's black edge: it must be <b>150 mm</b>. If not, the scale is off and every distance in the room will inherit the error.</li>
+      <li>After printing, <b>measure a tag's black edge</b> and enter it below. It is the room's only metric datum — every distance inherits its error, and a printer's "fit to page" quietly returns a 150&nbsp;mm tag at about 142&nbsp;mm.</li>
+      <li class="warn-note">Changing it rescales the room: the survey is reset, the map is cleared, and each camera needs a fresh depth calibration sweep.</li>
       <li>Mount tags <b>flat</b> (rigid backing, no curl) around the room, roughly at camera height, on more than one wall. Leave the white margin around the black border intact.</li>
       <li><b>Tag 0 is the room origin.</b> Mount it upright on a wall: the room frame is x right along the wall, y up, z out of the wall into the room. It anchors the whole map — do not move it after surveying starts.</li>
       <li>Any position in the room should see at least one tag within ~6 m and not too obliquely (under ~60°).</li>
