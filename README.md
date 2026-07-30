@@ -12,6 +12,8 @@ No build step, no app install: vanilla JS served as static files. A client is an
 - [Architecture](#architecture)
 - [Frame sync](#frame-sync)
 - [Room positioning](#room-positioning)
+- [Devices](#devices)
+- [Client roster and remote control](#client-roster-and-remote-control)
 - [Virtual webcam](#virtual-webcam)
 - [Recordings](#recordings)
 - [Project layout](#project-layout)
@@ -62,15 +64,16 @@ Server responsibilities:
 1. **Signaling relay.** `offer`/`answer`/`ice` relayed verbatim; client→viewer messages are tagged with a `clientId`, viewer→client messages carry one for routing. One viewer at a time — a new one displaces the old.
 2. **Recording sink.** Binary frames on the bulk socket are `MediaRecorder` chunks appended to the client's current file. Recording state lives on the socket, so a new socket requires a new recorder (the first chunk carries the WebM header); the client therefore rebuilds its recorder on reconnect, camera switch, mic toggle, and resolution change.
 3. **Room survey and localization.** See the sections below.
-4. **Virtual webcam tee** (optional, Windows).
+4. **Client roster and remote control.** Clients report their own settings; the server keeps the roster and pushes it to the dashboard, and relays the dashboard's control messages back to a named client.
+5. **Virtual webcam tee** (optional, Windows).
 
-**Client identity.** Each device persists a UUID in `localStorage` and presents it on every connection; the server maps it to a stable small integer, so a reload keeps its tile and recording filename prefix. A new socket for an existing id closes the old one; the old socket's close handler checks it still owns the id before cleaning up.
+**Client identity.** Each device persists a UUID in `localStorage` and presents it on every connection; the server maps it to a stable small integer, so a reload keeps its tile and recording filename prefix. A new socket for an existing id closes the old one; the old socket's close handler checks it still owns the id before cleaning up. That UUID is the *only* thing the browser stores — everything else about the device lives on the server under it, see [Devices](#devices).
 
 **Liveness.** Android freezes backgrounded pages and tears down their connections without a `close` event; the socket stays nominally `OPEN`. Both pages run an explicit ping/pong probe plus a probe on `visibilitychange`, and treat an unanswered ping as a dead socket. `readyState` is not trusted.
 
 **Recovery.** Backgrounding can take the camera, recorder, and peer connection at once. `restartCall()` in `client.js` is the single recovery path, re-entrancy guarded so a request arriving mid-restart is replayed. Pause (tapping the feed) disables tracks and pauses the recorder without tearing anything down, so a recording spans a pause as one file.
 
-**Resolution and bitrate.** Capture defaults to 4K with `ideal` constraints (unsupported clients degrade to their best mode). Recorder bitrate is tiered by the actual capture size: 16 Mbps ≥ 4K, 8 Mbps ≥ 1440p, 4 Mbps below.
+**Resolution and bitrate.** Capture defaults to 4K with `ideal` constraints (unsupported clients degrade to their best mode). The chosen size, lens, mic and marker-tracking state persist per device on the server, so a client turned down to 720p stays there across reloads and recovery restarts. Recorder bitrate is tiered by the actual capture size: 16 Mbps ≥ 4K, 8 Mbps ≥ 1440p, 4 Mbps below.
 
 ## Frame sync
 
@@ -91,8 +94,8 @@ Clients detect ArUco tags fixed to the room and the server maintains a persisten
 **Setup.**
 
 1. Print tags from `/markers`. Tag edge must be exactly 150 mm including the black border (`markerSizeM` in `server.js`); any scale error multiplies every distance in the room frame. A screen showing `/digital` also works as a tag.
-2. Calibrate each client at `/calibrate` (ChArUco board from the same page). Intrinsics are stored per lens and per resolution in `localStorage`. Uncalibrated clients fall back to a generic FOV model and are flagged `calibrated:false` end to end.
-4. Marker tracking is on by default (toggle on the client header). The client-side overlay reports resolution, scan mode, a detect-time breakdown (pixel grab / tag search / PnP), per-tag distance / viewing angle / reprojection error, and the current room fix.
+2. Calibrate each client at `/calibrate` (ChArUco board from the same page). Intrinsics are stored per lens and per resolution on the server, under the device's id, so they survive a cleared browser (see [Devices](#devices)). Uncalibrated clients fall back to a generic FOV model and are flagged `calibrated:false` end to end.
+4. Marker tracking is on by default (toggle on the client header, or from the dashboard's Clients drawer). The client-side overlay reports resolution, scan mode, a detect-time breakdown (pixel grab / tag search / PnP), per-tag distance / viewing angle / reprojection error, and the current room fix.
 
 **Detection** (`detect-worker.js` + `detect-core.js`, client). Runs at ~10 Hz on raw camera frames at native capture resolution, on a worker thread fed by a `MediaStreamTrackProcessor` — detection is the most expensive thing the client does per frame and it must not stall the encoded-frame transform, the recorder or the UI. Where a track processor is unavailable, `pose.js` runs the same core on the page via `requestVideoFrameCallback`.
 
@@ -111,6 +114,40 @@ Per tag, pose comes from `SOLVEPNP_IPPE_SQUARE`. Planar PnP has a two-fold mirro
 Removing a tag: double-click it in the floor plan. Removing the anchor resets the entire survey, since all poses are expressed relative to it.
 
 Expected accuracy is decimeter-level at room scale, dependent on calibration quality, tag print accuracy, viewing angle (degrades hard past ~60° off-normal), and distance.
+
+## Devices
+
+The browser stores exactly one thing: a UUID. Everything tied to it — capture settings and, above all, camera calibration — lives on the server in `devices.json`, keyed by that id.
+
+This matters because of what calibration costs. Fifteen careful ChArUco captures used to live in `localStorage`, where clearing site data, reinstalling the browser or switching from Chrome to anything else destroyed them silently: the client simply started reporting a derived model, or an outright FOV guess, and every distance in the room went with it.
+
+A record holds the device's name, its user agent, a hardware fingerprint, its capture settings, and one calibration per lens and resolution. Writes are debounced and atomic (temp file plus rename).
+
+**Recovering a lost id.** The id is now the single point of failure, so it is recoverable two ways.
+
+*Automatically.* Each device stores a fingerprint of its hardware — GPU string, physical screen geometry and pixel ratio, device model parsed from the user agent, camera labels, core count, memory, platform, languages, timezone. A browser arriving with no id is scored against every stored fingerprint, weighted towards the fields that survive a browser reinstall. It adopts a device only when one candidate is both strong on its own **and** clearly ahead of the runner-up. Two identical phone models fingerprint identically, and adopting the wrong one would hand a phone another phone's camera model with nothing downstream able to tell — so the matcher refuses to guess. Browser and OS versions are deliberately excluded: they change on their own every few weeks. Every match decision is logged.
+
+*By hand.* When the fingerprint cannot decide, the phone shows a picker listing each device by name, when it was last seen, and what it has been calibrated for — plus "This is a new device". The same picker is reachable any time by tapping the id chip in the header of `/client` or `/calibrate`, which is the way out for a phone that adopted the wrong record or minted a fresh id while the server was unreachable. Adopting reloads the page, since calibration and settings both change underneath it.
+
+**Ordering.** A capture page resolves its identity and applies its stored settings *before* it opens the camera — the size and lens are fixed at `getUserMedia` time, and a camera opened first would have to be torn down and reopened, taking the recording and the peer connection with it. If the server does not answer within a couple of seconds, the page proceeds on defaults rather than sitting dark.
+
+**Names** come from the user agent to start with (`Pixel 7 · Chrome`) and can be typed over from the dashboard's Clients drawer. The name belongs to the device, so it follows the phone across reconnects and client numbers, and it is what the picker shows.
+
+Calibrations still in a browser's `localStorage` from before this move are lifted to the server on the next load, and left in place as a fallback.
+
+## Client roster and remote control
+
+The **Clients** drawer on the dashboard lists every connected client and drives it. A client only gets a video tile once its peer connection is up, and `/xr-client` never opens one at all — so the drawer, not the tile grid, is the honest answer to "what is connected". The header reports both counts (`N clients · M streaming`).
+
+Per client the drawer shows: requested and actually-delivered capture size, lens, mic, marker tracking, paused and blanked state, AR session state for XR clients, the room fix and its age, link latency and clock uncertainty, recording size, and uptime.
+
+Controls, all of which are also on the client's own header: resolution, mic, marker tracking, pause, blank screen, front/rear lens, start a new recording, and the virtual webcam assignment. An XR client is offered only **Blank** — it has no mic, no recorder and no resolution to pick, and its tag detection is the entire point of the page.
+
+Nothing in the drawer is optimistic. A control sends the *wanted* state to the client, the client performs it and reports back what it actually did, and the drawer renders that — so a client that refuses or fails an action never leaves a button claiming otherwise. Every action lands in the same function the client's own button calls, so the two surfaces cannot drift apart.
+
+**Blank screen.** Both `/client` and `/xr-client` can black out the display while continuing to capture, detect and stream. The wake lock holds the screen on for the whole session and the display is the largest single draw on the phone; blanking it is the only meaningful power saving a page can make. Tap the black to wake. On `/xr-client` the black is mounted on the WebXR DOM overlay root, since inside an immersive-AR session that subtree is the only thing composited over the camera passthrough.
+
+**Marker tracking off** turns a client into a plain camera and microphone: no detection, no pose messages, no CPU spent on tags. The choice persists with the device's other settings across reloads.
 
 ## Virtual webcam
 
@@ -140,16 +177,19 @@ The active client's WebM chunk stream is teed into `ffmpeg`, decoded, and piped 
 ```
 server.js              HTTPS + WS: signaling relay, recording sink, vcam
 survey.js              marker map + room-frame localization
+devices.js             device registry: settings, calibration, fingerprints
 fetch-vendor.js        downloads opencv.js / three.js
 public/
-  common.js            signaling socket, liveness probe, clock sync
+  common.js            signaling socket, liveness probe, clock sync, screen blank,
+                       device identity + fingerprint + picker
   client.js             camera, MediaRecorder, peer connection, recovery
   pose.js              pose sockets, intrinsics, stats, on-page fallback
   detect-worker.js     worker thread: camera frames in, tag poses out
   detect-core.js       detector objects, scan strategy, PnP
   pose-math.js         quaternion / SE(3) helpers (shared with server)
   cv-common.js         opencv loading, intrinsics store, detector + luma factories
-  viewer.js            tiles, combined canvas, frame buffering + sync
+  viewer.js            tiles, combined canvas, frame buffering + sync, client model
+  clients-panel.js     client roster drawer + remote controls
   scene.js             3D room view (three.js)
   map2d.js             floor plan + elevation views
   calibrate.js/.html   ChArUco camera calibration
@@ -161,6 +201,7 @@ recordings/            output                                     (gitignored)
 tools/                 ffmpeg.exe for the virtual webcam          (gitignored)
 public/vendor/         fetched opencv.js / three.js               (gitignored)
 markers.json           surveyed marker map                        (gitignored)
+devices.json           per-device settings + camera calibration   (gitignored)
 ```
 
 Conventions: dates/times are 24-hour `dd/mm/yy`, formatted only by the helpers in `server.js` — no `toLocaleString`. Comments explain why, not what. Shared client/viewer logic lives in `common.js`; shared CV definitions in `cv-common.js`; transform math in `pose-math.js`.
