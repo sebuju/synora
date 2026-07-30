@@ -7,6 +7,12 @@ const muteBtn = document.getElementById('muteBtn');
 
 // clientId -> { pc, tile, video, label, camBtn }
 const devices = new Map();
+// clientId -> the state the server reports for it. Separate from `devices`
+// because the two answer different questions: `devices` is "is there a video
+// feed", the roster is "is there a client at all". An XR client only ever
+// appears in the roster, and a client whose peer connection has not come up yet
+// appears there first.
+const roster = new Map();
 // clientId -> { at, ms } while that client's ARCore tracking is down. Kept
 // separately from `devices` because an XR client never opens a peer connection
 // and so never gets a device entry at all — the state has to survive without
@@ -29,7 +35,13 @@ const signaling = connectSignaling('viewer', {
   },
   onClose() {
     setStatus('signaling lost, reconnecting…');
+    // Everything known about the clients came over this socket; none of it
+    // survives it. The server re-sends the roster on reconnect.
+    roster.clear();
+    poses.clear();
+    trackingLost.clear();
     for (const id of [...devices.keys()]) removeDevice(id);
+    refreshClientsPanel();
   },
   async onMessage(msg) {
     if (clockSync.handle(msg)) return;
@@ -55,6 +67,14 @@ const signaling = connectSignaling('viewer', {
       if (!msg.lost) trackingLost.delete(msg.clientId);
       return;
     }
+    if (msg.type === 'client-list') {
+      roster.clear();
+      for (const c of msg.clients) roster.set(c.clientId, c);
+      updateStatus();
+      updateLabels();
+      refreshClientsPanel();
+      return;
+    }
     if (msg.type === 'marker-map') {
       markerMap = msg;
       roomViewList.forEach((v) => v.setMarkerMap(msg));
@@ -71,6 +91,11 @@ const signaling = connectSignaling('viewer', {
       }
     } else if (msg.type === 'client-gone') {
       trackingLost.delete(msg.clientId);
+      poses.delete(msg.clientId);
+      // Not folded into removeDevice: a client with no tile has no device entry
+      // to remove, and an XR client never has one — it would have left its dot
+      // sitting in the room views forever.
+      roomViewList.forEach((v) => v.removeClient(msg.clientId));
       removeDevice(msg.clientId);
     } else if (msg.type === 'vcam-state') {
       if (msg.available !== undefined) vcamAvailable = msg.available;
@@ -81,6 +106,28 @@ const signaling = connectSignaling('viewer', {
 });
 
 const clockSync = createClockSync(signaling);
+
+// The one place the webcam assignment is sent from: a tile's button and the
+// client drawer's both target the same single server-side state, and null is
+// how it is cleared.
+function setVcam(clientId) {
+  signaling.send({ type: 'vcam', clientId });
+}
+
+// The tile caption is where a feed is actually identified, so it carries the
+// device's name once there is one — the client number stays because it is the
+// prefix on that client's recording filenames.
+function tileLabel(clientId) {
+  const name = roster.get(clientId)?.name;
+  const dev = devices.get(clientId);
+  const state = dev?.pc && dev.pc.connectionState !== 'connected'
+    ? ` — ${dev.pc.connectionState}` : '';
+  return `${name ? `${name} · client${clientId}` : `Client ${clientId}`}${state}`;
+}
+
+function updateLabels() {
+  for (const [id, dev] of devices) dev.label.textContent = tileLabel(id);
+}
 
 function updateCamBtn(clientId, dev) {
   dev.camBtn.style.display = vcamAvailable ? '' : 'none';
@@ -109,29 +156,26 @@ function uncertaintyOf(msg) {
   return { r: (j?.jitterMm ?? 0) / 1000, p: j?.centre ?? null };
 }
 
+// clientId -> { msg, at } for the newest pose, whether or not that client has a
+// tile. A client with no tile is not a client with no position: the XR client
+// positions and maps without streaming, so it never opens a peer connection and
+// never gets a device entry — and it is the one whose position matters most.
+const poses = new Map();
+
 function updatePoseLabel(clientId, msg) {
-  const dev = devices.get(clientId);
-  // A client with no tile is not a client with no position: the XR client
-  // positions and maps without streaming, so it never opens a peer connection
-  // and never gets a device entry. The room views take it regardless — only
-  // the per-tile label below needs a tile to live on.
-  if (!dev) {
-    if (msg.room?.pose) {
-      roomViewList.forEach((v) => v.updateClient(
-        clientId, msg.room.pose, (msg.tags || []).map((t) => t.id), uncertaintyOf(msg)));
-    }
-    return;
-  }
-  dev.lastPoseMsg = msg;
-  dev.lastPoseAt = performance.now();
+  poses.set(clientId, { msg, at: performance.now() });
+  const tags = msg.tags || [];
   if (msg.room?.pose) {
-    const seen = msg.tags.map((t) => t.id);
+    const seen = tags.map((t) => t.id);
     roomViewList.forEach((v) =>
       v.updateClient(clientId, msg.room.pose, seen, uncertaintyOf(msg)));
   }
+  // Only the per-tile label below needs a tile to live on.
+  const dev = devices.get(clientId);
+  if (!dev) return;
   clearTimeout(dev.poseLabelTimer);
-  if (msg.tags.length) {
-    const ids = msg.tags.map((t) => t.id).join(',');
+  if (tags.length) {
+    const ids = tags.map((t) => t.id).join(',');
     const room = msg.room?.pose
       ? ` · [${msg.room.pose.p.map((v) => v.toFixed(2)).join(', ')}] ${msg.room.quality}`
       : '';
@@ -152,10 +196,16 @@ function updatePoseLabel(clientId, msg) {
   }, POSE_LABEL_TTL_MS);
 }
 
+// Connected and streaming are different counts, and reporting only the second
+// made a room full of XR clients read as "no devices": they position without
+// ever opening a peer connection.
 function updateStatus() {
-  const n = devices.size;
-  setStatus(n === 0 ? 'no devices' : `${n} device${n === 1 ? '' : 's'} live`);
-  empty.style.display = n === 0 ? '' : 'none';
+  const streaming = devices.size;
+  const total = Math.max(streaming, roster.size);
+  setStatus(total === 0
+    ? 'no clients'
+    : `${total} client${total === 1 ? '' : 's'} · ${streaming} streaming`);
+  empty.style.display = streaming === 0 ? '' : 'none';
 }
 
 function ensureDevice(clientId) {
@@ -170,12 +220,12 @@ function ensureDevice(clientId) {
   video.muted = !soundOn;
   const label = document.createElement('div');
   label.className = 'label';
-  label.textContent = `Client ${clientId}`;
+  label.textContent = tileLabel(clientId);
   const camBtn = document.createElement('button');
   camBtn.className = 'cam-btn';
   camBtn.onclick = (ev) => {
     ev.stopPropagation();
-    signaling.send({ type: 'vcam', clientId: clientId === vcamClientId ? null : clientId });
+    setVcam(clientId === vcamClientId ? null : clientId);
   };
   const poseLabel = document.createElement('div');
   poseLabel.className = 'pose-label';
@@ -192,7 +242,7 @@ function ensureDevice(clientId) {
     pc: null, tile, video, label, camBtn, poseLabel,
     frames: [], lastFrame: null, latency: null, capturing: false,
     rtpMap: null, rtpSamples: [], clockUnc: null,
-    lastPoseMsg: null, poseLabelTimer: null,
+    poseLabelTimer: null,
   };
   devices.set(clientId, dev);
   updateCamBtn(clientId, dev);
@@ -221,7 +271,7 @@ async function acceptOffer(clientId, description) {
   dev.rtpMap = null;
   dev.rtpSamples = [];
   dev.latency = null;
-  dev.lastPoseMsg = null;
+  poses.delete(clientId);
   clearTimeout(dev.poseLabelTimer);
   dev.poseLabel.textContent = '';
   dropFrames(dev);
@@ -234,10 +284,7 @@ async function acceptOffer(clientId, description) {
   };
   dev.pc.onconnectionstatechange = () => {
     if (!dev.pc) return;
-    dev.label.textContent =
-      dev.pc.connectionState === 'connected'
-        ? `Client ${clientId}`
-        : `Client ${clientId} — ${dev.pc.connectionState}`;
+    dev.label.textContent = tileLabel(clientId);
   };
   await dev.pc.setRemoteDescription(description);
   const answer = await dev.pc.createAnswer();
@@ -501,13 +548,41 @@ let show3d = true;
 let show2d = true;      // top-down floor plan
 let showSide = false;   // side elevation (height)
 
-// Age of a pose in one-character units, one decimal: 3.2s, 1.5m, 2.0h, 1.1d.
-function fmtAge(ms) {
-  const s = ms / 1000;
-  if (s < 60) return `${s.toFixed(1)}s`;
-  if (s < 3600) return `${(s / 60).toFixed(1)}m`;
-  if (s < 86400) return `${(s / 3600).toFixed(1)}h`;
-  return `${(s / 86400).toFixed(1)}d`;
+// ---------------------------------------------------------------------------
+// One description of a client, merged from everything that knows part of one:
+// the server's roster (what it is and what it was told to do), the peer
+// connection (video, latency, clock uncertainty), the tracking-loss reports and
+// the newest pose. Two panels render this — the compact overlay over the room
+// views and the control drawer — and neither assembles its own view of a
+// client, or they would sooner or later disagree about one.
+const POSE_STALE_MS = 2000;
+
+function clientIds() {
+  return [...new Set([...roster.keys(), ...devices.keys(), ...poses.keys()])]
+    .sort((a, b) => a - b);
+}
+
+function clientInfo(id) {
+  const dev = devices.get(id);
+  const lost = trackingLost.get(id);
+  // A client that leaves AR while its tracking is down never sends the recovery
+  // message, so the state has to expire on its own or the roster keeps
+  // reporting a client that is not there. The ping is once a second.
+  if (lost && performance.now() - lost.at > LOST_STALE_MS) trackingLost.delete(id);
+  const stillLost = trackingLost.get(id);
+  const pose = poses.get(id);
+  return {
+    id,
+    kind: 'client',
+    ...(roster.get(id) || {}),
+    vcamAvailable,
+    live: !!dev,
+    poseMsg: pose?.msg ?? null,
+    poseAge: pose ? performance.now() - pose.at : null,
+    latency: dev?.latency ?? null,
+    clockUnc: dev?.clockUnc ?? null,
+    lostMs: stillLost ? stillLost.ms + performance.now() - stillLost.at : null,
+  };
 }
 
 // Client roster over the room views: who is where, facing which way, and how
@@ -519,48 +594,60 @@ setInterval(() => {
     roomStats.textContent = '';
     return;
   }
+  const infos = clientIds().map(clientInfo);
   const rows = [];
   // Tracking-lost clients first, and listed even when they have no tile and no
   // pose: this is the one state where the honest report is that there is no
   // position, rather than no client.
-  for (const [id, lost] of [...trackingLost.entries()].sort((a, b) => a[0] - b[0])) {
-    // A client that leaves AR while its tracking is down never sends the
-    // recovery message, so the state has to expire on its own or the roster
-    // keeps reporting a client that is not there. The ping is once a second.
-    if (performance.now() - lost.at > LOST_STALE_MS) {
-      trackingLost.delete(id);
-      continue;
-    }
-    const held = (lost.ms + performance.now() - lost.at) / 1000;
+  for (const info of infos) {
+    if (info.lostMs === null) continue;
     const row = document.createElement('div');
     row.style.color = '#e0603a';
-    row.textContent = `P${id}  NO ARCORE TRACK ${held.toFixed(0)}s  `
+    row.textContent = `P${info.id}  NO ARCORE TRACK ${(info.lostMs / 1000).toFixed(0)}s  `
       + '— position from tags only, nothing carried between sightings';
     rows.push(row);
   }
-  for (const [id, dev] of [...devices.entries()].sort((a, b) => a[0] - b[0])) {
-    const room = dev.lastPoseMsg?.room;
+  for (const info of infos) {
+    const room = info.poseMsg?.room;
     // Not skipped while tracking is lost: the client still reports a tag-only
     // position, and the banner above already says where it is coming from.
     if (!room?.pose) continue;
-    const age = performance.now() - dev.lastPoseAt;
-    const stale = age > 2000;
-    const colorHex = ROOM_CLIENT_COLORS[id % ROOM_CLIENT_COLORS.length];
-    const color = stale ? '#777' : `#${colorHex.toString(16).padStart(6, '0')}`;
     const p = room.pose.p;
     const f = quatRotate(room.pose.q, [0, 0, 1]);
     const yaw = Math.atan2(f[0], f[2]) * 180 / Math.PI;
     const pitch = Math.asin(Math.max(-1, Math.min(1, f[1]))) * 180 / Math.PI;
     const row = document.createElement('div');
-    row.style.color = color;
+    row.style.color = info.poseAge > POSE_STALE_MS ? '#777' : roomClientColorCss(info.id);
     row.textContent =
-      `P${id}  ${p.map((v) => v.toFixed(2)).join(', ')}` +
+      `P${info.id}  ${p.map((v) => v.toFixed(2)).join(', ')}` +
       `  yaw ${Math.round(yaw)}°  pitch ${Math.round(pitch)}°` +
-      `  ${dev.lastPoseMsg.tags.length} tags  ${fmtAge(age)}`;
+      `  ${(info.poseMsg.tags || []).length} tags  ${fmtAge(info.poseAge)}`;
     rows.push(row);
   }
   roomStats.replaceChildren(...rows);
 }, 100);
+
+// ---------------------------------------------------------------------------
+// Client drawer: the same roster with the controls attached. Everything a
+// client can do to itself is drivable from here; the client owns the behaviour
+// and reports back what it actually did, so nothing here is optimistic.
+const clientsBtn = document.getElementById('clientsBtn');
+const clientsPanel = createClientsPanel(document.getElementById('clients'), {
+  onControl: (clientId, action, value) =>
+    signaling.send({ type: 'control', clientId, action, value }),
+  onVcam: (clientId, on) => setVcam(on ? clientId : null),
+  onRename: (clientId, name) => signaling.send({ type: 'device-rename', clientId, name }),
+});
+let showClients = false;
+
+function refreshClientsPanel() {
+  if (!showClients) return;
+  clientsPanel.update(clientIds().map(clientInfo));
+}
+
+// Recording byte counts and pose ages move on their own; the roster message
+// only arrives when something changes.
+setInterval(refreshClientsPanel, 400);
 
 function refreshViews() {
   const room = show3d || show2d || showSide;
@@ -568,6 +655,11 @@ function refreshViews() {
   sceneBtn.classList.toggle('on', show3d);
   map2dBtn.classList.toggle('on', show2d);
   sideBtn.classList.toggle('on', showSide);
+  clientsBtn.classList.toggle('on', showClients);
+  clientsPanel.setActive(showClients);
+  // Both live in the top-right; the compact readout steps aside for the drawer.
+  roomViews.classList.toggle('with-panel', showClients);
+  refreshClientsPanel();
   backdrop.style.display = combinedActive || room ? 'block' : '';
   combined.style.display = combinedActive ? 'block' : '';
   combined.classList.toggle('pip', combinedActive && room);
@@ -601,6 +693,10 @@ map2dBtn.onclick = () => {
 };
 sideBtn.onclick = () => {
   showSide = !showSide;
+  refreshViews();
+};
+clientsBtn.onclick = () => {
+  showClients = !showClients;
   refreshViews();
 };
 

@@ -15,6 +15,7 @@
     <button id="sceneBtn" class="toggle">3D</button>
     <button id="map2dBtn" class="toggle">Top</button>
     <button id="sideBtn" class="toggle">Side</button>
+    <button id="clientsBtn" class="toggle">Clients</button>
     <button id="muteBtn" class="toggle">Sound</button>
     <button id="fullscreenBtn">Full</button>
   </header>
@@ -30,7 +31,8 @@
       </div>
       <div id="roomStats"></div>
     </div>
-    <div id="empty">No devices connected</div>
+    <div id="clients"></div>
+    <div id="empty">No video feeds</div>
   </main>
   <script src="/vendor/three.min.js"></script>
   <script src="/vendor/OrbitControls.js"></script>
@@ -38,6 +40,7 @@
   <script src="/pose-math.js"></script>
   <script src="/scene.js"></script>
   <script src="/map2d.js"></script>
+  <script src="/clients-panel.js"></script>
   <script src="/viewer.js"></script>
 </body>
 </html>
