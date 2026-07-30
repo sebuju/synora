@@ -68,29 +68,14 @@ function setResult(text) {
 // from the page that a resolution or an orientation is still uncovered — and an
 // uncovered one silently becomes a derived model on the client.
 function showStored() {
-  const prefix = `streamer-intrinsics:${facingSelect.value}:`;
-  const rows = [];
-  let n = 0;
-  try {
-    n = localStorage.length;
-  } catch {
-    n = 0;
-  }
-  for (let i = 0; i < n; i++) {
-    try {
-      const key = localStorage.key(i);
-      if (!key?.startsWith(prefix)) continue;
-      const c = JSON.parse(localStorage.getItem(key));
-      const shape = c.h > c.w ? 'portrait' : 'landscape';
-      rows.push(`${c.w}x${c.h}  ${shape}  `
-        + `rms ${Number.isFinite(c.rms) ? `${c.rms.toFixed(2)} px` : 'unknown'}  `
-        + (Number.isFinite(c.orientAngle)
-          ? `at ${c.orientAngle}°`
-          : 'no orientation recorded — recalibrate to allow exact un-rotation'));
-    } catch {
-      // A corrupt entry is worth neither listing nor dying over.
-    }
-  }
+  const rows = listIntrinsics(facingSelect.value).map((c) => {
+    const shape = c.h > c.w ? 'portrait' : 'landscape';
+    return `${c.w}x${c.h}  ${shape}  `
+      + `rms ${Number.isFinite(c.rms) ? `${c.rms.toFixed(2)} px` : 'unknown'}  `
+      + (Number.isFinite(c.orientAngle)
+        ? `at ${c.orientAngle}°`
+        : 'no orientation recorded — recalibrate to allow exact un-rotation');
+  });
   rows.sort();
   // The requested size and the delivered one routinely differ: these are `ideal`
   // constraints, and a client commonly hands back the portrait transpose. The
@@ -278,10 +263,21 @@ calibrateBtn.onclick = () => {
   }
 };
 
-saveBtn.onclick = () => {
+saveBtn.onclick = async () => {
   if (!calib) return;
-  saveIntrinsics(facingSelect.value, { ...calib, savedAtMs: Date.now() });
+  saveBtn.disabled = true;
+  const stored = await saveIntrinsics(facingSelect.value, { ...calib, savedAtMs: Date.now() });
   showStored();
+  if (!stored) {
+    // The store took it, so this tab still works — but nothing else will ever
+    // see it. Saying "saved" here would be the one lie that costs a calibration.
+    saveBtn.disabled = false;
+    setResult('NOT SAVED — the server did not accept the calibration.'
+      + '\nIt is live in this tab only and will be lost on reload.'
+      + '\nCheck the server is running, then save again.');
+    setStatus('save failed');
+    return;
+  }
   const turned = calib.h > calib.w ? 'landscape' : 'portrait';
   setResult(
     `Saved for ${facingSelect.value} @ ${calib.w}x${calib.h} (RMS ${calib.rms.toFixed(2)} px).` +
@@ -316,9 +312,19 @@ facingSelect.onchange = calResSelect.onchange = async () => {
   }
 };
 
-showStored();
-
 (async () => {
+  // A calibration belongs to a device, not to a browser: this page has to know
+  // which device it is speaking for before it can list what is stored, and
+  // certainly before it saves anything. The chip names it and opens the picker,
+  // which is how a phone that has forgotten its id gets its calibrations back
+  // instead of recapturing fifteen views.
+  const device = await resolveDevice('client');
+  await initIntrinsics(device);
+  const label = document.getElementById('clientLabel');
+  label.textContent = device.name || 'unnamed device';
+  wireDeviceChip(label, 'client');
+  showStored();
+
   try {
     cv = await loadOpenCv();
   } catch (err) {

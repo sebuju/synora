@@ -85,34 +85,100 @@ function loadOpenCv() {
 }
 
 // ---------------------------------------------------------------------------
-// Intrinsics persistence. Keyed by lens and resolution, not device identity:
-// the same client has independent front/back cameras, and fx/fy/cx/cy are
-// resolution-dependent. Same try/catch shape as loadClientId.
+// Intrinsics store. Keyed by lens and resolution within a device: the same
+// client has independent front/back cameras, and fx/fy/cx/cy are
+// resolution-dependent.
 //
-// A stored record is { fx, fy, cx, cy, dist[5], w, h, rms, savedAtMs,
-// orientAngle }. `orientAngle` is the display rotation the views were captured
-// at; it may be absent on records written before it was recorded, which is why
-// orientIntrinsics has an approximate path. The key format is unchanged for the
-// same reason — devices must not lose their calibration.
+// These live on the server now, under the device's id, and this is the page's
+// in-memory copy of them. They used to live in localStorage, where a cleared
+// site data or a switch of browser destroyed fifteen careful ChArUco captures
+// and nothing said so — the client simply started reporting a derived model, or
+// an outright FOV guess, and every distance in the room went with it.
+//
+// A record is { fx, fy, cx, cy, dist[5], w, h, rms, savedAtMs, orientAngle }.
+// `orientAngle` is the display rotation the views were captured at; it may be
+// absent on records written before it was recorded, which is why
+// orientIntrinsics has an approximate path. The key format is deliberately
+// unchanged from the localStorage one, so a lifted record and a fresh one are
+// the same thing.
+//
+// Lookups are synchronous, because that is what the detection path needs, so
+// nothing may be fetched here — initIntrinsics fills the store once, before any
+// camera opens. In the detection worker (which imports this file but never the
+// identity module) the store stays empty by design: intrinsics reach the worker
+// from the page, which is the only context that can resolve them.
+const intrinsicsStore = new Map();
+
 function intrinsicsKey(facing, w, h) {
   return `streamer-intrinsics:${facing}:${w}x${h}`;
 }
 
-function saveIntrinsics(facing, data) {
+// Calibrations left in localStorage by a build from before the store moved.
+// Read once, lifted to the server, and then irrelevant — but never deleted:
+// nothing is gained by removing them, and they are the only copy if the lift
+// fails.
+function localIntrinsicsRecords() {
+  const out = {};
+  let n = 0;
   try {
-    localStorage.setItem(intrinsicsKey(facing, data.w, data.h), JSON.stringify(data));
+    n = localStorage.length;
   } catch {
-    // Storage unavailable — calibration just does not survive a reload.
+    return out;
   }
+  for (let i = 0; i < n; i++) {
+    try {
+      const key = localStorage.key(i);
+      if (!key?.startsWith('streamer-intrinsics:')) continue;
+      out[key] = JSON.parse(localStorage.getItem(key));
+    } catch {
+      // One unparseable entry must not lose the rest.
+    }
+  }
+  return out;
 }
 
-function loadStoredIntrinsics(facing, w, h) {
-  try {
-    const raw = localStorage.getItem(intrinsicsKey(facing, w, h));
-    return raw ? JSON.parse(raw) : null;
-  } catch {
-    return null;
+// Fill the store for a resolved device, and lift anything this browser still
+// holds locally that the server has not got. Must complete before a camera
+// opens — a frame that arrives first is solved with a guessed camera model.
+// `apiJson` comes from common.js, which every page using this also loads.
+async function initIntrinsics(device) {
+  intrinsicsStore.clear();
+  for (const [key, rec] of Object.entries(device.intrinsics || {})) {
+    intrinsicsStore.set(key, rec);
   }
+  const missing = Object.fromEntries(Object.entries(localIntrinsicsRecords())
+    .filter(([key, rec]) => validIntrinsics(rec) && !intrinsicsStore.has(key)));
+  if (!Object.keys(missing).length) return;
+  const res = await apiJson('/api/device/intrinsics', {
+    deviceId: device.id, intrinsics: missing,
+  });
+  if (!res?.ok) return;
+  for (const [key, rec] of Object.entries(missing)) intrinsicsStore.set(key, rec);
+}
+
+// Write-through: the page keeps working from the store immediately, and the
+// server is told. Returns whether it was persisted — a calibration that only
+// reached the store dies with the tab, and /calibrate says so rather than
+// claiming a save.
+async function saveIntrinsics(facing, data) {
+  const key = intrinsicsKey(facing, data.w, data.h);
+  intrinsicsStore.set(key, data);
+  const res = await apiJson('/api/device/intrinsics', {
+    deviceId: storedDeviceId('client'), intrinsics: { [key]: data },
+  });
+  return !!res?.ok;
+}
+
+// Every stored calibration for a lens, newest first. The calibration page lists
+// these so an uncovered resolution or orientation is visible before it silently
+// becomes a derived model on the client.
+function listIntrinsics(facing) {
+  const prefix = `streamer-intrinsics:${facing}:`;
+  return [...intrinsicsStore.entries()]
+    .filter(([key]) => key.startsWith(prefix))
+    .map(([, rec]) => rec)
+    .filter(validIntrinsics)
+    .sort((a, b) => (b.savedAtMs || 0) - (a.savedAtMs || 0));
 }
 
 // The display rotation the browser reports now. Android rotates the camera
@@ -225,25 +291,8 @@ function orientIntrinsics(cand, w, h, nowAngle) {
 // keep their existing meaning.
 function intrinsicsFor(facing, w, h) {
   const nowAngle = displayAngle();
-  const prefix = `streamer-intrinsics:${facing}:`;
   let best = null;
-  let stored = 0;
-  try {
-    stored = localStorage.length;
-  } catch {
-    stored = 0;
-  }
-  for (let i = 0; i < stored; i++) {
-    let cand = null;
-    try {
-      const key = localStorage.key(i);
-      if (!key?.startsWith(prefix)) continue;
-      cand = JSON.parse(localStorage.getItem(key));
-    } catch {
-      // One unparseable entry must not discard every other candidate.
-      continue;
-    }
-    if (!validIntrinsics(cand)) continue;
+  for (const cand of listIntrinsics(facing)) {
     const from = `${cand.w}x${cand.h}`;
     const { model, source } = orientIntrinsics(cand, w, h, nowAngle);
     // A different aspect ratio is a different sensor crop, so a different field
