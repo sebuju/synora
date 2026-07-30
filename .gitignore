@@ -7,5 +7,7 @@ markers.json
 server.log
 .vscode/
 .claude/
+.plans/
 CLAUDE.md
 pose-settings.json
+devices.json
