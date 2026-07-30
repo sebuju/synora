@@ -254,10 +254,9 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
     updateClient(clientId, pose, seenTagIds = [], uncertainty = null) {
       let ph = clients.get(clientId);
       if (!ph) {
-        const colorHex = ROOM_CLIENT_COLORS[clientId % ROOM_CLIENT_COLORS.length];
         ph = {
           id: clientId,
-          color: `#${colorHex.toString(16).padStart(6, '0')}`,
+          color: roomClientColorCss(clientId),
           cur: { p: [...pose.p], fwd: [0, 0, 1] },
           target: null, seen: [], at: 0,
           uncertaintyM: 0, shownRadius: 0,

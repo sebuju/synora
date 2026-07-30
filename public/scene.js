@@ -11,6 +11,17 @@
 
 // Shared by the 3D scene and the 2D top-down map.
 const ROOM_CLIENT_COLORS = [0x4dabf7, 0xffa94d, 0x69db7c, 0xff6b6b, 0xda77f2, 0xffe066];
+
+// The one place a client's colour is picked. The 3D scene, the 2D maps, the
+// roster overlay and the client drawer all key off the same id, and a client
+// that reads as two different colours across them is worse than no colour.
+function roomClientColor(id) {
+  return ROOM_CLIENT_COLORS[id % ROOM_CLIENT_COLORS.length];
+}
+
+function roomClientColorCss(id) {
+  return `#${roomClientColor(id).toString(16).padStart(6, '0')}`;
+}
 const ROOM_POSE_STALE_MS = 2000;
 
 // Green head-on sliding to red as the view of a tag gets oblique — pose
