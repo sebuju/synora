@@ -74,6 +74,11 @@ const posePipeline = (() => {
       w: res.w,
       h: res.h,
       calibrated: res.calibrated,
+      // Which tier of the intrinsics ladder solved this. The server gates
+      // survey maintenance on it, and the dashboard names it.
+      source: res.source,
+      scale: res.scale,
+      from: res.from,
       unc: clockSync.synced ? Math.round(clockSync.uncertaintyMs * 10) / 10 : null,
       tags: res.tags,
     });
@@ -83,15 +88,26 @@ const posePipeline = (() => {
   // On-screen diagnostics — makes "why is nothing happening" answerable from
   // the client alone, and "why is it slow" answerable without a profiler: the
   // timing breakdown separates getting the pixels from searching them.
+  //
+  // The camera-model line is a DOM node rather than part of the text blob so it
+  // can be coloured: a guessed or derived model is the one state where every
+  // other number on the overlay is quietly wrong, and it was previously a
+  // lowercase word in the same green as the rest.
   function updateStats(res) {
     if (!statsEl) return;
     const t = res.timing;
     const scan = res.mode === 'roi'
       ? `roi ${Math.round(res.scanned.w)}x${Math.round(res.scanned.h)}`
       : `full${res.retried ? ' (roi missed)' : ''}${res.idle ? ', idle rate' : ''}`;
+    const model = describeCameraModel(res);
+    const modelEl = document.createElement('span');
+    if (model.level !== 'ok') modelEl.className = model.level;
+    modelEl.textContent = `${res.w}x${res.h} · ${model.long}`;
     const lines = [
-      `${res.w}x${res.h} · ${res.calibrated ? 'calibrated' : 'UNCALIBRATED'} · ` +
-      `clock ${clockSync.synced ? `±${clockSync.uncertaintyMs.toFixed(0)} ms` : 'unsynced'}`,
+      // The clock shares the model's line while that line is two words, and
+      // takes its own once the model has a sentence to explain itself.
+      `${model.level === 'ok' ? ' · ' : '\n'}`
+      + `clock ${clockSync.synced ? `±${clockSync.uncertaintyMs.toFixed(0)} ms` : 'unsynced'}`,
       `${scan} · ${Math.round(t.total)} ms ` +
       `(grab ${Math.round(t.grab)} · find ${Math.round(t.detect)} · pnp ${Math.round(t.solve)})` +
       (worker ? '' : ' · on-page'),
@@ -112,7 +128,7 @@ const posePipeline = (() => {
         `tag ${tag.id}: ${d.toFixed(2)} m · ${Math.round(ang)}° · err ${tag.err.toFixed(1)} px`);
     }
     if (!res.tags.length) lines.push('no tags in view');
-    statsEl.textContent = lines.join('\n');
+    statsEl.replaceChildren(modelEl, document.createTextNode(lines.join('\n')));
   }
 
   // -------------------------------------------------------------------------

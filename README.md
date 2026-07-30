@@ -176,7 +176,10 @@ Conventions: dates/times are 24-hour `dd/mm/yy`, formatted only by the helpers i
 | "sync unavailable" | Browser lacks encoded-frame access, or no free extmap id. Combined view works unsynced. |
 | Second dashboard kicks the first | By design. |
 | No Webcam button | Missing `tools/ffmpeg.exe`, AkVirtualCamera, or device. Startup log names which. |
-| Overlay shows UNCALIBRATED | No stored calibration for that lens/resolution — run `/calibrate`. Poses fall back to a FOV guess. |
+| Overlay red, UNCALIBRATED | No stored calibration for that lens at all — run `/calibrate`. Poses fall back to a FOV guess, and the server refuses such a client the survey: a ~5% scale error would be permanent in `markers.json`. |
+| Overlay amber, "rotated" / "scaled from WxH" | Working from a derived model: the calibration was captured in the other orientation, or at another resolution. Usable, but calibrate in the orientation and resolution you stream at to clear it. |
+| Overlay amber, "turn direction unknown" | The stored calibration predates orientation recording, so a quarter turn can only be approximated (principal point dropped to centre). Recalibrate once in each orientation. |
+| Tags move when the client is turned | The symptom the above two exist to make visible. A rotated or rescaled model is the usual cause; `/calibrate` in both orientations is the fix. |
 | Tags detected but no room fix | No surveyed tag in view. The survey grows from the anchor: show a known and an unknown tag together repeatedly. |
 | Distances uniformly wrong | Printed tag size ≠ 150 mm. Reprint at exact scale or adjust `markerSizeM`. |
 | Freeze button will not take | The page lists what is missing — almost always distance range: the sweep needs the tag walked from near to far, not viewed from one spot. |

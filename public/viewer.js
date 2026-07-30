@@ -135,10 +135,17 @@ function updatePoseLabel(clientId, msg) {
     const room = msg.room?.pose
       ? ` · [${msg.room.pose.p.map((v) => v.toFixed(2)).join(', ')}] ${msg.room.quality}`
       : '';
+    // Same wording as the client's own overlay, and coloured for the same
+    // reason: a derived camera model makes every position on this tile
+    // unverified, which "uncalibrated" alone did not say.
+    const model = describeCameraModel(msg);
     dev.poseLabel.textContent =
-      `tags ${ids}${room}${msg.calibrated ? '' : ' · uncalibrated'}`;
+      `tags ${ids}${room}${model.level === 'ok' ? '' : ` · ${model.text}`}`;
+    dev.poseLabel.classList.toggle('bad', model.level === 'bad');
+    dev.poseLabel.classList.toggle('warn', model.level === 'warn');
   } else {
     dev.poseLabel.textContent = 'no tags';
+    dev.poseLabel.classList.remove('bad', 'warn');
   }
   dev.poseLabelTimer = setTimeout(() => {
     dev.poseLabel.textContent = '';

@@ -142,6 +142,45 @@ function setStatus(text) {
   document.getElementById('status').textContent = text;
 }
 
+// How a pose message's camera model should be described and how loudly. Both
+// the client overlay and the dashboard tile report this, from the same wire
+// fields, so the wording cannot drift between them.
+//
+// Level maps to the shared .warn/.bad classes: a model that was rotated or
+// rescaled from another resolution is not wrong so much as unverified at the
+// resolution in use, and those tiers are exactly where an orientation change
+// used to move the map — so they are worth seeing rather than being folded into
+// the same "calibrated" as an exact fit. `source` is absent on messages from
+// before it existed; fall back to the boolean.
+function describeCameraModel(msg) {
+  if (msg.source === 'guess') {
+    return {
+      level: 'bad',
+      text: 'UNCALIBRATED',
+      long: 'UNCALIBRATED — FOV guess, distances ~5% out; run /calibrate',
+    };
+  }
+  if (msg.source === undefined) {
+    // A client from before provenance existed, or the XR path's own model.
+    return msg.calibrated
+      ? { level: 'ok', text: 'calibrated', long: 'calibrated' }
+      : { level: 'bad', text: 'UNCALIBRATED', long: 'UNCALIBRATED' };
+  }
+  const from = msg.from ? ` from ${msg.from}` : '';
+  const scaled = Number.isFinite(msg.scale) && Math.abs(msg.scale - 1) > 1e-6;
+  const parts = [];
+  let hint = '';
+  if (msg.source === 'rotated') parts.push('rotated');
+  if (msg.source === 'rotated-approx') {
+    parts.push('rotated, turn direction unknown');
+    hint = ' — recalibrate in this orientation to pin the principal point';
+  }
+  if (scaled) parts.push(`scaled x${msg.scale.toFixed(2)}`);
+  if (!parts.length) return { level: 'ok', text: 'calibrated', long: 'calibrated' };
+  const text = `${parts.join(', ')}${from}`;
+  return { level: 'warn', text, long: `${text}${hint}` };
+}
+
 // ---------------------------------------------------------------------------
 // Clock sync. Clients and the dashboard run on independent clocks, so frames
 // can only be aligned against a shared reference: the server's clock. Probes

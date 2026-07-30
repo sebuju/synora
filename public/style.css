@@ -162,6 +162,16 @@ main.tappable {
   cursor: pointer;
 }
 
+/* Degraded-state colours, shared so every panel says "wrong" the same way.
+   .bad is a real fault, .warn is working from something unverified. */
+.bad {
+  color: #e0603a;
+}
+
+.warn {
+  color: #e0a03a;
+}
+
 /* Live marker-tracking stats over the client preview. */
 #poseStats {
   position: absolute;
@@ -174,7 +184,10 @@ main.tappable {
   font-size: 11px;
   line-height: 1.5;
   color: #8fc79d;
-  white-space: pre;
+  /* pre-wrap, not pre: the camera-model line explains itself when the model is
+     derived, and a phone in portrait is narrower than that sentence. */
+  white-space: pre-wrap;
+  max-width: calc(100% - 32px);
   pointer-events: none;
 }
 
@@ -253,6 +266,15 @@ body.paused #pauseOverlay {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   color: #8fc79d;
   pointer-events: none;
+}
+
+/* The shared .bad/.warn are a single class and lose to the selector above. */
+.tile .pose-label.bad {
+  color: #e0603a;
+}
+
+.tile .pose-label.warn {
+  color: #e0a03a;
 }
 
 .tile .pose-label:empty {
