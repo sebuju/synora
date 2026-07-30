@@ -287,6 +287,50 @@ function openRecording(ws) {
   log(`Recording started: ${path.relative(__dirname, ws.recordingPath)}`);
 }
 
+// Pose journal: every observation the survey consumes, kept so a session can be
+// replayed offline against different constants. The survey's tuning — how small
+// a tag is too small to trust, how much disagreement means a tag was moved, how
+// many estimates make a position — decides whether the map is right, and all of
+// it was being argued from a summary line throttled to one every three seconds
+// while the numbers that would settle it arrived ten times a second and were
+// dropped on the floor. Deliberately independent of the video recorder: pose
+// runs whether or not anything is recording, and a session worth replaying is
+// usually one where nothing was.
+function closePoseJournal(ws) {
+  if (!ws.poseJournal) return;
+  ws.poseJournal.end();
+  log(`Pose journal saved: ${path.relative(__dirname, ws.poseJournalPath)} `
+    + `(${ws.poseJournalLines} observations)`);
+  ws.poseJournal = null;
+  ws.poseJournalPath = null;
+}
+
+function journalPose(ws, entry) {
+  if (!ws.poseJournal) {
+    fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
+    ws.poseJournalPath = path.join(RECORDINGS_DIR,
+      `${fmtFileStamp(new Date())}_client${ws.clientId}.pose.jsonl`);
+    ws.poseJournal = fs.createWriteStream(ws.poseJournalPath);
+    ws.poseJournalLines = 0;
+    // The marker size cannot be recovered from the observations — it is the
+    // room's only metric datum — and a replay run against the wrong one
+    // reproduces nothing. Same reason markers.json carries it.
+    ws.poseJournal.write(`${JSON.stringify({
+      kind: 'meta',
+      at: Date.now(),
+      clientId: ws.clientId,
+      deviceId: ws.deviceId,
+      markerSizeM: POSE_CONFIG.markerSizeM,
+    })}\n`);
+    log(`Pose journal started: ${path.relative(__dirname, ws.poseJournalPath)}`);
+  }
+  // Both sides of the transaction: the observation as it arrived and the pose
+  // the survey produced from it. A replay that only had the input could not be
+  // diffed against what actually happened at the time.
+  ws.poseJournal.write(`${JSON.stringify(entry)}\n`);
+  ws.poseJournalLines++;
+}
+
 function send(socket, obj) {
   if (socket && socket.readyState === socket.OPEN) {
     socket.send(JSON.stringify(obj));
@@ -526,12 +570,47 @@ function handleSignal(ws, msg) {
     }
     return;
   }
+  // ARCore tracking loss on an XR client. The client keeps detecting tags
+  // through it and falls back to plain `pose` reports, so this is a change of
+  // localization mode rather than an outage — but it used to be sent as
+  // nothing at all, which reads exactly like a client that went away. Logged on
+  // entry and on recovery with a duration, so "how often, how long" is
+  // answerable from the log rather than from a gap between journal lines.
+  if (msg.type === 'xr-tracking') {
+    if (ws.role === 'client') {
+      if (msg.lost) {
+        if (!ws.trackingLostAt) {
+          // Both stamps, or the "still lost" reminder below measures its
+          // interval from the epoch and fires on the very next ping.
+          ws.trackingLostAt = Date.now();
+          ws.trackingLostLog = Date.now();
+          log(`Client ${ws.clientId} lost ARCore tracking — localizing from tags `
+            + 'alone, no carry between sightings');
+        } else if (Date.now() - (ws.trackingLostLog || 0) > 10000) {
+          // A long outage should not be one line at each end with silence in
+          // between; that is the shape that made this invisible before.
+          ws.trackingLostLog = Date.now();
+          log(`Client ${ws.clientId} still not tracking (${(msg.ms / 1000).toFixed(0)}s)`);
+        }
+      } else if (ws.trackingLostAt) {
+        log(`Client ${ws.clientId} recovered ARCore tracking after `
+          + `${(msg.ms / 1000).toFixed(1)}s`);
+        ws.trackingLostAt = null;
+        ws.trackingLostLog = 0;
+      }
+      journalPose(ws, { kind: 'xr-tracking', at: Date.now(), msg });
+      send(viewerSocket, {
+        type: 'client-tracking', clientId: ws.clientId, lost: !!msg.lost, ms: msg.ms });
+    }
+    return;
+  }
   if (msg.type === 'xr-pose') {
     if (ws.role === 'client') {
       // ARCore already knows where the camera is; the tags only say where the
       // room is relative to ARCore's frame.
       const { pose, quality, mapChanged, jitter } =
         survey.alignXr(ws.clientId, msg.xr, msg.tags || [], msg.sid ?? null, msg.intrinsics);
+      journalPose(ws, { kind: 'xr-pose', at: Date.now(), msg, room: { pose, quality, jitter }, mapChanged });
       send(viewerSocket, {
         ...msg, type: 'pose', clientId: ws.clientId, room: { pose, quality, jitter } });
       // jitter rides back to the client: the measurement needs both the phone's
@@ -546,6 +625,7 @@ function handleSignal(ws, msg) {
       // The survey consumes the camera-frame observations and hands back the
       // room-frame pose; the viewer gets both in one message.
       const { pose, quality, mapChanged } = survey.handlePose(msg, ws.clientId);
+      journalPose(ws, { kind: 'pose', at: Date.now(), msg, room: { pose, quality }, mapChanged });
       send(viewerSocket, { ...msg, clientId: ws.clientId, room: { pose, quality } });
       // The client cannot know its room pose on its own (the marker map lives
       // here) — reflect it back for the on-client stats overlay.
@@ -608,6 +688,7 @@ function main() {
     ws.on('close', () => {
       if (ws.role === 'client') {
         closeRecording(ws);
+        closePoseJournal(ws);
         // A reconnect of the same device may already own this id — its state
         // belongs to the new socket, so leave it alone.
         if (clients.get(ws.clientId) !== ws) return;
