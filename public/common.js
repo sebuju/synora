@@ -142,6 +142,67 @@ function setStatus(text) {
   document.getElementById('status').textContent = text;
 }
 
+// Age of an instant in one-character units, one decimal: 3.2s, 1.5m, 2.0h,
+// 1.1d. Every panel that shows how stale something is uses this one, so a
+// figure means the same thing wherever it is read.
+function fmtAge(ms) {
+  const s = ms / 1000;
+  if (s < 60) return `${s.toFixed(1)}s`;
+  if (s < 3600) return `${(s / 60).toFixed(1)}m`;
+  if (s < 86400) return `${(s / 3600).toFixed(1)}h`;
+  return `${(s / 86400).toFixed(1)}d`;
+}
+
+// Screen blanking. A capture device runs for hours with a wake lock holding the
+// display on, and the display is the largest single draw on the phone — nothing
+// else a page can switch off comes close. Blanking costs nothing: the camera,
+// the recorder, the peer connection and tag detection all keep running, only
+// the picture stops being drawn.
+//
+// `root` is what the black div is mounted on, and that is the whole difference
+// between the two callers: on an ordinary page it is the body, but inside an
+// immersive-AR session the UA only composites the DOM overlay root's subtree
+// over the camera passthrough, so /xr-client has to mount it there or the black
+// never reaches the screen.
+function createBlankScreen(root, onChange) {
+  const el = document.createElement('div');
+  el.className = 'blank-screen';
+  const hint = document.createElement('span');
+  hint.textContent = 'tap to wake';
+  el.append(hint);
+  // The tap must not reach what is underneath: on /client the feed toggles
+  // pause on click, so waking the screen would also unpause it.
+  el.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    set(false);
+  });
+  root.append(el);
+
+  let on = false;
+  function set(next) {
+    if (next === on) return;
+    on = next;
+    el.classList.toggle('on', on);
+    // Restart the hint's fade so it is readable again on the next blank.
+    if (on) {
+      hint.style.animation = 'none';
+      void hint.offsetWidth;
+      hint.style.animation = '';
+    }
+    onChange?.(on);
+  }
+
+  return {
+    set,
+    toggle() {
+      set(!on);
+    },
+    get on() {
+      return on;
+    },
+  };
+}
+
 // How a pose message's camera model should be described and how loudly. Both
 // the client overlay and the dashboard tile report this, from the same wire
 // fields, so the wording cannot drift between them.
