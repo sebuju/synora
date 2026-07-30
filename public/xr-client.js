@@ -21,6 +21,7 @@ const report = document.getElementById('report');
 const startBtn = document.getElementById('startBtn');
 const overlay = document.getElementById('overlay');
 const overlayText = document.getElementById('overlayText');
+const blankBtn = document.getElementById('blankBtn');
 
 const POSE_INTERVAL_MS = 100;      // tag detection + pose report
 
@@ -59,15 +60,32 @@ let trackingLostSince = 0;
 let lastLostPing = 0;
 const LOST_PING_MS = 1000;
 
+// Same device identity as /client on this phone — same browser, same stored id
+// — so this page registers the same way. It stores nothing of its own: the
+// server keeps XR reports out of the device's settings, since this page has no
+// mic, no recorder and no resolution and would otherwise overwrite what the
+// capture client on the same phone actually uses.
+const device = resolveDevice('client');
+device.then((d) => {
+  const label = document.getElementById('clientLabel');
+  label.textContent = d.name || 'unnamed device';
+  wireDeviceChip(label, 'client');
+});
+
 const signaling = connectSignaling('client', {
   onOpen() {
     clockSync.start();
-    signaling.send({ type: 'client-state', res: 'xr', mic: false, pose: true });
+    sendClientState();
   },
   onMessage(msg) {
     if (clockSync.handle(msg)) return;
     if (msg.type === 'room-pose') roomPose = msg;
-    else if (msg.type === 'pose-config') {
+    else if (msg.type === 'control') {
+      // The dashboard drives every client through one message shape. This page
+      // has no mic, no recorder and no resolution to change, and its tag
+      // detection is the whole point, so blanking is all it answers to.
+      if (msg.action === 'blank') blank.set(!!msg.value);
+    } else if (msg.type === 'pose-config') {
       // Remembered, not just forwarded. pose-config arrives on connect; the
       // detector does not exist until the user starts the XR session, so
       // `core?.` dropped the size on the floor and the detector kept its 0.15
@@ -78,8 +96,33 @@ const signaling = connectSignaling('client', {
       core?.setMarkerSize(markerSizeM);
     }
   },
-});
+}, device.then((d) => d.id));
 const clockSync = createClockSync(signaling);
+
+// Blanking the display while the session keeps tracking. Mounted on the DOM
+// overlay root rather than the body: in an immersive-AR session that subtree is
+// the only thing the UA composites over the camera passthrough, so black put
+// anywhere else never reaches the screen.
+const blank = createBlankScreen(overlay, (on) => {
+  blankBtn.classList.toggle('active', on);
+  sendClientState();
+});
+
+// The dashboard's roster is built from what each client reports about itself.
+// This page has far fewer knobs than /client and says so, rather than reporting
+// defaults for controls it does not have.
+function sendClientState() {
+  signaling.send({
+    type: 'client-state',
+    kind: 'xr',
+    res: 'xr',
+    capture: camInfo ? { w: camInfo.w, h: camInfo.h } : null,
+    mic: false,
+    pose: true,
+    session: !!session,
+    blank: blank.on,
+  });
+}
 
 // WebXR view space is +x right, +y UP, -z forward. Every other camera pose in
 // this project is OpenCV — +x right, +y down, +z forward — including the tag
@@ -230,9 +273,14 @@ async function start() {
     session = null;
     sessionId = null;
     camInfo = null;
+    // Nothing is being blanked once the overlay is gone, and a client that
+    // still claimed to be blank would be reporting a screen that is not.
+    blank.set(false);
+    sendClientState();
   });
   session.requestAnimationFrame(onFrame);
   setStatus('session running');
+  sendClientState();
 }
 
 function onFrame(t, frame) {
@@ -359,7 +407,11 @@ async function detectAndReport(view, pose, viewport) {
 
   const intr = intrinsicsFromProjection(
     view.projectionMatrix, camera.width, camera.height, viewport);
+  // The camera image size is ARCore's choice, not this page's, so the roster
+  // only learns it once a frame has actually arrived.
+  const sizeChanged = !camInfo || camInfo.w !== camera.width || camInfo.h !== camera.height;
   camInfo = { w: camera.width, h: camera.height, fx: intr.fx };
+  if (sizeChanged) sendClientState();
   if (!core.hasIntrinsics(camera.width, camera.height)) {
     core.setIntrinsics(camera.width, camera.height, intr);
   }
@@ -383,4 +435,5 @@ async function detectAndReport(view, pose, viewport) {
 }
 
 startBtn.onclick = start;
+blankBtn.onclick = () => blank.toggle();
 probe();

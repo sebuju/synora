@@ -34,18 +34,29 @@
       font-family: ui-monospace, monospace; font-size: 12px; color: #eee;
       white-space: pre-line;
     }
+    /* Sits under the text chip, clear of the same status bar and cutout. */
+    #blankBtn {
+      position: absolute;
+      right: 8px;
+      bottom: calc(env(safe-area-inset-bottom, 0px) + 16px);
+      padding: 8px 14px;
+    }
   </style>
 </head>
 <body>
   <header>
     <a class="home" href="/" title="Back to start">XR client</a>
+    <span id="clientLabel"></span>
     <span id="status" class="grow">checking…</span>
   </header>
   <main>
     <div id="report">probing…</div>
     <button id="startBtn" class="wide" type="button" disabled>Start XR session</button>
   </main>
-  <div id="overlay"><div id="overlayText"></div></div>
+  <div id="overlay">
+    <div id="overlayText"></div>
+    <button id="blankBtn" type="button">Blank</button>
+  </div>
   <script src="/common.js"></script>
   <script src="/cv-common.js"></script>
   <script src="/pose-math.js"></script>
