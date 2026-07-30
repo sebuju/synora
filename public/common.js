@@ -18,32 +18,275 @@ const PROBE_INTERVAL_MS = 5000;
 const PROBE_TIMEOUT_MS = 8000;
 const RECONNECT_DELAY_MS = 2000;
 
-// A client id that survives reloads, so the server can hand a device the client
-// number it had before instead of burning a fresh one on every refresh.
-function loadDeviceId(role) {
-  const key = `streamer-device-id:${role}`;
-  // Devices that predate the phone→client rename keep their identity: read
-  // the uuid from the old role's key once and copy it under the new one.
-  const legacy = `streamer-client-id:${role.replace(/^client/, 'phone')}`;
-  let id = null;
+// ---------------------------------------------------------------------------
+// Device identity.
+//
+// The browser holds one thing: this id. Everything tied to it — capture
+// settings and, far more importantly, camera calibration — lives on the server,
+// so clearing site data or changing browser costs nothing but the id itself.
+//
+// The id is therefore the single point of failure, and it is recoverable two
+// ways: the server re-matches a fingerprint of the device (automatic, and only
+// trusted when it picks one device out unambiguously), and failing that the
+// person is shown the list and asked. Both live below.
+
+const DEVICE_ID_KEY = (role) => `streamer-device-id:${role}`;
+// Devices that predate the phone→client rename keep their identity: the uuid is
+// read from the old role's key once and copied under the new one.
+const DEVICE_ID_LEGACY = (role) => `streamer-client-id:${role.replace(/^client/, 'phone')}`;
+
+function storedDeviceId(role) {
   try {
-    id = localStorage.getItem(key) || localStorage.getItem(legacy);
-    if (!id) id = crypto.randomUUID();
-    localStorage.setItem(key, id);
+    return localStorage.getItem(DEVICE_ID_KEY(role))
+      || localStorage.getItem(DEVICE_ID_LEGACY(role))
+      || null;
   } catch {
-    // Storage unavailable (private mode, blocked cookies): a per-load id still
-    // works, it just does not survive a refresh.
-    id ||= crypto.randomUUID();
+    return null;
   }
+}
+
+function saveDeviceId(role, id) {
+  try {
+    localStorage.setItem(DEVICE_ID_KEY(role), id);
+  } catch {
+    // Storage unavailable (private mode, blocked cookies): the id works for
+    // this load, it just does not survive a refresh — and the fingerprint match
+    // is what gets it back next time.
+  }
+}
+
+// Synchronous id for the pages that are not devices (the dashboard) and for a
+// page's secondary socket. Mints one if there is none; a device page must use
+// resolveDevice() instead, which can recover an id rather than burning a new
+// one.
+function loadDeviceId(role) {
+  const id = storedDeviceId(role) || crypto.randomUUID();
+  saveDeviceId(role, id);
   return id;
+}
+
+// Small JSON calls to the server. Every one of these sits in front of the
+// camera opening, so none of them may hang: a server that does not answer has
+// to degrade to defaults rather than leave the page dark.
+const API_TIMEOUT_MS = 2000;
+
+async function apiJson(path, body) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), API_TIMEOUT_MS);
+  try {
+    const res = await fetch(path, {
+      method: body === undefined ? 'GET' : 'POST',
+      headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;   // offline, aborted, or a server that is not there
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// The GPU string is the strongest single hint that two visits are the same
+// physical device: it names the chip, and it survives a browser reinstall. The
+// context is thrown away immediately — this is one read, not a renderer.
+function gpuRenderer() {
+  try {
+    const canvas = document.createElement('canvas');
+    const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+    if (!gl) return null;
+    const ext = gl.getExtension('WEBGL_debug_renderer_info');
+    const name = ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+    gl.getExtension('WEBGL_lose_context')?.loseContext();
+    return name || null;
+  } catch {
+    return null;
+  }
+}
+
+// Camera labels, when the browser will say. They are only exposed once camera
+// permission has been granted — and clearing site data usually clears that too,
+// so the case this whole mechanism exists for is often the case where this
+// field is missing. It is worth collecting anyway: the server treats an absent
+// field as missing information rather than disagreement, and a client that
+// re-announces itself after opening the camera fills it in for next time.
+async function cameraLabels() {
+  try {
+    const list = await navigator.mediaDevices.enumerateDevices();
+    return list
+      .filter((d) => d.kind === 'videoinput' && d.label)
+      .map((d) => d.label)
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
+async function deviceFingerprint() {
+  const labels = await cameraLabels();
+  // Screen dimensions swap with orientation on a phone, so the pair is sorted:
+  // a fingerprint that changed when the device was turned would match nothing.
+  const a = Math.min(screen.width, screen.height);
+  const b = Math.max(screen.width, screen.height);
+  return {
+    gpu: gpuRenderer(),
+    screen: `${a}x${b}@${window.devicePixelRatio}`,
+    cameras: labels,
+    cores: navigator.hardwareConcurrency ?? null,
+    memory: navigator.deviceMemory ?? null,
+    platform: navigator.userAgentData?.platform || navigator.platform || null,
+    langs: (navigator.languages || [navigator.language]).join(','),
+    tz: Intl.DateTimeFormat().resolvedOptions().timeZone || null,
+  };
+}
+
+// Resolve who this device is and fetch everything the server holds for it.
+// Returns { id, name, settings, intrinsics } — settings and intrinsics are null
+// / empty when the server could not be reached, which is what makes the caller
+// fall back to its own defaults rather than wait.
+async function resolveDevice(role = 'client') {
+  const fingerprint = await deviceFingerprint();
+  let id = storedDeviceId(role);
+
+  if (!id) {
+    // No id. Ask the server who this fingerprint used to be; it answers with an
+    // id to adopt only when one device is picked out unambiguously, because two
+    // identical phones fingerprint identically and adopting the wrong one hands
+    // this phone another phone's camera model.
+    const m = await apiJson('/api/device/match', { fingerprint });
+    if (m?.adopt) {
+      id = m.adopt;
+    } else if (m?.candidates?.length) {
+      id = await openDevicePicker({
+        devices: m.candidates,
+        title: 'Which device is this?',
+        note: 'This browser has no stored identity. Picking the right one restores '
+          + 'its camera calibration and settings.',
+      });
+    }
+    id ||= crypto.randomUUID();
+    saveDeviceId(role, id);
+  }
+
+  const hello = await apiJson('/api/device/hello', { deviceId: id, fingerprint });
+  return {
+    id,
+    name: hello?.device?.name ?? null,
+    settings: hello?.device?.settings ?? null,
+    intrinsics: hello?.device?.intrinsics ?? {},
+    // The camera labels are usually missing on the load that matters. Calling
+    // this again once the camera is open fills them in, so the *next* recovery
+    // has a stronger fingerprint to work from.
+    async refresh() {
+      await apiJson('/api/device/hello', { deviceId: id, fingerprint: await deviceFingerprint() });
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Device picker. Shown automatically when a browser turns up with no id and the
+// server cannot tell on its own which device it is; also reachable at any time
+// from the id chip, which is the escape hatch for a phone that adopted the
+// wrong record or minted a fresh id while the server was unreachable.
+//
+// Resolves to the chosen device id, or null for "this is a new device".
+function openDevicePicker({ devices, title, note, currentId = null }) {
+  return new Promise((resolve) => {
+    const root = document.createElement('div');
+    root.className = 'device-picker';
+
+    const panel = document.createElement('div');
+    panel.className = 'panel';
+    const h = document.createElement('h2');
+    h.textContent = title;
+    const p = document.createElement('p');
+    p.textContent = note;
+    panel.append(h, p);
+
+    const choose = (id) => {
+      root.remove();
+      resolve(id);
+    };
+
+    for (const d of devices) {
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.className = 'device';
+      if (d.id === currentId) item.classList.add('current');
+      const name = document.createElement('div');
+      name.className = 'name';
+      name.textContent = d.name + (d.id === currentId ? ' — this browser now' : '');
+      const meta = document.createElement('div');
+      meta.className = 'meta';
+      // Last seen and what it is calibrated for are what actually tell two of
+      // the same phone model apart.
+      const cal = d.calibrations?.length
+        ? d.calibrations.map((c) => `${c.w}x${c.h} ${c.facing === 'user' ? 'front' : 'rear'}`).join(', ')
+        : 'never calibrated';
+      meta.textContent = `seen ${fmtAge(Date.now() - d.lastSeenMs)} ago · ${cal}`
+        + (d.score !== undefined ? ` · ${Math.round(d.score * 100)}% match` : '');
+      item.append(name, meta);
+      item.onclick = () => choose(d.id);
+      panel.append(item);
+    }
+
+    const fresh = document.createElement('button');
+    fresh.type = 'button';
+    fresh.className = 'device new';
+    fresh.textContent = 'This is a new device';
+    fresh.onclick = () => choose(null);
+    panel.append(fresh);
+
+    root.append(panel);
+    document.body.append(root);
+  });
+}
+
+// Hand the id chip to the picker. Adopting a different device changes the
+// calibration and the settings the page is running on, so it reloads rather
+// than trying to re-apply half a page's state in place.
+function wireDeviceChip(el, role = 'client') {
+  if (!el) return;
+  el.classList.add('clickable');
+  el.title = 'Which device this browser is — tap to change';
+  el.onclick = async () => {
+    const list = await apiJson('/api/devices');
+    if (!list?.devices?.length) return;
+    const picked = await openDevicePicker({
+      devices: list.devices,
+      title: 'Which device is this?',
+      note: 'Pick the record this browser should use. Its calibration and capture '
+        + 'settings come with it. The page reloads.',
+      currentId: storedDeviceId(role),
+    });
+    if (!picked || picked === storedDeviceId(role)) return;
+    saveDeviceId(role, picked);
+    location.reload();
+  };
 }
 
 // Opens the signaling WebSocket, announces our role, auto-reconnects.
 // handlers: { onMessage(msg), onOpen(), onClose(), onPong(msg) } — optional.
 // deviceId can be passed so a page's secondary socket (bulk uploads) presents
-// the same identity as its primary one.
+// the same identity as its primary one. It may be a promise: a device page
+// resolves its identity against the server before it is entitled to announce
+// one, and both of its sockets wait on the same resolution.
 // Returns { send(obj), sendBinary(blob), close() }.
-function connectSignaling(role, handlers = {}, deviceId = loadDeviceId(role)) {
+function connectSignaling(role, handlers = {}, deviceId) {
+  // A capture device's identity is resolved against the server — it may have to
+  // be recovered from a fingerprint, or asked about — so those pages pass it in.
+  // Falling back to loadDeviceId() here is not a harmless convenience: the
+  // default is evaluated at module load, before resolveDevice has even read
+  // storage, and it *mints and saves* a fresh id. That silently destroyed the
+  // recovery path, and looked exactly like a device that had never been seen.
+  if (deviceId === undefined) {
+    if (role.startsWith('client')) {
+      throw new Error(`connectSignaling('${role}') needs a resolved deviceId`);
+    }
+    deviceId = loadDeviceId(role);
+  }
   let ws = null;
   let closedByUs = false;
   let reconnectTimer = null;
@@ -62,8 +305,12 @@ function connectSignaling(role, handlers = {}, deviceId = loadDeviceId(role)) {
     if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) return;
     const sock = new WebSocket(`wss://${location.host}`);
     ws = sock;
-    sock.onopen = () => {
-      sock.send(JSON.stringify({ type: 'role', role, deviceId }));
+    sock.onopen = async () => {
+      const id = await deviceId;
+      // The socket may have been superseded or torn down while identity was
+      // being resolved; announcing a role on a dead one throws.
+      if (sock !== ws || sock.readyState !== WebSocket.OPEN) return;
+      sock.send(JSON.stringify({ type: 'role', role, deviceId: id }));
       handlers.onOpen?.();
     };
     sock.onmessage = (ev) => {
