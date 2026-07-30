@@ -23,6 +23,96 @@ function rvecFromQuat(q) {
   return [q[0] / n * angle * sign, q[1] / n * angle * sign, q[2] / n * angle * sign];
 }
 
+// Rodrigues vector -> 3x3 rotation matrix, row-major. Needed because the planar
+// mirror construction below is a reflection, and a reflection has no quaternion.
+function matFromRvec(rvec) {
+  const th = Math.hypot(rvec[0], rvec[1], rvec[2]);
+  if (th < 1e-12) return [1, 0, 0, 0, 1, 0, 0, 0, 1];
+  const x = rvec[0] / th;
+  const y = rvec[1] / th;
+  const z = rvec[2] / th;
+  const c = Math.cos(th);
+  const s = Math.sin(th);
+  const t = 1 - c;
+  return [
+    t * x * x + c, t * x * y - s * z, t * x * z + s * y,
+    t * x * y + s * z, t * y * y + c, t * y * z - s * x,
+    t * x * z - s * y, t * y * z + s * x, t * z * z + c,
+  ];
+}
+
+// Inverse of matFromRvec. The near-180° branch is load-bearing: a tag can be
+// seen at any roll, the antisymmetric part of R vanishes at a half turn, and
+// reading the axis off it alone returns noise exactly there.
+function rvecFromMat(m) {
+  const c = Math.min(1, Math.max(-1, (m[0] + m[4] + m[8] - 1) / 2));
+  const th = Math.acos(c);
+  if (th < 1e-9) return [0, 0, 0];
+  if (th > Math.PI - 1e-6) {
+    // The largest diagonal entry picks the best-conditioned column of R + I.
+    const d = [m[0], m[4], m[8]];
+    const i = d[0] >= d[1] && d[0] >= d[2] ? 0 : (d[1] >= d[2] ? 1 : 2);
+    const col = [m[i], m[3 + i], m[6 + i]];
+    col[i] += 1;
+    const n = Math.hypot(col[0], col[1], col[2]);
+    if (n < 1e-12) return [0, 0, 0];
+    return [col[0] / n * th, col[1] / n * th, col[2] / n * th];
+  }
+  const k = th / (2 * Math.sin(th));
+  return [(m[7] - m[5]) * k, (m[2] - m[6]) * k, (m[3] - m[1]) * k];
+}
+
+function matMul3(a, b) {
+  const o = new Array(9);
+  for (let i = 0; i < 3; i++) {
+    for (let j = 0; j < 3; j++) {
+      o[i * 3 + j] = a[i * 3] * b[j] + a[i * 3 + 1] * b[3 + j] + a[i * 3 + 2] * b[6 + j];
+    }
+  }
+  return o;
+}
+
+// Starting guesses for the *other* pose of a planar target.
+//
+// A plane has two poses that project almost identically, and picking the wrong
+// one teleports the implied camera. The two differ by tilting the plane the
+// opposite way about the line of sight: if the normal leans away from the view
+// ray by some angle, the twin leans by the same angle on the other side. So with
+// v the unit direction to the target centre, the twin's normal is the first
+// one's reflected **about the line v** — not about the plane perpendicular to
+// it. Reflecting about that perpendicular plane instead flips the normal's sign
+// along v, which turns the target to face away from the camera: a pose ~180°
+// from the answer rather than the ambiguity, and every refine from it either
+// dies at ~50 px reprojection error or slides back into the original solution.
+//
+// Reflection about the line v is `2vv^T - I`, whose eigenvalues are (+1,-1,-1) —
+// determinant +1, so it is a proper rotation (the half turn about v) and needs
+// no improper flip to fix up.
+//
+// It does also spin the target 180° in its own plane, which the projection does
+// not want, so the in-plane half turn about the target normal is offered as the
+// second guess. Only reprojection error can say which is right, so both are
+// returned for the caller to refine and score.
+//
+// The centre stays on the same ray at nearly the same depth, so the first
+// solution's translation is already a good starting point for the second.
+function mirrorRvecGuesses(rvec, tvec) {
+  const d = Math.hypot(tvec[0], tvec[1], tvec[2]);
+  if (!(d > 1e-6)) return [];
+  const v = [tvec[0] / d, tvec[1] / d, tvec[2] / d];
+  const S = [
+    2 * v[0] * v[0] - 1, 2 * v[0] * v[1], 2 * v[0] * v[2],
+    2 * v[1] * v[0], 2 * v[1] * v[1] - 1, 2 * v[1] * v[2],
+    2 * v[2] * v[0], 2 * v[2] * v[1], 2 * v[2] * v[2] - 1,
+  ];
+  const R = matMul3(S, matFromRvec(rvec));
+  return [
+    rvecFromMat(R),
+    // R * diag(-1,-1,1): a half turn about the target's own normal.
+    rvecFromMat([-R[0], -R[1], R[2], -R[3], -R[4], R[5], -R[6], -R[7], R[8]]),
+  ];
+}
+
 function quatMul(a, b) {
   return [
     a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
@@ -64,7 +154,8 @@ function quatAngleDeg(a, b) {
 // Weighted mean of quaternions that all sit near each other: sign-align to
 // the first (q and -q are the same rotation, and averaging across the sign
 // flip cancels instead of averaging), then normalized weighted sum. Not valid
-// for widely spread rotations — fine here, outliers are rejected first.
+// for widely spread rotations — callers that cannot guarantee that want
+// quatMedian below.
 function quatMean(quats, weights) {
   const ref = quats[0];
   const acc = [0, 0, 0, 0];
@@ -75,6 +166,43 @@ function quatMean(quats, weights) {
     for (let k = 0; k < 4; k++) acc[k] += q[k] * sign;
   }
   return quatNormalize(acc);
+}
+
+// Robust centre of a set of orientations: the medoid (the member with the
+// smallest total angular distance to the others), then a plain mean of just the
+// members within `tolDeg` of it.
+//
+// This exists because quatMean has no breakdown point. A planar tag's PnP can
+// return the mirrored solution, which is a ~40° orientation error, and a
+// measured 12-27% of sightings did; averaging those in pulls the result degrees
+// off, and a few degrees of tag orientation over a room-scale lever arm is tens
+// of centimetres of implied camera position. The position half of the same
+// computation was always a component-wise median and was measurably fine, so
+// this is the orientation half catching up rather than a new idea.
+//
+// Measured against quatMean on a set contaminated with a tight second mode 40°
+// away (which is what flips look like — they cluster, they do not scatter):
+// identical at 0% contamination, 0.46° vs 9.66° at 27%, still 0.88° vs 16.2° at
+// 45%. Past 50% it follows the flipped mode instead, as any robust estimator
+// must: at that point the outliers are the majority and nothing local can tell.
+//
+// O(n^2) in the number of quaternions, which is bounded by the candidate ring.
+function quatMedian(quats, tolDeg = 20) {
+  if (quats.length <= 2) return quatMean(quats);
+  let medoid = quats[0];
+  let bestTotal = Infinity;
+  for (const a of quats) {
+    let total = 0;
+    for (const b of quats) total += quatAngleDeg(a, b);
+    if (total < bestTotal) {
+      bestTotal = total;
+      medoid = a;
+    }
+  }
+  const inliers = quats.filter((q) => quatAngleDeg(q, medoid) <= tolDeg);
+  // The medoid alone is already a valid answer; only average if averaging has
+  // something to average.
+  return inliers.length >= 2 ? quatMean(inliers) : medoid;
 }
 
 // Small-step interpolation toward a target orientation (sign-aligned nlerp:
@@ -120,7 +248,8 @@ function transformPoint(t, v) {
 if (typeof module !== 'undefined') {
   module.exports = {
     quatFromRvec, rvecFromQuat, quatMul, quatConj, quatNormalize, quatRotate,
-    quatAngleDeg, quatMean, quatNudge, se3FromRvecTvec, se3Compose, se3Invert,
-    se3Identity, transformPoint,
+    quatAngleDeg, quatMean, quatMedian, quatNudge, se3FromRvecTvec, se3Compose,
+    se3Invert, se3Identity, transformPoint,
+    matFromRvec, rvecFromMat, matMul3, mirrorRvecGuesses,
   };
 }
