@@ -171,6 +171,21 @@ function createDetectCore() {
     }
   }
 
+  // Mean edge length of the detected quad, in full-frame pixels. This is the
+  // measurement the server's survey gates on: how much tag there actually was
+  // to fit a pose to. It deliberately comes from the corners rather than from
+  // size/distance and the camera model — a wrong model is one of the things it
+  // has to stay able to expose.
+  function meanSidePx(cornerMat) {
+    const d = cornerMat.data32F;
+    let sum = 0;
+    for (let i = 0; i < 4; i++) {
+      const j = (i + 1) % 4;
+      sum += Math.hypot(d[i * 2] - d[j * 2], d[i * 2 + 1] - d[j * 2 + 1]);
+    }
+    return sum / 4;
+  }
+
   function bboxOf(cornerMat) {
     const d = cornerMat.data32F;
     let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
@@ -233,7 +248,17 @@ function createDetectCore() {
         const sols = solveTag(cornerMat);
         if (!sols) continue;
         boxes.push(bboxOf(cornerMat));
-        const tag = { id, ...roundSol(sols[0]) };
+        // The corners are the measurement; rvec/tvec are one interpretation of
+        // them under one camera model. Shipping them costs eight numbers and
+        // means a recorded session can be re-solved against a different model
+        // — which is the only way to ask "how much of this pose error is the
+        // camera model" without going back to the room with the phone.
+        const tag = {
+          id,
+          px: Math.round(meanSidePx(cornerMat)),
+          corners: [...cornerMat.data32F].map((v) => Math.round(v * 100) / 100),
+          ...roundSol(sols[0]),
+        };
         // The runner-up only matters while it is plausible — a clearly worse
         // reprojection is not an ambiguity worth the bytes.
         if (sols[1] && sols[1].err < 8) tag.alt = roundSol(sols[1]);
