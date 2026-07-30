@@ -26,6 +26,7 @@
     #coverage div { background: #333; border-radius: 2px; }
     #coverage div.hit { background: #2e8b47; }
     #result { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; color: #9a9a9a; white-space: pre-line; }
+    #stored { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; color: #9a9a9a; white-space: pre-line; }
     /* Printable ChArUco board: hidden on screen, alone on paper. CSS mm are
        true millimeters at 100% print scale. */
     #boardPrint { display: none; }
@@ -66,6 +67,8 @@
     <select id="calResSelect">
       <option value="720p">720p</option>
       <option value="1080p" selected>1080p</option>
+      <option value="1440p">1440p</option>
+      <option value="4K">4K</option>
     </select>
   </header>
   <main>
@@ -83,6 +86,7 @@
       <button id="printBtn">Print board</button>
       <button id="showBoardBtn">Show board</button>
     </div>
+    <div id="stored">no stored calibrations for this lens</div>
     <div id="result">Print the ChArUco board (Print board → 100% scale, A4) and fix it to something rigid and flat —
 or open this page on the PC, hit "Show board", and film the monitor with the client.
 Note: the board is its own checkered pattern, not the room tags. Capture ~15 views: vary distance,

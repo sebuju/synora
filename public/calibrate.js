@@ -18,8 +18,19 @@ const printBtn = document.getElementById('printBtn');
 const viewCount = document.getElementById('viewCount');
 const coverageEl = document.getElementById('coverage');
 const result = document.getElementById('result');
+const storedEl = document.getElementById('stored');
 
-const CAL_RESOLUTIONS = { '720p': { width: 1280, height: 720 }, '1080p': { width: 1920, height: 1080 } };
+// Labels are the familiar landscape names, but these are `ideal` constraints and
+// a client hands back whatever it likes — commonly the portrait transpose. What
+// is stored is always the size the track actually produced. 1440p and 4K are
+// here because the client streams at 4K by default and a model calibrated at the
+// streaming resolution beats one rescaled into it.
+const CAL_RESOLUTIONS = {
+  '720p': { width: 1280, height: 720 },
+  '1080p': { width: 1920, height: 1080 },
+  '1440p': { width: 2560, height: 1440 },
+  '4K': { width: 3840, height: 2160 },
+};
 const MIN_CORNERS_PER_VIEW = 8;
 const TARGET_VIEWS = 15;
 const DETECT_INTERVAL_MS = 250;
@@ -35,6 +46,11 @@ let lastIds = null;
 // Captured views: { corners: Mat, ids: Mat, w, h }
 const views = [];
 let calib = null;   // last calibration result, pending save
+// Display rotation when the first view of the current set was captured. Recorded
+// so a later 90° turn can be un-rotated exactly: without it the principal point
+// can only be transposed, which describes a mirrored camera. Taken at capture
+// rather than at save because the two can be minutes and a rotation apart.
+let calOrientAngle = null;
 
 const coverageCells = [];
 for (let i = 0; i < 9; i++) {
@@ -45,6 +61,50 @@ for (let i = 0; i < 9; i++) {
 
 function setResult(text) {
   result.textContent = text;
+}
+
+// What is already stored for this lens, and whether each entry knows the
+// orientation it was captured at. Without that list there is no way to tell
+// from the page that a resolution or an orientation is still uncovered — and an
+// uncovered one silently becomes a derived model on the client.
+function showStored() {
+  const prefix = `streamer-intrinsics:${facingSelect.value}:`;
+  const rows = [];
+  let n = 0;
+  try {
+    n = localStorage.length;
+  } catch {
+    n = 0;
+  }
+  for (let i = 0; i < n; i++) {
+    try {
+      const key = localStorage.key(i);
+      if (!key?.startsWith(prefix)) continue;
+      const c = JSON.parse(localStorage.getItem(key));
+      const shape = c.h > c.w ? 'portrait' : 'landscape';
+      rows.push(`${c.w}x${c.h}  ${shape}  `
+        + `rms ${Number.isFinite(c.rms) ? `${c.rms.toFixed(2)} px` : 'unknown'}  `
+        + (Number.isFinite(c.orientAngle)
+          ? `at ${c.orientAngle}°`
+          : 'no orientation recorded — recalibrate to allow exact un-rotation'));
+    } catch {
+      // A corrupt entry is worth neither listing nor dying over.
+    }
+  }
+  rows.sort();
+  // The requested size and the delivered one routinely differ: these are `ideal`
+  // constraints, and a client commonly hands back the portrait transpose. The
+  // delivered size is what gets stored and what the client will look up, so it
+  // is the one worth showing.
+  const want = CAL_RESOLUTIONS[calResSelect.value];
+  const got = calVideo.videoWidth
+    ? `${calVideo.videoWidth}x${calVideo.videoHeight}`
+    : '—';
+  const head = `capturing at ${got} (asked ${want.width}x${want.height})`
+    + `${Number.isFinite(displayAngle()) ? `, display ${displayAngle()}°` : ''}`;
+  storedEl.textContent = `${head}\n${rows.length
+    ? `stored for this lens:\n${rows.join('\n')}`
+    : 'no stored calibrations for this lens'}`;
 }
 
 async function startCalCamera() {
@@ -60,6 +120,14 @@ async function startCalCamera() {
   calVideo.srcObject = stream;
 }
 
+// The delivered track size is only known once metadata lands, and it changes
+// when the device is turned — both are worth reflecting in the stored list.
+calVideo.addEventListener('loadedmetadata', showStored);
+calVideo.addEventListener('resize', showStored);
+if (typeof screen !== 'undefined') {
+  screen.orientation?.addEventListener?.('change', showStored);
+}
+
 // Switching lens or resolution invalidates every captured view.
 function resetViews() {
   for (const v of views) {
@@ -68,6 +136,7 @@ function resetViews() {
   }
   views.length = 0;
   calib = null;
+  calOrientAngle = null;
   saveBtn.disabled = true;
   calibrateBtn.disabled = true;
   viewCount.textContent = '0 views';
@@ -143,6 +212,7 @@ captureBtn.onclick = () => {
   const h = calVideo.videoHeight;
   // Mixed-size views would calibrate against the wrong image size silently.
   if (views.length && (views[0].w !== w || views[0].h !== h)) resetViews();
+  if (!views.length) calOrientAngle = displayAngle();
   views.push({ corners: lastCorners.clone(), ids: lastIds.clone(), w, h });
   markCoverage(lastCorners, w, h);
   viewCount.textContent = `${views.length} views`;
@@ -183,7 +253,7 @@ calibrateBtn.onclick = () => {
     calib = {
       fx: k[0], fy: k[4], cx: k[2], cy: k[5],
       dist: [...dist.data64F].slice(0, 5),
-      w, h, rms, savedAtMs: null,
+      w, h, rms, savedAtMs: null, orientAngle: calOrientAngle,
     };
     saveBtn.disabled = false;
     const worst = Math.max(...Array.from({ length: perView.rows }, (_, i) => perView.data64F[i]));
@@ -211,9 +281,15 @@ calibrateBtn.onclick = () => {
 saveBtn.onclick = () => {
   if (!calib) return;
   saveIntrinsics(facingSelect.value, { ...calib, savedAtMs: Date.now() });
+  showStored();
+  const turned = calib.h > calib.w ? 'landscape' : 'portrait';
   setResult(
     `Saved for ${facingSelect.value} @ ${calib.w}x${calib.h} (RMS ${calib.rms.toFixed(2)} px).` +
-    '\nThe client page picks this up automatically. Calibrate the other lens too if you use it.');
+    '\nThe client page picks this up automatically.' +
+    `\n\nNow turn the client 90° to ${turned} and do it again. A calibration only` +
+    '\ndescribes the orientation it was captured in; used in the other one it has to' +
+    '\nbe rotated, and a rotated model is a derived model. Calibrate the other lens' +
+    '\ntoo if you use it, and the resolution you actually stream at.');
 };
 
 clearBtn.onclick = () => {
@@ -232,12 +308,15 @@ document.getElementById('boardPrint').onclick = () =>
 
 facingSelect.onchange = calResSelect.onchange = async () => {
   resetViews();
+  showStored();
   try {
     await startCalCamera();
   } catch (err) {
     setStatus(`camera error: ${err.message}`);
   }
 };
+
+showStored();
 
 (async () => {
   try {
