@@ -236,6 +236,34 @@ function se3Invert(t) {
   return { p: [-p[0], -p[1], -p[2]], q: qi };
 }
 
+// The shortest rotation carrying unit vector `a` onto unit vector `b`. Shortest
+// matters: this is used to correct an orientation that is already nearly right,
+// and any other rotation with the same effect on `a` would spin the object about
+// `b` as a side effect — for a marker that is its roll on the wall, which was
+// measured and must survive.
+function quatFromTo(a, b) {
+  const dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  if (dot > 0.999999) return [0, 0, 0, 1];
+  const cross = [
+    a[1] * b[2] - a[2] * b[1],
+    a[2] * b[0] - a[0] * b[2],
+    a[0] * b[1] - a[1] * b[0],
+  ];
+  // Exactly opposed: the rotation is a half turn and the axis is undetermined by
+  // the pair, so any perpendicular will do. Cross with whichever basis vector is
+  // least aligned with `a`, so the result is never near zero length.
+  if (dot < -0.999999) {
+    const alt = Math.abs(a[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
+    const axis = [
+      a[1] * alt[2] - a[2] * alt[1],
+      a[2] * alt[0] - a[0] * alt[2],
+      a[0] * alt[1] - a[1] * alt[0],
+    ];
+    return quatNormalize([axis[0], axis[1], axis[2], 0]);
+  }
+  return quatNormalize([cross[0], cross[1], cross[2], 1 + dot]);
+}
+
 function se3Identity() {
   return { p: [0, 0, 0], q: [0, 0, 0, 1] };
 }
@@ -249,7 +277,7 @@ if (typeof module !== 'undefined') {
   module.exports = {
     quatFromRvec, rvecFromQuat, quatMul, quatConj, quatNormalize, quatRotate,
     quatAngleDeg, quatMean, quatMedian, quatNudge, se3FromRvecTvec, se3Compose,
-    se3Invert, se3Identity, transformPoint,
+    se3Invert, se3Identity, transformPoint, quatFromTo,
     matFromRvec, rvecFromMat, matMul3, mirrorRvecGuesses,
   };
 }
