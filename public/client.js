@@ -7,6 +7,7 @@ const switchBtn = document.getElementById('switchBtn');
 const micBtn = document.getElementById('micBtn');
 const recBtn = document.getElementById('recBtn');
 const poseBtn = document.getElementById('poseBtn');
+const blankBtn = document.getElementById('blankBtn');
 const resSelect = document.getElementById('resSelect');
 
 // Constraints use `ideal`, so a client that cannot do the asked size degrades
@@ -19,9 +20,28 @@ const RESOLUTIONS = {
   '4K': { width: 3840, height: 2160 },
 };
 
+// Defaults only. The device's real settings live on the server under its id and
+// are applied by applyStoredConfig() below, before anything opens the camera.
+// `appliedRes` is also the answer to "did the resolution actually change": the
+// select already shows the new value by the time its change event fires, so it
+// cannot be compared against itself.
+let appliedRes = resSelect.value;
 let facing = 'environment';
 let audioEnabled = false;
 let paused = false;
+// Two halves of one label: the client number matches this device's recording
+// filenames and its dashboard tile, the device name is what a person calls it.
+// They arrive from different places at different times, so neither writes the
+// element directly.
+let clientNumber = null;
+let deviceName = null;
+
+function updateLabel() {
+  const parts = [];
+  if (clientNumber !== null) parts.push(`client${clientNumber}`);
+  if (deviceName) parts.push(deviceName);
+  clientLabel.textContent = parts.join(' · ') || 'identifying…';
+}
 let stream = null;
 let pc = null;
 let recorder = null;
@@ -30,6 +50,14 @@ let viewerWaiting = false;
 let cameraPending = null;
 let restarting = false;
 let restartQueued = false;
+
+// Identity comes first: both sockets announce it, every stored setting and
+// every camera calibration is keyed by it, and the server can only hand this
+// device its own state once it knows which device it is. Resolving it may
+// involve asking the person which device this browser is, so it is a promise
+// the sockets wait on rather than a value.
+const device = resolveDevice('client');
+const deviceIdReady = device.then((d) => d.id);
 
 const signaling = connectSignaling('client', {
   async onOpen() {
@@ -65,13 +93,18 @@ const signaling = connectSignaling('client', {
   async onMessage(msg) {
     if (clockSync.handle(msg)) return;
     if (msg.type === 'client-id') {
-      // Matches the name the server gives this device's recordings.
-      clientLabel.textContent = `client${msg.clientId}`;
+      clientNumber = msg.clientId;
+      updateLabel();
     } else if (msg.type === 'viewer-ready') {
       viewerWaiting = true;
       await restartCall();
     } else if (msg.type === 'restart-recorder') {
       startRecorder();
+    } else if (msg.type === 'control') {
+      // Remote control from the dashboard. Every action lands in the same
+      // setter the on-screen button calls — a second path would be a second
+      // set of bugs, and the two would drift.
+      await REMOTE_ACTIONS[msg.action]?.(msg.value);
     } else if (msg.type === 'pose-config') {
       posePipeline.setConfig(msg);
     } else if (msg.type === 'room-pose') {
@@ -86,7 +119,7 @@ const signaling = connectSignaling('client', {
       }
     }
   },
-});
+}, deviceIdReady);
 
 const clockSync = createClockSync(signaling);
 
@@ -95,16 +128,78 @@ const clockSync = createClockSync(signaling);
 // of pose and signaling messages — half a megabyte of WebM per second queued
 // ahead of a pose message is exactly the lag it caused. Same deviceId, so the
 // server maps both sockets to the same client.
-const bulk = connectSignaling('client-bulk', {}, loadDeviceId('client'));
+const bulk = connectSignaling('client-bulk', {}, deviceIdReady);
 
-// The server keeps a roster of connected clients; it only learns the settings a
-// client chose for itself if the client reports them, on connect and on change.
+// Everything this device was last set to, applied before a camera can open —
+// the size and the lens are read at getUserMedia time, so a camera opened
+// ahead of this would have to be torn down and reopened, taking the recording
+// and the peer connection with it. A server that does not answer leaves the
+// defaults standing rather than leaving the page dark: resolveDevice and
+// initIntrinsics both give up after a short timeout.
+// Never rejects: a server that cannot be reached must leave the defaults
+// standing, not wedge every path that waits on this.
+const configReady = applyStoredConfig().catch((err) => {
+  setStatus(`stored settings unavailable: ${err.message}`);
+});
+
+async function applyStoredConfig() {
+  const d = await device;
+  // Calibration must be in place before the first frame is solved, or the
+  // client reports positions from a guessed camera model and only says so in
+  // one line of an overlay.
+  await initIntrinsics(d);
+  deviceName = d.name;
+  updateLabel();
+  wireDeviceChip(clientLabel, 'client');
+  const s = d.settings;
+  if (!s) return;
+  if (RESOLUTIONS[s.res]) {
+    appliedRes = s.res;
+    resSelect.value = s.res;
+  }
+  facing = s.facing === 'user' ? 'user' : 'environment';
+  audioEnabled = !!s.mic;
+  // The mic button carries its state in a class and nothing else sets it on
+  // load.
+  micBtn.classList.toggle('active', audioEnabled);
+}
+
+// Blanking the screen is the one real power saving available to a page that is
+// pinned awake by a wake lock. Nothing is torn down — the stream, the recorder
+// and tag detection carry on behind the black.
+const blank = createBlankScreen(document.body, (on) => {
+  blankBtn.classList.toggle('active', on);
+  sendClientState();
+});
+
+// The server keeps a roster of connected clients, and the dashboard renders it;
+// the server only learns the settings a client chose for itself if the client
+// reports them, on connect and on every change.
 function sendClientState() {
+  // Gated on the restore, because reporting is also the *write* path: the
+  // server stores whatever a client says about itself. The socket opens as soon
+  // as identity resolves, which is earlier than the settings finish being
+  // applied — and a report that raced the restore overwrote the stored settings
+  // with this page's defaults, destroying them on every single load.
+  configReady.then(reportClientState);
+}
+
+function reportClientState() {
+  // The requested resolution is not the streamed one: constraints use `ideal`,
+  // so a camera that cannot do 4K silently hands back whatever it could, and
+  // the roster showing the request alone made that invisible.
+  const settings = stream?.getVideoTracks()[0]?.getSettings?.() ?? {};
   signaling.send({
     type: 'client-state',
+    kind: 'client',
     res: resSelect.value,
+    capture: settings.width && settings.height
+      ? { w: settings.width, h: settings.height } : null,
+    facing,
     mic: audioEnabled,
     pose: posePipeline.enabled,
+    paused,
+    blank: blank.on,
   });
 }
 
@@ -118,7 +213,10 @@ function streamLive() {
 // getUserMedia call — two in flight would leave the loser's tracks orphaned.
 function ensureCamera() {
   if (streamLive()) return Promise.resolve(true);
-  cameraPending ??= startCamera()
+  // Nothing opens the camera before the device's stored settings have been
+  // applied, or given up on — the size and lens are fixed at getUserMedia time.
+  cameraPending ??= configReady
+    .then(startCamera)
     .then(() => true)
     .catch((err) => {
       setStatus(`camera error: ${err.message}`);
@@ -170,6 +268,9 @@ async function startCamera() {
   // New tracks may mean a different lens or resolution; the pose pipeline
   // must re-read its intrinsics and make sure its frame loop is armed.
   posePipeline.onCameraChanged(facing);
+  // The single point where lens, resolution and mic all become true rather than
+  // requested, so it is the one place the roster has to be told from.
+  sendClientState();
 }
 
 // Advertise the absolute-capture-time RTP header extension on the video
@@ -318,18 +419,31 @@ function startRecorder() {
 }
 
 // ---------------------------------------------------------------------------
-switchBtn.onclick = async () => {
-  facing = facing === 'environment' ? 'user' : 'environment';
+// Everything the client can be told to do, as functions of the state wanted
+// rather than of a tap. The on-screen buttons and the dashboard's remote
+// control both go through these, so there is one implementation of each action
+// and the two surfaces cannot drift apart.
+// A failed change is rolled back before it is reported. What the client reports
+// is what the server stores and hands back on the next load, so a lens or a
+// size the camera refused must not become the one it starts with — that would
+// fail identically every load, with nothing left to fall back to.
+async function setFacing(next) {
+  if (next === facing) return;
+  const prev = facing;
+  facing = next;
   try {
     await startCamera();
     startRecorder();
   } catch (err) {
+    facing = prev;
     setStatus(`camera switch failed: ${err.message}`);
+    sendClientState();
   }
-};
+}
 
-micBtn.onclick = async () => {
-  audioEnabled = !audioEnabled;
+async function setMic(on) {
+  if (on === audioEnabled) return;
+  audioEnabled = on;
   micBtn.classList.toggle('active', audioEnabled);
   try {
     await startCamera();
@@ -340,12 +454,28 @@ micBtn.onclick = async () => {
     audioEnabled = !audioEnabled;
     micBtn.classList.toggle('active', audioEnabled);
     setStatus(`mic toggle failed: ${err.message}`);
+    sendClientState();
   }
-  sendClientState();
-};
+}
+
+async function setResolution(value) {
+  if (!RESOLUTIONS[value] || value === appliedRes) return;
+  const prev = appliedRes;
+  appliedRes = value;
+  resSelect.value = value;
+  try {
+    await startCamera();
+    startRecorder();
+  } catch (err) {
+    appliedRes = prev;
+    resSelect.value = prev;
+    setStatus(`resolution change failed: ${err.message}`);
+    sendClientState();
+  }
+}
 
 // Cut the current recording and open the next one server-side.
-recBtn.onclick = async () => {
+async function newRecording() {
   if (!wsOpen) {
     setStatus('not connected — recording unchanged');
     return;
@@ -355,38 +485,47 @@ recBtn.onclick = async () => {
   // Recording is invisible from the client, so acknowledge the tap.
   recBtn.classList.add('active');
   setTimeout(() => recBtn.classList.remove('active'), 400);
-};
+}
 
-feed.onclick = () => {
-  paused = !paused;
+function setPaused(on) {
+  if (on === paused) return;
+  paused = on;
   applyPaused();
-};
+  sendClientState();
+}
 
-poseBtn.onclick = async () => {
-  const on = !posePipeline.enabled;
+async function setPose(on) {
+  if (on === posePipeline.enabled) return;
   poseBtn.classList.toggle('active', on);
   try {
-    localStorage.setItem('streamer-pose-enabled', on ? '1' : '0');
-  } catch {
-    // Storage unavailable — the toggle just does not survive a reload.
-  }
-  try {
+    // setEnabled reports the new state through the onState hook.
     await posePipeline.setEnabled(on);
   } catch (err) {
     poseBtn.classList.remove('active');
     setStatus(`marker tracking failed: ${err.message}`);
   }
+}
+
+// Actions the dashboard may drive, keyed by the name it sends. Values are the
+// wanted state, not a toggle: the dashboard renders from the state the server
+// reported, so a toggle raced against a stale view would land inverted.
+const REMOTE_ACTIONS = {
+  facing: (v) => setFacing(v === 'user' ? 'user' : 'environment'),
+  mic: (v) => setMic(!!v),
+  res: (v) => setResolution(v),
+  pose: (v) => setPose(!!v),
+  paused: (v) => setPaused(!!v),
+  blank: (v) => blank.set(!!v),
+  record: () => newRecording(),
 };
 
-resSelect.onchange = async () => {
-  try {
-    await startCamera();
-    startRecorder();
-  } catch (err) {
-    setStatus(`resolution change failed: ${err.message}`);
-  }
-  sendClientState();
-};
+switchBtn.onclick = () => setFacing(facing === 'environment' ? 'user' : 'environment');
+micBtn.onclick = () => setMic(!audioEnabled);
+recBtn.onclick = () => newRecording();
+feed.onclick = () => setPaused(!paused);
+poseBtn.onclick = () => setPose(!posePipeline.enabled);
+blankBtn.onclick = () => blank.toggle();
+resSelect.onchange = () => setResolution(resSelect.value);
 
 // ---------------------------------------------------------------------------
 // Recovery. Backgrounding the browser can cost us the camera, the recorder and
@@ -451,23 +590,18 @@ document.addEventListener('visibilitychange', async () => {
     clockSync,
     onState: sendClientState,
   });
-  // On unless explicitly turned off — the room features are the point.
-  let poseWanted = true;
-  try {
-    poseWanted = localStorage.getItem('streamer-pose-enabled') !== '0';
-  } catch {
-    // Storage unavailable — default on.
-  }
-  if (poseWanted) {
-    poseBtn.classList.add('active');
-    // Loads opencv.js in the background; detection starts once frames flow.
-    posePipeline.setEnabled(true).catch((err) => {
-      poseBtn.classList.remove('active');
-      setStatus(`marker tracking failed: ${err.message}`);
-    });
-  }
+  const d = await device;
+  // On unless this device is on record as having turned it off — the room
+  // features are the point. Loads opencv.js in the background; detection starts
+  // once frames flow, so this is deliberately not awaited.
+  if (d.settings?.pose !== false) setPose(true);
   if (!(await ensureCamera())) return;
   keepAwake();
   ensureRecorder();
   if (viewerWaiting) await startCall();
+  // Camera labels are only readable once camera permission has been granted, so
+  // the fingerprint stored before the camera opened is weaker than the one
+  // available now. Re-announcing strengthens the *next* recovery, which is the
+  // one that will need it.
+  d.refresh();
 })();
