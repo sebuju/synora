@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Synora landmark probe</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; font: 13px/1.45 system-ui, sans-serif;
+    background: #14161a; color: #dfe3e8;
+    display: grid; grid-template-columns: minmax(0, 1fr) 380px; height: 100vh;
+  }
+  #stage { position: relative; overflow: auto; background: #0b0d10; }
+  #view { display: block; max-width: 100%; cursor: crosshair; }
+  #side { border-left: 1px solid #2a2f37; padding: 12px; overflow: auto; }
+  h2 { font-size: 13px; margin: 16px 0 6px; color: #8fa4bd; text-transform: uppercase; letter-spacing: .06em; }
+  h2:first-child { margin-top: 0; }
+  label { display: block; margin: 4px 0; }
+  input[type=file] { width: 100%; font-size: 12px; }
+  button { font: inherit; padding: 4px 9px; margin: 2px 2px 2px 0;
+    background: #232833; color: #dfe3e8; border: 1px solid #39404d; border-radius: 4px; cursor: pointer; }
+  button:hover { background: #2c323f; }
+  button.on { background: #2d5c8a; border-color: #3d78b0; }
+  #status { white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 11px; color: #9fb0c4; }
+  #out { white-space: pre; font-family: ui-monospace, monospace; font-size: 11px;
+    background: #0b0d10; border: 1px solid #2a2f37; border-radius: 4px; padding: 8px; overflow-x: auto; }
+  .row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .lm { display: flex; gap: 6px; align-items: center; margin: 2px 0; }
+  .lm span { flex: 1; }
+  .muted { color: #6f7d8f; }
+  input[type=text], input[type=number] {
+    background: #0b0d10; color: #dfe3e8; border: 1px solid #39404d;
+    border-radius: 4px; padding: 3px 5px; font: inherit; }
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <canvas id="view"></canvas>
+</div>
+
+<div id="side">
+  <h2>1 · Load</h2>
+  <label>pose journal (.pose.jsonl)<input type="file" id="fJournal" accept=".jsonl"></label>
+  <label>marker map (markers.json)<input type="file" id="fMap" accept=".json"></label>
+  <label>frames (select every .jpg at once)<input type="file" id="fFrames" accept="image/*" multiple></label>
+  <div id="status">no files loaded</div>
+
+  <h2>2 · Frame</h2>
+  <div class="row">
+    <button id="bPrev">&lt;&lt; -10</button>
+    <button id="bBack">&lt; -1</button>
+    <button id="bFwd">+1 &gt;</button>
+    <button id="bNext">+10 &gt;&gt;</button>
+  </div>
+  <div class="row">
+    <span class="muted">step</span><input type="number" id="step" value="1" step="1" min="1" style="width:70px">
+    <span class="muted">frames ·</span><span id="tNow" class="muted">–</span>
+  </div>
+  <div class="row"><button id="bSolve">re-detect this frame</button></div>
+
+  <h2>3 · Landmarks</h2>
+  <div class="row">
+    <input type="text" id="lmName" placeholder="name, e.g. frame-TL" style="flex:1">
+    <button id="bAddLm">add</button>
+  </div>
+  <div id="lmList"></div>
+  <div class="row"><label><input type="checkbox" id="autoStep" checked> advance after click</label></div>
+
+  <h2>4 · Auto-collect</h2>
+  <div class="row">
+    <button id="bAuto">collect anchors automatically</button>
+    <button id="bM3">M3 · localize without tags</button>
+  </div>
+  <div class="row">
+    <span class="muted">min sightings</span><input type="number" id="minObs" value="12" min="4" style="width:60px">
+    <span class="muted">min arc°</span><input type="number" id="minArc" value="60" min="10" style="width:60px">
+  </div>
+  <div class="row">
+    <button id="bSaveMap">save anchor map</button>
+    <button id="bM6">M6 · relocalize</button>
+  </div>
+  <label>anchor map from another session<input type="file" id="fAnchors" accept=".json"></label>
+
+  <h2>5 · Measure</h2>
+  <div class="row">
+    <button id="bCompute">compute M1 / M2</button>
+    <button id="bExport">export labels</button>
+    <label style="margin:0"><input type="file" id="fLabels" accept=".json" style="width:150px"></label>
+  </div>
+  <div id="out">–</div>
+</div>
+
+<script src="/pose-math.js"></script>
+<script src="/cv-common.js"></script>
+<script src="/detect-core.js"></script>
+<script src="/probe.js"></script>
+</body>
+</html>
