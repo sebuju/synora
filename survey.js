@@ -12,7 +12,7 @@
 const fs = require('fs');
 const path = require('path');
 const {
-  quatAngleDeg, quatMean, quatNudge, se3FromRvecTvec, se3Compose, se3Invert,
+  quatAngleDeg, quatMean, quatMedian, quatNudge, se3FromRvecTvec, se3Compose, se3Invert,
   se3Identity, quatFromRvec, quatRotate, quatMul, quatConj, transformPoint,
 } = require('./public/pose-math.js');
 
@@ -426,6 +426,12 @@ function createSurvey({ file, markerSizeM, log }) {
   // clientId -> the session id whose camera model was already logged, so the
   // 10 Hz pose path logs it once per session rather than on every report.
   const loggedIntrinsics = new Map();
+  // clientId -> the camera-model provenance last logged for it. Logged on change
+  // rather than once, because it changes mid-session: a resolution switch or a
+  // camera switch re-resolves the model and can drop it to a derived tier.
+  // Without this a map polluted by a client working from a guessed or rotated
+  // model is undiagnosable after the fact — the map file records no such thing.
+  const loggedModel = new Map();
   let lastSeenLog = 0;
   // How long after a confirming tag sighting the alignment is still good
   // enough to survey new tags against.
@@ -537,10 +543,13 @@ function createSurvey({ file, markerSizeM, log }) {
     const ring = candidates.get(id);
     if (ring.length < PROMOTE_MIN_ESTIMATES) return false;
     // Agreement with the component-wise median throws out estimates from bad
-    // camera fixes without needing to know which fix was bad.
+    // camera fixes without needing to know which fix was bad. Orientation gets
+    // the same robust treatment as position: a mean reference cannot reject
+    // outliers it has itself been pulled toward, which is how a minority of
+    // mirror-flipped sightings used to set the stored orientation degrees off.
     const med = {
       p: [0, 1, 2].map((k) => median(ring.map((e) => e.p[k]))),
-      q: quatMean(ring.map((e) => e.q)),
+      q: quatMedian(ring.map((e) => e.q), OUTLIER_ANGLE_DEG),
     };
     const inliers = ring.filter((e) =>
       Math.hypot(e.p[0] - med.p[0], e.p[1] - med.p[1], e.p[2] - med.p[2]) <= OUTLIER_POS_M &&
@@ -565,7 +574,10 @@ function createSurvey({ file, markerSizeM, log }) {
 
     const p = [0, 1, 2].map((k) =>
       inliers.reduce((a, e) => a + e.p[k], 0) / inliers.length);
-    markers.set(id, { pose: { p, q: quatMean(inliers.map((e) => e.q)) }, nObs: inliers.length });
+    markers.set(id, {
+      pose: { p, q: quatMedian(inliers.map((e) => e.q), OUTLIER_ANGLE_DEG) },
+      nObs: inliers.length,
+    });
     candidates.delete(id);
     clearStreaks(id);
     log(`Marker ${id} surveyed at ${fmtP(p)} ` +
@@ -574,14 +586,50 @@ function createSurvey({ file, markerSizeM, log }) {
     return true;
   }
 
+  // How the client's camera model was arrived at, on both pose paths. `guess`
+  // is refused the map outright; the derived tiers are allowed but recorded,
+  // since a rotated or rescaled model is the difference between a map that is
+  // right and one that is consistently a couple of centimetres out.
+  function logModelSource(clientId, msg) {
+    const src = msg.source ?? (msg.calibrated === false ? 'guess' : 'unreported');
+    const scale = Number.isFinite(msg.scale) && Math.abs(msg.scale - 1) > 1e-6
+      ? ` scaled x${msg.scale.toFixed(2)}`
+      : '';
+    const desc = `${src}${scale}${msg.from ? ` from ${msg.from}` : ''}`
+      + `${msg.w && msg.h ? ` at ${msg.w}x${msg.h}` : ''}`;
+    if (loggedModel.get(clientId) === desc) return;
+    loggedModel.set(clientId, desc);
+    log(`Client ${clientId} camera model: ${desc}`
+      + (src === 'guess'
+        ? ' — refused the survey: a ~5% scale error would be permanent in markers.json'
+        : ''));
+  }
+
   // Adopting the room origin. Both client kinds need it and neither can do
   // anything at all before it has happened.
   let anchorRejectAt = 0;
 
-  function bootstrapAnchor(obs) {
+  // `modelSource` gates this for the same reason maintainSurvey is gated, and it
+  // matters most here: the anchor is the datum everything else is measured
+  // against, and nothing ever detects that it is wrong. A client running on the
+  // FOV guess must not be the one to define it.
+  function bootstrapAnchor(obs, modelSource = undefined) {
     if (anchorId !== null) return false;
-    const seed = obs.find((o) => o.err <= ANCHOR_MAX_ERR_PX && o.dist <= ANCHOR_MAX_DIST_M &&
+    if (modelSource === 'guess') return false;
+    const clean = obs.filter((o) => o.err <= ANCHOR_MAX_ERR_PX && o.dist <= ANCHOR_MAX_DIST_M &&
       surveyGrade(o));
+    // The anchor's orientation *is* the room frame, and nothing downstream ever
+    // detects that the datum is wrong — so it must not be founded on a sighting
+    // whose mirror is still plausible. A sighting with only one solution has no
+    // ambiguity left to get wrong; prefer those, and fall back to an ambiguous
+    // one only when nothing else is on offer rather than refusing to start.
+    const seed = clean.find((o) => o.sols.length === 1) ?? clean[0];
+    if (seed && seed.sols.length > 1) {
+      log(`Marker ${seed.id} anchoring from an ambiguous sighting — its mirror `
+        + `reprojects within ${(seed.sols[1].err - seed.sols[0].err).toFixed(2)} px. `
+        + 'If the room frame comes out tilted, remove the anchor and re-seed it '
+        + 'from a large, square-on tag.');
+    }
     if (!seed) {
       // Without this an empty map is silent: tags are seen, rejected for being
       // a fraction over a gate, and the dashboard simply shows nothing with no
@@ -602,6 +650,22 @@ function createSurvey({ file, markerSizeM, log }) {
     return true;
   }
 
+  // Of a tag's candidate PnP solutions, the room-pose estimate that agrees best
+  // with the estimates already gathered for it. Position is deliberately not
+  // part of the score: the mirror ambiguity is almost entirely an orientation
+  // difference, and the two solutions' translations can be close enough that
+  // including them just dilutes the signal.
+  function bestAgreeingEstimate(o, pose, ring) {
+    const ref = quatMedian(ring.map((e) => e.q), OUTLIER_ANGLE_DEG);
+    let best = null;
+    for (const s of o.sols) {
+      const est = se3Compose(pose, s.camTag);
+      const score = quatAngleDeg(est.q, ref);
+      if (!best || score < best.score) best = { score, est };
+    }
+    return best.est;
+  }
+
   // Every unknown tag seen from a solid fix contributes one room-pose estimate;
   // enough consistent estimates promote it into the map.
   // `needKnownTag` is what separates the two client kinds. Without ARCore the
@@ -610,7 +674,18 @@ function createSurvey({ file, markerSizeM, log }) {
   // where it is continuously, so requiring a second tag in the same frame just
   // makes the tag you are standing next to unsurveyable — which is exactly
   // what it did.
-  function maintainSurvey(pose, obs, needKnownTag = true, clientId = undefined) {
+  //
+  // `modelSource` is the client's camera-model provenance. A client running on
+  // the FOV guess is out by ~5% in scale, and the map is the one thing here that
+  // outlives the session: baking that into markers.json is permanent, while a
+  // wrong live pose is gone next frame. So a guessed client is still localized
+  // against the map, it just may not shape it. The gate lives here rather than
+  // at the two call sites because splitting survey maintenance across the
+  // /client and XR paths is how the refine half came to be missing on one of
+  // them.
+  function maintainSurvey(pose, obs, needKnownTag = true, clientId = undefined,
+    modelSource = undefined) {
+    if (modelSource === 'guess') return false;
     const known = obs.filter((o) => markers.has(o.id));
     if (needKnownTag) {
       const strong = known.filter((o) => o.err <= GOOD_MAX_ERR_PX && o.dist <= GOOD_MAX_DIST_M);
@@ -625,9 +700,18 @@ function createSurvey({ file, markerSizeM, log }) {
       // so a tag too small to solve produces a bad estimate however good the
       // fix was. Recording it only buries the good estimates in noise.
       if (!surveyGrade(o)) continue;
-      const est = se3Compose(pose, o.camTag);
       let ring = candidates.get(o.id);
       if (!ring) candidates.set(o.id, (ring = []));
+      // pickSolutions cannot help here: it resolves the mirror by asking where
+      // the tag's *mapped* pose puts the camera, and this tag has no mapped pose
+      // yet. Its own accumulated estimates are the reference instead — a tag on a
+      // wall has one room pose, so the solution agreeing with the estimates
+      // already collected is the one to record. Without this the extend path took
+      // whichever branch reprojected marginally better and left tryPromote's
+      // median to out-vote the flips, which works but wastes the ring on them.
+      const est = ring.length >= 3
+        ? bestAgreeingEstimate(o, pose, ring)
+        : se3Compose(pose, o.camTag);
       ring.push(est);
       if (ring.length > CANDIDATE_RING) ring.shift();
       if (tryPromote(o.id)) changed = true;
@@ -809,7 +893,8 @@ function createSurvey({ file, markerSizeM, log }) {
 
     // One XR pose report: the camera's pose in the session frame, plus any
     // tags visible in that same frame. Returns the room-frame pose.
-    alignXr(clientId, xr, tags, sessionId = null, intrinsics = null) {
+    alignXr(clientId, xr, tags, sessionId = null, intrinsics = null,
+      modelSource = undefined) {
       const xrT = { p: xr.p, q: xr.q };
       let prev = xrAlign.get(clientId);
       // An alignment describes one ARCore session's frame, whose origin is
@@ -897,7 +982,7 @@ function createSurvey({ file, markerSizeM, log }) {
       // Without this an XR client can never start a survey, and once the map
       // is emptied it can never recover one either — it consumes markers but
       // had no way to create them.
-      let mapChanged = bootstrapAnchor(obs);
+      let mapChanged = bootstrapAnchor(obs, modelSource);
       const known = obs.filter((o) => markers.has(o.id));
       // ARCore's own pose, mapped through the current alignment, is a far
       // better mirror reference than anything the tag path can produce on its
@@ -1013,7 +1098,7 @@ function createSurvey({ file, markerSizeM, log }) {
       }
       const alignFresh = A && Date.now() - A.at < ALIGN_FRESH_MS;
       const extPose = camRoom || (alignFresh ? roomPose : null);
-      if (extPose && maintainSurvey(extPose, obs, false, clientId)) mapChanged = true;
+      if (extPose && maintainSurvey(extPose, obs, false, clientId, modelSource)) mapChanged = true;
       if (!A) return { pose: null, quality: 'unaligned', mapChanged };
       return {
         pose: roomPose,
@@ -1031,13 +1116,17 @@ function createSurvey({ file, markerSizeM, log }) {
     // null; mapChanged says the marker map gained/moved a tag.
     handlePose(msg, clientId) {
       let mapChanged = false;
+      // Only this path resolves intrinsics through the stored-calibration ladder,
+      // so only this one has a tier worth reporting. The XR path derives its
+      // model from the projection matrix and logs that model in full below.
+      logModelSource(clientId, msg);
       const obs = buildObs(msg.tags);
 
       // Bootstrap: adopt the first clean look at any tag as the room origin.
       // Shared with the XR path — this was a second inline copy of the same
       // gate, which is how one of them can end up with a quality check the
       // other does not have.
-      if (bootstrapAnchor(obs)) mapChanged = true;
+      if (bootstrapAnchor(obs, msg.source)) mapChanged = true;
 
       const known = obs.filter((o) => markers.has(o.id));
       const prev = clientId !== undefined ? lastFix.get(clientId) : undefined;
@@ -1083,7 +1172,7 @@ function createSurvey({ file, markerSizeM, log }) {
       if (pose) {
         const strong = known.filter(
           (o) => o.err <= GOOD_MAX_ERR_PX && o.dist <= GOOD_MAX_DIST_M);
-        if (maintainSurvey(pose, obs, true, clientId)) mapChanged = true;
+        if (maintainSurvey(pose, obs, true, clientId, msg.source)) mapChanged = true;
 
         return {
           pose: smoothed,

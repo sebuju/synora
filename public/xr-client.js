@@ -142,6 +142,14 @@ function intrinsicsFromProjection(proj, w, h, viewport) {
     dist: [0, 0, 0, 0, 0],   // ARCore hands back an undistorted image
     w,
     h,
+    // Not a ChArUco fit and not the FOV guess either: a derivation from the
+    // frustum ARCore is already rendering with, at the camera image's own
+    // resolution. It never goes through the stored-calibration ladder, so it has
+    // no rotated or rescaled tier to be in.
+    source: 'xr',
+    scale: 1,
+    from: null,
+    calibrated: true,
     // The derivation's own inputs travel with it. cx/cy alone cannot be
     // checked: a principal point 10% off centre is either a real lens or this
     // projection describing the display rather than the camera, and only
@@ -370,8 +378,8 @@ async function detectAndReport(view, pose, viewport) {
   // separate server state, so flipping between them mid-session costs nothing —
   // the XR alignment is keyed by session id and picks up where it left off.
   signaling.send(pose
-    ? { type: 'xr-pose', sid: sessionId, xr: cvPose(pose.transform), ...common }
-    : { type: 'pose', calibrated: true, ...common });
+    ? { type: 'xr-pose', sid: sessionId, xr: cvPose(pose.transform), source: 'xr', ...common }
+    : { type: 'pose', calibrated: true, source: 'xr', ...common });
 }
 
 startBtn.onclick = start;

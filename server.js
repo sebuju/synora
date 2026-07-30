@@ -609,7 +609,8 @@ function handleSignal(ws, msg) {
       // ARCore already knows where the camera is; the tags only say where the
       // room is relative to ARCore's frame.
       const { pose, quality, mapChanged, jitter } =
-        survey.alignXr(ws.clientId, msg.xr, msg.tags || [], msg.sid ?? null, msg.intrinsics);
+        survey.alignXr(ws.clientId, msg.xr, msg.tags || [], msg.sid ?? null, msg.intrinsics,
+          msg.source);
       journalPose(ws, { kind: 'xr-pose', at: Date.now(), msg, room: { pose, quality, jitter }, mapChanged });
       send(viewerSocket, {
         ...msg, type: 'pose', clientId: ws.clientId, room: { pose, quality, jitter } });
