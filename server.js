@@ -8,6 +8,7 @@ const { spawn, spawnSync } = require('child_process');
 const { WebSocketServer } = require('ws');
 const qrcode = require('qrcode-terminal');
 const { createSurvey } = require('./survey.js');
+const { createDeviceRegistry, modelFromUa } = require('./devices.js');
 
 const PORT = Number(process.env.PORT) || 8443;
 const CERT_DIR = path.join(__dirname, 'certs');
@@ -21,6 +22,7 @@ const VCAM_HEIGHT = 720;
 const VCAM_FPS = 30;
 const VENDOR_DIR = path.join(PUBLIC_DIR, 'vendor');
 const MARKER_MAP_FILE = path.join(__dirname, 'markers.json');
+const DEVICES_FILE = path.join(__dirname, 'devices.json');
 const POSE_SETTINGS_FILE = path.join(__dirname, 'pose-settings.json');
 const LOG_FILE = path.join(__dirname, 'server.log');
 // Physical marker edge length in meters — the outer edge of the black square,
@@ -127,38 +129,141 @@ const MIME = {
   '.wasm': 'application/wasm',
 };
 
-function serveStatic(req, res) {
-  let urlPath = req.url.split('?')[0];
-  // /markers is a plain page with no socket of its own, so the marker size it
-  // sets and renders at rides a small JSON route rather than the WS protocol.
-  if (urlPath === '/api/pose-config') {
-    if (req.method === 'GET') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ markerSizeM: POSE_CONFIG.markerSizeM }));
+function sendJson(res, status, body) {
+  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(body));
+}
+
+// Calibration payloads are the largest thing that comes back this way: a
+// handful of small records, nowhere near this.
+const JSON_BODY_LIMIT = 64 * 1024;
+
+function readJson(req, res, then) {
+  let body = '';
+  let over = false;
+  req.on('data', (c) => {
+    body += c;
+    if (body.length > JSON_BODY_LIMIT) {
+      over = true;
+      req.destroy();
+    }
+  });
+  req.on('end', () => {
+    if (over) return;
+    let parsed;
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      sendJson(res, 400, { ok: false, error: 'bad JSON' });
       return;
     }
-    if (req.method === 'POST') {
-      let body = '';
-      req.on('data', (c) => {
-        body += c;
-        if (body.length > 1024) req.destroy();
-      });
-      req.on('end', () => {
+    then(parsed);
+  });
+}
+
+// Small JSON routes, for the pages that have no WebSocket of their own
+// (/markers, /calibrate) and for the one exchange that has to happen before a
+// page knows which client it even is. Returns true when it handled the request.
+function serveApi(req, res, urlPath) {
+  if (!urlPath.startsWith('/api/')) return false;
+
+  // /markers is a plain page, and the marker size it sets and renders at is the
+  // room's only metric datum — so it rides a route rather than the WS protocol.
+  if (urlPath === '/api/pose-config') {
+    if (req.method === 'GET') {
+      sendJson(res, 200, { markerSizeM: POSE_CONFIG.markerSizeM });
+    } else if (req.method === 'POST') {
+      readJson(req, res, (body) => {
         let out;
         try {
-          out = applyMarkerSize(Number(JSON.parse(body).markerSizeM));
+          out = applyMarkerSize(Number(body.markerSizeM));
         } catch (err) {
           out = { ok: false, error: err.message };
         }
-        res.writeHead(out.ok ? 200 : 400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(out));
+        sendJson(res, out.ok ? 200 : 400, out);
       });
-      return;
+    } else {
+      sendJson(res, 405, { ok: false, error: 'method not allowed' });
     }
-    res.writeHead(405);
-    res.end('Method not allowed');
-    return;
+    return true;
   }
+
+  // The device model is parsed out of the user agent here rather than on the
+  // page, so there is one parser and a stored fingerprint is always comparable
+  // with a fresh one. The browser and OS versions are deliberately left out —
+  // they change on their own every few weeks and would walk a device out of
+  // matching range of its own record.
+  const withModel = (fingerprint) => (fingerprint
+    ? { ...fingerprint, model: modelFromUa(req.headers['user-agent']) }
+    : null);
+
+  // Everything a device has ever been told about itself. Fetched before the
+  // camera is opened, because the size and lens it opens with come from here.
+  if (urlPath === '/api/device/hello' && req.method === 'POST') {
+    readJson(req, res, (body) => {
+      const rec = registry.touch(body.deviceId, {
+        userAgent: req.headers['user-agent'],
+        fingerprint: withModel(body.fingerprint),
+      });
+      if (!rec) {
+        sendJson(res, 400, { ok: false, error: 'no deviceId' });
+        return;
+      }
+      sendJson(res, 200, {
+        ok: true,
+        device: {
+          id: rec.id, name: rec.name, settings: rec.settings, intrinsics: rec.intrinsics,
+        },
+      });
+    });
+    return true;
+  }
+
+  // A browser that has lost its id asking who it used to be. Answers with an
+  // id to adopt only when the fingerprint picks one device out unambiguously;
+  // otherwise with the candidates, for a person to choose between.
+  if (urlPath === '/api/device/match' && req.method === 'POST') {
+    readJson(req, res, (body) => {
+      const out = registry.match(withModel(body.fingerprint));
+      // Logged because it is otherwise invisible and it is the mechanism that
+      // decides whether a device keeps its calibration: a browser that turned
+      // up blank and walked away with a fresh id looks exactly like a browser
+      // that was always new.
+      const best = out.candidates[0];
+      log(`Device match: ${out.adopt ? `adopt ${out.adopt.slice(0, 8)}` : 'no adoption'}`
+        + ` (${out.candidates.length} candidate(s)`
+        + `${best ? `, best ${best.name} at ${Math.round(best.score * 100)}%` : ''})`);
+      sendJson(res, 200, { ok: true, ...out });
+    });
+    return true;
+  }
+
+  if (urlPath === '/api/devices' && req.method === 'GET') {
+    sendJson(res, 200, { ok: true, devices: registry.list() });
+    return true;
+  }
+
+  // Calibration, from /calibrate. Merged rather than replaced — a device
+  // calibrated at several resolutions has a record per resolution.
+  if (urlPath === '/api/device/intrinsics' && req.method === 'POST') {
+    readJson(req, res, (body) => {
+      if (!registry.has(body.deviceId)) {
+        sendJson(res, 404, { ok: false, error: 'unknown device' });
+        return;
+      }
+      const n = registry.mergeIntrinsics(body.deviceId, body.intrinsics);
+      sendJson(res, 200, { ok: true, stored: n });
+    });
+    return true;
+  }
+
+  sendJson(res, 404, { ok: false, error: 'no such route' });
+  return true;
+}
+
+function serveStatic(req, res) {
+  let urlPath = req.url.split('?')[0];
+  if (serveApi(req, res, urlPath)) return;
   if (urlPath === '/') urlPath = '/index.html';
   // Legacy path — printed QR codes and bookmarks from before the rename.
   if (urlPath === '/phone') {
@@ -237,13 +342,20 @@ function log(msg) {
   logStream.write(`${line}\n`);
 }
 
+function onOff(v) {
+  return v === undefined ? '?' : v ? 'on' : 'off';
+}
+
 // Roster of connected clients, printed whenever it changes. Settings come from
 // the clients themselves (see client-state), so they read '?' until reported.
 const CLIENT_COLUMNS = [
   ['id', (id) => String(id)],
+  ['kind', (id, s) => s.kind || '?'],
   ['resolution', (id, s) => s.res || '?'],
-  ['mic', (id, s) => (s.mic === undefined ? '?' : s.mic ? 'on' : 'off')],
-  ['pose', (id, s) => (s.pose === undefined ? '?' : s.pose ? 'on' : 'off')],
+  ['mic', (id, s) => onOff(s.mic)],
+  ['pose', (id, s) => onOff(s.pose)],
+  ['paused', (id, s) => onOff(s.paused)],
+  ['blank', (id, s) => onOff(s.blank)],
 ];
 const CLIENT_COL_WIDTH = 12;
 
@@ -268,6 +380,34 @@ function logClients() {
   }
 }
 
+// The roster as the dashboard needs it. A client only gets a video tile there
+// once a peer connection is up, and the XR client never opens one at all — so
+// before this, a positioning client was invisible on the dashboard even though
+// the server had it listed the whole time. Everything the dashboard can control
+// is in here, and the controls render from this rather than from what they last
+// asked for: an optimistic button lies whenever the client refuses.
+function clientList() {
+  return [...clients.keys()].sort((a, b) => a - b).map((id) => {
+    const ws = clients.get(id);
+    return {
+      clientId: id,
+      ...(ws.clientState || {}),
+      // The registry's name, not the socket's: it is the device that is named,
+      // and the same device keeps that name across reconnects and client ids.
+      name: registry.get(ws.deviceId)?.name || null,
+      connectedAt: ws.connectedAt,
+      recording: ws.recordingStream
+        ? { name: path.basename(ws.recordingPath), bytes: ws.recordingBytes }
+        : null,
+      vcam: id === vcamClientId,
+    };
+  });
+}
+
+function sendClients() {
+  send(viewerSocket, { type: 'client-list', clients: clientList() });
+}
+
 function closeRecording(ws) {
   if (!ws.recordingStream) return;
   ws.recordingStream.end();
@@ -275,6 +415,7 @@ function closeRecording(ws) {
   log(`Recording saved: ${path.relative(__dirname, ws.recordingPath)} (${mb} MB)`);
   ws.recordingStream = null;
   ws.recordingPath = null;
+  sendClients();
 }
 
 function openRecording(ws) {
@@ -285,6 +426,7 @@ function openRecording(ws) {
   ws.recordingStream = fs.createWriteStream(ws.recordingPath);
   ws.recordingBytes = 0;
   log(`Recording started: ${path.relative(__dirname, ws.recordingPath)}`);
+  sendClients();
 }
 
 // Pose journal: every observation the survey consumes, kept so a session can be
@@ -372,6 +514,12 @@ const survey = createSurvey({
   log,
 });
 
+// Per-device state that has to outlive the browser holding it: capture settings
+// and, above all, camera calibration. The browser keeps only its id. See
+// devices.js for why, and for how a browser that has lost even that gets its
+// identity back.
+const registry = createDeviceRegistry({ file: DEVICES_FILE, log });
+
 // Changing the marker size rescales the room, so the survey goes with it:
 // every tag position was measured in the old scale and a mixture of the two is
 // worse than either.
@@ -441,6 +589,7 @@ function stopVcam() {
     vcamClientId = null;
   }
   send(viewerSocket, { type: 'vcam-state', clientId: null });
+  sendClients();
 }
 
 function startVcam(clientId) {
@@ -476,6 +625,7 @@ function startVcam(clientId) {
   send(client, { type: 'restart-recorder' });
   log(`Virtual cam feed: client ${clientId}`);
   send(viewerSocket, { type: 'vcam-state', clientId });
+  sendClients();
 }
 
 function clientIdFor(deviceId) {
@@ -494,12 +644,17 @@ function handleSignal(ws, msg) {
       // Kept as well as the clientId: depth calibration is a property of the
       // physical camera, so it outlives the session-scoped small integer.
       ws.deviceId = msg.deviceId;
+      ws.connectedAt = Date.now();
+      // The page has normally introduced itself over /api/device/hello already;
+      // this refreshes last-seen, and covers a client whose hello never landed.
+      registry.touch(ws.deviceId);
       // A reload can land the new socket before the old one's close fires, so
       // retire whatever socket still holds the id — only one owns it.
       const prev = clients.get(ws.clientId);
       if (prev && prev !== ws) prev.close();
       clients.set(ws.clientId, ws);
       log(`Client ${ws.clientId} connected (${clients.size} total)`);
+      sendClients();
       // The webcam feed was bound to the socket that just went away; the new
       // one starts a fresh WebM stream, which needs a fresh ffmpeg.
       if (ws.clientId === vcamClientId) startVcam(ws.clientId);
@@ -528,14 +683,70 @@ function handleSignal(ws, msg) {
       if (!vcamDeviceId) detectVcam();
       send(ws, { type: 'vcam-state', clientId: vcamClientId, available: !!vcamDeviceId });
       send(ws, { type: 'marker-map', ...survey.getMarkerMap() });
+      sendClients();
       for (const client of clients.values()) send(client, { type: 'viewer-ready' });
     }
     return;
   }
   if (msg.type === 'client-state') {
     if (ws.role === 'client') {
-      ws.clientState = { res: msg.res, mic: !!msg.mic, pose: !!msg.pose };
+      // Copied field by field rather than spread: this object is echoed to the
+      // dashboard, and a client should not be able to put arbitrary keys in it.
+      ws.clientState = {
+        kind: msg.kind === 'xr' ? 'xr' : 'client',
+        res: msg.res,
+        // What the camera actually delivered, which `ideal` constraints let
+        // differ from what was asked for.
+        capture: msg.capture && msg.capture.w && msg.capture.h
+          ? { w: msg.capture.w, h: msg.capture.h } : null,
+        facing: msg.facing === 'user' ? 'user' : msg.facing === 'environment' ? 'environment' : null,
+        mic: !!msg.mic,
+        pose: !!msg.pose,
+        paused: !!msg.paused,
+        blank: !!msg.blank,
+        // XR only: whether the AR session is actually running.
+        session: msg.session === undefined ? null : !!msg.session,
+      };
+      // The XR client shares a browser, and therefore a deviceId, with /client
+      // on the same phone. It has no mic, no recorder and no resolution to
+      // choose, so storing what it reports would overwrite the settings the
+      // capture client on that same phone actually uses. Only a capture
+      // client's settings are persisted.
+      if (ws.clientState.kind === 'client') {
+        registry.setSettings(ws.deviceId, {
+          res: ws.clientState.res,
+          mic: ws.clientState.mic,
+          facing: ws.clientState.facing,
+          pose: ws.clientState.pose,
+        });
+      }
       logClients();
+      sendClients();
+    }
+    return;
+  }
+  // Naming a device is naming the hardware, not the connection: the name has to
+  // outlive both the client id and the browser, so it lives in the registry.
+  if (msg.type === 'device-rename') {
+    if (ws.role === 'viewer') {
+      const target = clients.get(msg.clientId);
+      if (target?.deviceId) {
+        log(`Client ${msg.clientId} named "${registry.rename(target.deviceId, msg.name)}"`);
+        sendClients();
+      }
+    }
+    return;
+  }
+  // Remote control from the dashboard. The client owns the behaviour — this is
+  // only routing — and the action lands in the same setter the client's own
+  // button calls, so the two surfaces cannot diverge.
+  if (msg.type === 'control') {
+    if (ws.role === 'viewer') {
+      const target = clients.get(msg.clientId);
+      if (target) {
+        send(target, { type: 'control', action: msg.action, value: msg.value });
+        log(`Control -> client ${msg.clientId}: ${msg.action}=${JSON.stringify(msg.value)}`);
+      }
     }
     return;
   }
@@ -659,6 +870,7 @@ function main() {
   detectVcam();
   probeAssets();
   survey.load();
+  registry.load();
   const tls = loadOrCreateCert();
   const server = https.createServer(tls, serveStatic);
   const wss = new WebSocketServer({ server });
@@ -698,6 +910,7 @@ function main() {
         log(`Client ${ws.clientId} disconnected (${clients.size} total)`);
         logClients();
         send(viewerSocket, { type: 'client-gone', clientId: ws.clientId });
+        sendClients();
       } else if (ws === viewerSocket) {
         viewerSocket = null;
         log('Viewer disconnected');
@@ -706,6 +919,13 @@ function main() {
 
     ws.on('error', () => {});
   });
+
+  // The roster is pushed on every change, but the recording byte count only
+  // ever grows — it has no event to hang off, and a size that only moves when
+  // something else happens reads as a stalled recording.
+  setInterval(() => {
+    if (viewerSocket) sendClients();
+  }, 1000);
 
   server.listen(PORT, () => {
     const ips = lanAddresses();
