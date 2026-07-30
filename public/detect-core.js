@@ -323,9 +323,26 @@ function createDetectCore() {
           corners: [...cornerMat.data32F].map((v) => Math.round(v * 100) / 100),
           ...roundSol(sols[0]),
         };
-        // The runner-up only matters while it is plausible — a clearly worse
-        // reprojection is not an ambiguity worth the bytes.
-        if (sols[1] && sols[1].err < 8) tag.alt = roundSol(sols[1]);
+        // The runner-up ships only when solvePnPGeneric produced it. When that
+        // binding is missing the second solution is *reconstructed* by refining
+        // out of a mirrored guess (see solveTag), and that reconstruction does
+        // not hold up: measured against map accuracy rather than against how
+        // often the branches agree, shipping it makes the map worse at every
+        // threshold tried, because a spurious solution is one the server can
+        // pick. Six replayed sessions of one room, worst cross-session
+        // disagreement per tag, averaged:
+        //
+        //   twins shipped    none   <1.2x err  <1.5x   <2x    <5x    all
+        //   mean worst (m)   0.141  0.147      0.145   0.226  0.304  0.286
+        //
+        // There is no cut where it pays, so it is gated at the source rather
+        // than filtered downstream. A real IPPE pair from solvePnPGeneric is a
+        // different thing and still goes, which is also what makes this
+        // self-repairing if the binding ever appears. Note the earlier
+        // measurement that justified the reconstruction counted branch
+        // agreement, a proxy — it moved the opposite way to the map itself, so
+        // re-enable this only against a map measurement.
+        if (genericPnP && sols[1] && sols[1].err < 8) tag.alt = roundSol(sols[1]);
         tags.push(tag);
       } finally {
         cornerMat.delete();
