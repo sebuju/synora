@@ -33,6 +33,7 @@ let session = null;
 // began.
 let sessionId = null;
 let refSpace = null;
+let viewerSpace = null;
 let gl = null;
 let binding = null;
 let core = null;
@@ -51,6 +52,12 @@ let busy = false;
 // image size is the device's choice, not this page's, and every range figure
 // for tag detection is derived from it and from fx.
 let camInfo = null;
+// ARCore tracking loss. Held here rather than derived per frame because the
+// thing worth knowing is how long it has lasted, and a frame on its own cannot
+// say. Re-sent on a timer so the viewer can tell "still lost" from "gone".
+let trackingLostSince = 0;
+let lastLostPing = 0;
+const LOST_PING_MS = 1000;
 
 const signaling = connectSignaling('client', {
   onOpen() {
@@ -119,13 +126,28 @@ async function probe() {
 // own pixels. WebXR gives a projection, not a camera model; for ARCore the
 // camera image shares the view frustum, so the two are the same optics sampled
 // at a different resolution.
-function intrinsicsFromProjection(proj, w, h) {
+// The frame size travels with the model: a principal point means nothing
+// without the image it is a point in, and "is cx near w/2" is the one check
+// that says whether this derivation held. proj[8]/proj[9] are the frustum's
+// skew, which for a camera image should be ~0 — anything else is the *display*
+// frustum leaking in (ARCore skews it when the camera image aspect does not
+// match the screen), and a skew of 0.2 is 10% of the width of pointing error
+// that PnP will quietly absorb as tag orientation.
+function intrinsicsFromProjection(proj, w, h, viewport) {
   return {
     fx: proj[0] * w / 2,
     fy: proj[5] * h / 2,
     cx: w * (1 - proj[8]) / 2,
     cy: h * (1 + proj[9]) / 2,
     dist: [0, 0, 0, 0, 0],   // ARCore hands back an undistorted image
+    w,
+    h,
+    // The derivation's own inputs travel with it. cx/cy alone cannot be
+    // checked: a principal point 10% off centre is either a real lens or this
+    // projection describing the display rather than the camera, and only
+    // proj[8]/proj[9] and the two aspect ratios can tell those apart.
+    proj: [...proj].map((v) => Math.round(v * 1e6) / 1e6),
+    viewport: viewport ? [viewport.width, viewport.height] : null,
   };
 }
 
@@ -178,6 +200,15 @@ async function start() {
   binding = new XRWebGLBinding(session, gl);
   refSpace = await session.requestReferenceSpace('local-floor')
     .catch(() => session.requestReferenceSpace('local'));
+  // 'local'/'local-floor' are world-locked: locating the viewer in them is
+  // exactly what ARCore stops being able to do when tracking drops, which is
+  // why getViewerPose returns null. The 'viewer' space is defined relative to
+  // the device itself, so a pose in it needs no world tracking at all — and a
+  // pose is only wanted here for the views it carries, since the camera image
+  // and the projection matrix hang off XRView, not off knowing where the room
+  // is. Tags do not need ARCore: they are an independent, absolute fix, and
+  // /client localizes from them alone with no XR session anywhere.
+  viewerSpace = await session.requestReferenceSpace('viewer').catch(() => null);
 
   core = createDetectCore();
   await core.ensureReady();
@@ -204,24 +235,71 @@ function onFrame(t, frame) {
   gl.clearColor(0, 0, 0, 0);
   gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
+  // ARCore not tracking costs the room-frame *carry* between sightings, and
+  // nothing else. A tag in view is still an absolute fix, so detection keeps
+  // running off the device-relative 'viewer' space and the client falls back to
+  // reporting exactly what /client reports: tags, no XR pose, localized on the
+  // server from the marker map alone. Losing the inertial track is precisely
+  // when the tags matter most; stopping detection there had it backwards.
   const pose = frame.getViewerPose(refSpace);
+  const now = performance.now();
   if (!pose) {
-    overlayText.textContent = 'tracking lost';
+    if (!trackingLostSince) {
+      trackingLostSince = now;
+      lastLostPing = 0;
+    }
+    const lostMs = Math.round(now - trackingLostSince);
+    // On entry, then once a second: the viewer needs to keep hearing this to
+    // know the client is still there and still lost rather than gone.
+    if (!lastLostPing || now - lastLostPing >= LOST_PING_MS) {
+      lastLostPing = now;
+      signaling.send({ type: 'xr-tracking', lost: true, ms: lostMs });
+    }
+    const blind = viewerSpace && frame.getViewerPose(viewerSpace);
+    const blindView = blind && blind.views[0];
+    if (blindView && !busy && now - lastPose >= POSE_INTERVAL_MS) {
+      lastPose = now;
+      busy = true;
+      // No second argument: no world pose exists, and that is what switches the
+      // report to the tag-only message.
+      detectAndReport(blindView, null, viewportOf(layer, blindView))
+        .finally(() => { busy = false; });
+    }
+    overlayText.textContent = `TRACKING LOST — ${(lostMs / 1000).toFixed(1)}s\n`
+      + (blindView
+        ? 'Still reading tags — position comes from the marker map alone,\n'
+          + 'with no carry between sightings.\n'
+        : 'No camera image either: this device gives no view without a\n'
+          + 'world pose, so nothing can be detected.\n')
+      + 'Usually too close to a flat, featureless surface — back off\n'
+      + 'or point somewhere with more texture.\n'
+      + `tags ${lastTags.length ? lastTags.map((x) => x.id).join(' ') : 'none'}`;
     return;
   }
+  if (trackingLostSince) {
+    signaling.send({
+      type: 'xr-tracking', lost: false, ms: Math.round(now - trackingLostSince),
+    });
+    trackingLostSince = 0;
+  }
   const view = pose.views[0];
-  const now = performance.now();
   // Detection is far too expensive for every frame, and is a re-entrant
   // hazard — one at a time, on its own schedule.
   if (!busy && now - lastPose >= POSE_INTERVAL_MS) {
     lastPose = now;
     busy = true;
-    detectAndReport(view, pose).finally(() => { busy = false; });
+    // The viewport is the display the projection matrix was built for; it only
+    // matters as the thing the camera image's aspect gets compared against.
+    detectAndReport(view, pose, viewportOf(layer, view)).finally(() => { busy = false; });
   }
 
   const p = pose.transform.position;
   overlayText.textContent =
-    `xr ${p.x.toFixed(2)} ${p.y.toFixed(2)} ${p.z.toFixed(2)}\n` +
+    `xr ${p.x.toFixed(2)} ${p.y.toFixed(2)} ${p.z.toFixed(2)}`
+    // The step before tracking is lost outright: ARCore still has an
+    // orientation but is guessing the position. Poses taken here are worth
+    // little and it is the warning that the next frame may have none at all.
+    + `${pose.emulatedPosition ? ' · POSITION EMULATED' : ''}\n` +
     (camInfo ? `cam ${camInfo.w}x${camInfo.h} fx ${camInfo.fx.toFixed(0)}\n` : 'cam: no image yet\n') +
     // The size the detector is actually solving with, not the one the server
     // meant to send — the gap between those two is silent everywhere else.
@@ -237,17 +315,33 @@ function onFrame(t, frame) {
       ? `room ${roomPose.pose.p.map((v) => v.toFixed(2)).join(' ')} · ${roomPose.quality}`
       : 'room: not aligned yet — show it a known tag') +
     // Steadiness, both halves side by side. "phone" is ARCore's own movement
-    // over the window, "pose" is how far the reported room pose wandered over
-    // the same one. Bolt the phone down and phone should read ~0; whatever
-    // pose reads then is the fix's own noise, and the number any uncertainty
-    // circle in the viewer should be sized from.
+    // over the window; "fix" is how far the tag fix wandered underneath it,
+    // with that movement divided out, so the two are independent — walking
+    // moves the first and should leave the second alone. "fix" is the fix's own
+    // noise and the number the viewer's uncertainty circle is sized from.
     (roomPose?.jitter
-      ? `\nsteady: phone ${roomPose.jitter.movedMm} mm · pose ${roomPose.jitter.jitterMm} mm`
+      ? `\nsteady: phone ${roomPose.jitter.movedMm} mm · fix ${roomPose.jitter.jitterMm} mm`
       : '\nsteady: measuring…') +
     `\n${frames} frames`;
 }
 
-async function detectAndReport(view, pose) {
+// A view from the 'viewer' space is not part of the render state's view list,
+// so asking for its viewport can throw or come back null. The viewport is only
+// ever a diagnostic (the camera aspect is compared against it), so it is
+// optional by design and must never take the frame down with it.
+function viewportOf(layer, view) {
+  try {
+    return layer.getViewport(view) || null;
+  } catch {
+    return null;
+  }
+}
+
+// `pose` is the camera's pose in the XR session frame, or null when ARCore has
+// no world track. Null is not an error: it selects the tag-only report, the
+// same message /client sends, which the server localizes from the marker map
+// with no XR frame involved.
+async function detectAndReport(view, pose, viewport) {
   const camera = view.camera;
   if (!camera) return;
   const tex = binding.getCameraImage?.(camera);
@@ -255,23 +349,29 @@ async function detectAndReport(view, pose) {
   const image = readCameraImage(tex, camera.width, camera.height);
   if (!image) return;
 
-  const intr = intrinsicsFromProjection(view.projectionMatrix, camera.width, camera.height);
+  const intr = intrinsicsFromProjection(
+    view.projectionMatrix, camera.width, camera.height, viewport);
   camInfo = { w: camera.width, h: camera.height, fx: intr.fx };
   if (!core.hasIntrinsics(camera.width, camera.height)) {
     core.setIntrinsics(camera.width, camera.height, intr);
   }
   const res = await core.detect(lumaSource, image, camera.width, camera.height, performance.now());
   lastTags = res.tags;
-  signaling.send({
-    type: 'xr-pose',
+  const common = {
     t: clockSync.synced ? clockSync.at(performance.now()) : null,
-    sid: sessionId,
-    xr: cvPose(pose.transform),
     w: camera.width,
     h: camera.height,
     intrinsics: intr,
     tags: res.tags,
-  });
+  };
+  // With a world pose the server can tie ARCore's frame to the room and carry
+  // the position between sightings; without one it gets the observations on
+  // their own and solves them like any other client. The two message types are
+  // separate server state, so flipping between them mid-session costs nothing —
+  // the XR alignment is keyed by session id and picks up where it left off.
+  signaling.send(pose
+    ? { type: 'xr-pose', sid: sessionId, xr: cvPose(pose.transform), ...common }
+    : { type: 'pose', calibrated: true, ...common });
 }
 
 startBtn.onclick = start;
