@@ -12,7 +12,9 @@
 // of on the page. The page loads it only if this path is unavailable and the
 // fallback in pose.js has to take over.
 
-importScripts('/cv-common.js', '/detect-core.js');
+// pose-math.js for the rotation maths the mirror-ambiguity solve needs: it is
+// transform maths, so it belongs there rather than being copied in here.
+importScripts('/pose-math.js', '/cv-common.js', '/detect-core.js');
 
 const core = createDetectCore();
 
@@ -83,6 +85,9 @@ async function onFrame(frame) {
     w: fw,
     h: fh,
     calibrated: result.calibrated,
+    source: result.source,
+    scale: result.scale,
+    from: result.from,
     tags: result.tags,
     mode: result.mode,
     retried: !!result.retried,

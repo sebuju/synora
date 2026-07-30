@@ -59,8 +59,11 @@ function createDetectCore() {
   let distMat = null;
   let rvec = null;
   let tvec = null;
+  let rvecAlt = null;
+  let tvecAlt = null;
   let projected = null;
   let genericPnP = false;
+  let refineLM = false;
   let skipRejected = true;
 
   let markerSizeM = 0.15;
@@ -110,11 +113,28 @@ function createDetectCore() {
     return sum / 4;
   }
 
-  // Planar single-tag PnP (IPPE) has a two-fold mirror ambiguity, and the
-  // wrong pick teleports the camera. When the build exposes solvePnPGeneric,
-  // both solutions are returned (best reprojection first) so the server —
-  // which knows the marker map and the client's recent pose — can pick the
-  // consistent one instead of this side guessing blind.
+  // Two rotations must differ by more than the noise floor before the second is
+  // worth shipping as an ambiguity rather than as a duplicate.
+  const ALT_MIN_ANGLE_DEG = 5;
+
+  // Planar single-tag PnP (IPPE) has a two-fold mirror ambiguity, and the wrong
+  // pick teleports the camera. Both solutions have to reach the server, which
+  // knows the marker map and the client's recent pose and can pick the
+  // consistent one; this side cannot.
+  //
+  // solvePnPGeneric would hand both over directly, but the vendored build does
+  // not export it (the symbol is in the wasm, it is just not bound), so for a
+  // long time only one solution ever shipped, `alt` was never set, and
+  // pickSolutions short-circuited on every tag — the map was averaging whichever
+  // branch solvePnP happened to return. Measured on a real session: 12% of
+  // solves were the mirrored one, 27% for the worst tag, each a ~40 deg
+  // orientation error carrying a reprojection error under 1.3 px, so no gate saw
+  // them.
+  //
+  // The two solutions are the two local minima of the same reprojection error,
+  // so the second is reachable without solvePnPGeneric: start from the mirrored
+  // pose and let a local refine converge into that basin. That is what the
+  // refine below does.
   function solveTag(cornerMat) {
     if (genericPnP) {
       const rvecs = new cv.MatVector();
@@ -148,11 +168,55 @@ function createDetectCore() {
     const ok = cv.solvePnP(objPts, cornerMat, KMat, distMat, rvec, tvec,
       false, cv.SOLVEPNP_IPPE_SQUARE);
     if (!ok) return null;
-    return [{
+    const first = {
       rvec: [...rvec.data64F],
       tvec: [...tvec.data64F],
       err: meanReprojErr(cornerMat, rvec, tvec),
-    }];
+    };
+    const second = solveMirror(cornerMat, first);
+    const sols = second ? [first, second] : [first];
+    return sols.sort((a, b) => a.err - b.err);
+  }
+
+  // Refine each mirrored starting guess and keep the better one, provided it
+  // really is a different pose.
+  //
+  // Both guesses are always tried rather than stopping at the first that works:
+  // the in-plane-flipped one wins the great majority of the time, but measured
+  // over 3000 synthetic solves the other was the only viable second solution in
+  // ~3% of them. Cost is two 4-point local refines, measured at 0.21 ms per tag
+  // against 0.013 ms for the IPPE solve alone — a large multiple of a tiny
+  // number, and about 4 ms of CPU per second at three tags and 7 Hz, against a
+  // detection step that runs tens of ms at 4K.
+  function solveMirror(cornerMat, first) {
+    let best = null;
+    for (const guess of mirrorRvecGuesses(first.rvec, first.tvec)) {
+      rvecAlt.data64F.set(guess);
+      tvecAlt.data64F.set(first.tvec);
+      try {
+        if (refineLM) {
+          cv.solvePnPRefineLM(objPts, cornerMat, KMat, distMat, rvecAlt, tvecAlt);
+        } else if (!cv.solvePnP(objPts, cornerMat, KMat, distMat, rvecAlt, tvecAlt,
+          true, cv.SOLVEPNP_ITERATIVE)) {
+          continue;
+        }
+      } catch {
+        // A refine that will not run for one guess will not run for any of
+        // them; give up on the ambiguity rather than on the tag.
+        return null;
+      }
+      const cand = {
+        rvec: [...rvecAlt.data64F],
+        tvec: [...tvecAlt.data64F],
+        err: meanReprojErr(cornerMat, rvecAlt, tvecAlt),
+      };
+      if (!Number.isFinite(cand.err)) continue;
+      // Converged back into the first solution's basin: not an ambiguity.
+      if (quatAngleDeg(quatFromRvec(cand.rvec), quatFromRvec(first.rvec))
+        < ALT_MIN_ANGLE_DEG) continue;
+      if (!best || cand.err < best.err) best = cand;
+    }
+    return best;
   }
 
   const roundSol = (s) => ({
@@ -314,12 +378,21 @@ function createDetectCore() {
       if (cv) return;
       cv = await loadOpenCv();
       genericPnP = typeof cv.solvePnPGeneric === 'function';
+      // Preferred over solvePnP+SOLVEPNP_ITERATIVE for the mirror refine: it is
+      // a pure local refinement of the pose it is handed, with no chance of
+      // re-initializing away from the basin the guess was chosen to land in.
+      refineLM = typeof cv.solvePnPRefineLM === 'function';
       roiDetector = makeRoomDetector(cv, 'roi');
       corners = new cv.MatVector();
       ids = new cv.Mat();
       rejected = new cv.MatVector();
       rvec = new cv.Mat();
       tvec = new cv.Mat();
+      // The refine reads these as its starting guess and writes the result back,
+      // so they must be allocated at a fixed 3x1 CV_64F rather than left for
+      // solvePnP to size.
+      rvecAlt = cv.matFromArray(3, 1, cv.CV_64F, [0, 0, 0]);
+      tvecAlt = cv.matFromArray(3, 1, cv.CV_64F, [0, 0, 0]);
       projected = new cv.Mat();
       buildObjPoints();
     },
@@ -412,6 +485,13 @@ function createDetectCore() {
       if (result.tags.length) lastSighting = now;
       result.idle = now - lastSighting > IDLE_AFTER_MS;
       result.calibrated = intr.calibrated;
+      // Which tier of the intrinsics ladder this pose was solved with. A
+      // rotated or rescaled model is not the same claim as an exact one, and
+      // nothing downstream could tell them apart while `calibrated` was the
+      // only field.
+      result.source = intr.source;
+      result.scale = intr.scale;
+      result.from = intr.from;
       result.timing = {
         grab: result.grab,
         detect: result.detect,
