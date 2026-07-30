@@ -9,9 +9,14 @@
 // a room tag, and vice versa.
 const ROOM_DICT = 'DICT_4X4_50';
 const ROOM_TAG_COUNT = 16;
-// Physical tag edge (black border included). Printed and on-screen tags must
-// both hit this exactly — it must agree with the server's POSE_CONFIG, or
-// every distance in the room scales by the mismatch.
+// Physical tag edge (black border included), as a *default* only. The live
+// value is the server's POSE_CONFIG.markerSizeM, settable from the markers
+// page and served by /api/pose-config, and that is the number PnP solves
+// against — so anything that draws a tag reads it from there rather than from
+// here, or every distance measured from that tag scales by the mismatch. This
+// constant existed as the one true size and /digital drew from it while the
+// server had been reconfigured to 142 mm: a 5.6% scale error on every screen
+// tag, visible nowhere.
 const ROOM_TAG_MM = 150;
 
 const BOARD_DICT = 'DICT_5X5_100';

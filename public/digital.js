@@ -23,6 +23,14 @@ const CARD_MM = 85.6;
 // Browser default assumption: 96 css px per inch.
 const DEFAULT_PPMM = 96 / 25.4;
 
+// The physical size to draw at is the server's configured marker size, not a
+// constant here: PnP solves every tag against that number, so a screen drawing
+// itself at any other size scales every distance measured from it by the
+// mismatch and nothing anywhere reports it. ROOM_TAG_MM is the printed default
+// and the server's own default, but the setting is live and this page is not
+// allowed to guess at it — until the fetch lands there is no tag to show.
+let tagMm = null;
+
 let ppmm = DEFAULT_PPMM;
 let calibrated = false;
 try {
@@ -49,23 +57,23 @@ const markerImg = { mat: null, cv: null };
 
 function renderTag() {
   const cv = markerImg.cv;
-  if (!cv) return;
+  if (!cv || !tagMm) return;
   const id = Number(tagSelect.value);
   dict.generateImageMarker(id, 360, markerImg.mat);
   cv.imshow(tagCanvas, markerImg.mat);
 
-  const px = ROOM_TAG_MM * ppmm;
+  const px = tagMm * ppmm;
   tagCanvas.style.width = `${px}px`;
   tagCanvas.style.height = `${px}px`;
   // The white panel is the quiet zone: one marker cell (a sixth of the tag)
   // of white on every side.
-  tagWrap.style.padding = `${(ROOM_TAG_MM / 6) * ppmm}px`;
+  tagWrap.style.padding = `${(tagMm / 6) * ppmm}px`;
   tagInfo.textContent =
-    `tag ${id} · ${ROOM_TAG_MM} mm at ${ppmm.toFixed(2)} px/mm` +
+    `tag ${id} · ${tagMm} mm at ${ppmm.toFixed(2)} px/mm` +
     (calibrated ? '' : ' · SCREEN NOT CALIBRATED — size is a guess');
 
   // The quiet zone needs roughly one marker cell (25 mm) of white all round.
-  const need = px + 2 * (ROOM_TAG_MM / 6) * ppmm;
+  const need = px + 2 * (tagMm / 6) * ppmm;
   const fitsW = need <= window.innerWidth;
   const fitsH = need <= window.innerHeight - 60;
   warn.textContent = fitsW && fitsH
@@ -116,9 +124,33 @@ async function keepAwake() {
     // Wake lock unavailable — the screen may dim, not fatal.
   }
 }
-document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible') keepAwake();
+document.addEventListener('visibilitychange', async () => {
+  if (document.visibilityState !== 'visible') return;
+  keepAwake();
+  // The size can be changed on the markers page while this screen is sitting
+  // there being a tag, and a screen still showing the old size is exactly the
+  // silent scale error this page is not allowed to produce.
+  if (!tagMm) return;
+  try {
+    const mm = await fetchTagSize();
+    if (mm !== tagMm) {
+      tagMm = mm;
+      renderTag();
+    }
+  } catch {
+    // Server unreachable — keep showing the size it last confirmed.
+  }
 });
+
+// Refusing to draw is the right failure here. A tag at the wrong size still
+// decodes and still solves — it just puts every distance measured from it out
+// by the ratio, silently, with the map showing no sign of it.
+async function fetchTagSize() {
+  const r = await fetch('/api/pose-config');
+  const mm = Math.round((await r.json()).markerSizeM * 1000);
+  if (!(mm > 0)) throw new Error('server reported no marker size');
+  return mm;
+}
 
 (async () => {
   let cv;
@@ -126,6 +158,16 @@ document.addEventListener('visibilitychange', () => {
     cv = await loadOpenCv();
   } catch (err) {
     setStatus(err.message);
+    return;
+  }
+  try {
+    tagMm = await fetchTagSize();
+  } catch {
+    warn.textContent = 'Cannot reach the server for the configured tag size. ' +
+      'A tag drawn at the wrong size corrupts every distance measured from it, ' +
+      `so nothing is shown — set the size on the markers page (default ${ROOM_TAG_MM} mm) ` +
+      'and reload.';
+    setStatus('no tag size from the server');
     return;
   }
   dict = cv.getPredefinedDictionary(cv[ROOM_DICT]);
