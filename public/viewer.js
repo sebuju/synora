@@ -7,6 +7,15 @@ const muteBtn = document.getElementById('muteBtn');
 
 // clientId -> { pc, tile, video, label, camBtn }
 const devices = new Map();
+// clientId -> { at, ms } while that client's ARCore tracking is down. Kept
+// separately from `devices` because an XR client never opens a peer connection
+// and so never gets a device entry at all — the state has to survive without
+// one, or the clients most likely to lose tracking are the ones that cannot
+// report it.
+const trackingLost = new Map();
+// The client re-sends every second while it is lost; three missed in a row is a
+// client that stopped reporting rather than one that is still stuck.
+const LOST_STALE_MS = 3500;
 let soundOn = false;
 let vcamAvailable = false;
 let vcamClientId = null;
@@ -36,6 +45,16 @@ const signaling = connectSignaling('viewer', {
       updatePoseLabel(msg.clientId, msg);
       return;
     }
+    // A client whose ARCore tracking dropped stops sending poses entirely, so
+    // without this it simply fades out of the roster and the room views as if
+    // it had been unplugged. It is still there and still connected; it just
+    // cannot see. Saying so is the difference between a diagnosable state and
+    // a client that "randomly disappears".
+    if (msg.type === 'client-tracking') {
+      trackingLost.set(msg.clientId, msg.lost ? { at: performance.now(), ms: msg.ms } : null);
+      if (!msg.lost) trackingLost.delete(msg.clientId);
+      return;
+    }
     if (msg.type === 'marker-map') {
       markerMap = msg;
       roomViewList.forEach((v) => v.setMarkerMap(msg));
@@ -51,6 +70,7 @@ const signaling = connectSignaling('viewer', {
         // Stale candidate from a previous connection — ignore.
       }
     } else if (msg.type === 'client-gone') {
+      trackingLost.delete(msg.clientId);
       removeDevice(msg.clientId);
     } else if (msg.type === 'vcam-state') {
       if (msg.available !== undefined) vcamAvailable = msg.available;
@@ -73,13 +93,20 @@ function updateCamBtn(clientId, dev) {
 // (disabled, backgrounded) must not keep showing a distance.
 const POSE_LABEL_TTL_MS = 2000;
 
-// Radius for the room views' uncertainty ring, in metres: the measured spread
-// of this client's recent fixes, as the server computed it. Only the XR path
-// reports it (it needs the phone's own pose to separate real motion from fix
-// noise), so anything else falls back to 0 and draws no ring rather than
-// inventing one.
+// The room views' uncertainty ring: where this client probably is, and how
+// tightly, as the server measured it over its recent fixes. Both halves have
+// the phone's own motion divided out (ARCore knows it exactly), so the ring
+// describes the fix and not the walk — it does not swell just because the
+// client is moving, and its centre does not trail a window behind them. The
+// ring is the distribution, the dot is a single draw from it, and tying the
+// ring to the dot made the steadier of the two inherit the jitter of the
+// noisier.
+// Only the XR path reports any of this (it needs the phone's own pose to
+// separate real motion from fix noise), so anything else gets radius 0 and
+// draws no ring rather than inventing one.
 function uncertaintyOf(msg) {
-  return (msg.room?.jitter?.jitterMm ?? 0) / 1000;
+  const j = msg.room?.jitter;
+  return { r: (j?.jitterMm ?? 0) / 1000, p: j?.centre ?? null };
 }
 
 function updatePoseLabel(clientId, msg) {
@@ -106,7 +133,7 @@ function updatePoseLabel(clientId, msg) {
   if (msg.tags.length) {
     const ids = msg.tags.map((t) => t.id).join(',');
     const room = msg.room?.pose
-      ? ` · [${msg.room.pose.p.map((v) => v.toFixed(1)).join(', ')}] ${msg.room.quality}`
+      ? ` · [${msg.room.pose.p.map((v) => v.toFixed(2)).join(', ')}] ${msg.room.quality}`
       : '';
     dev.poseLabel.textContent =
       `tags ${ids}${room}${msg.calibrated ? '' : ' · uncalibrated'}`;
@@ -486,8 +513,28 @@ setInterval(() => {
     return;
   }
   const rows = [];
+  // Tracking-lost clients first, and listed even when they have no tile and no
+  // pose: this is the one state where the honest report is that there is no
+  // position, rather than no client.
+  for (const [id, lost] of [...trackingLost.entries()].sort((a, b) => a[0] - b[0])) {
+    // A client that leaves AR while its tracking is down never sends the
+    // recovery message, so the state has to expire on its own or the roster
+    // keeps reporting a client that is not there. The ping is once a second.
+    if (performance.now() - lost.at > LOST_STALE_MS) {
+      trackingLost.delete(id);
+      continue;
+    }
+    const held = (lost.ms + performance.now() - lost.at) / 1000;
+    const row = document.createElement('div');
+    row.style.color = '#e0603a';
+    row.textContent = `P${id}  NO ARCORE TRACK ${held.toFixed(0)}s  `
+      + '— position from tags only, nothing carried between sightings';
+    rows.push(row);
+  }
   for (const [id, dev] of [...devices.entries()].sort((a, b) => a[0] - b[0])) {
     const room = dev.lastPoseMsg?.room;
+    // Not skipped while tracking is lost: the client still reports a tag-only
+    // position, and the banner above already says where it is coming from.
     if (!room?.pose) continue;
     const age = performance.now() - dev.lastPoseAt;
     const stale = age > 2000;

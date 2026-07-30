@@ -75,6 +75,18 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
       }
       const rAlpha = 1 - Math.exp(-dt / RADIUS_TAU_MS);
       ph.shownRadius += (ph.uncertaintyM * UNCERTAINTY_SIGMA - ph.shownRadius) * rAlpha;
+      // The circle's centre is a measurement in its own right and moves on the
+      // circle's own slow clock, not the dot's — see updateClient.
+      if (ph.ringTarget) {
+        if (!ph.ringSeeded) {
+          ph.ringAt = [...ph.ringTarget];
+          ph.ringSeeded = true;
+        } else {
+          for (let k = 0; k < 3; k++) {
+            ph.ringAt[k] += (ph.ringTarget[k] - ph.ringAt[k]) * rAlpha;
+          }
+        }
+      }
     }
 
     // Auto-fit: bounds of everything worth seeing, floor of 5 m span.
@@ -145,8 +157,9 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
       // Uncertainty first, so the dot and heading draw on top of it.
       const rPx = ph.shownRadius * scale;
       if (rPx > RADIUS_MIN_PX) {
+        const [ux, uy] = px(ph.ringAt || ph.cur.p);
         ctx.beginPath();
-        ctx.arc(sx, sy, rPx, 0, Math.PI * 2);
+        ctx.arc(ux, uy, rPx, 0, Math.PI * 2);
         ctx.fillStyle = stale ? 'rgba(85,85,85,0.10)' : `${ph.color}22`;
         ctx.fill();
         ctx.strokeStyle = color;
@@ -198,7 +211,7 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
       ctx.arc(sx, sy, 6, 0, Math.PI * 2);
       ctx.fill();
       const [pa, pb] = proj(ph.cur.p);
-      ctx.fillText(`C${ph.id} · ${pa.toFixed(1)}, ${pb.toFixed(1)}`, sx, sy - 12);
+      ctx.fillText(`C${ph.id} · ${pa.toFixed(2)}, ${pb.toFixed(2)}`, sx, sy - 12);
     }
 
     schedule();
@@ -233,7 +246,12 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
       }
     },
 
-    updateClient(clientId, pose, seenTagIds = [], uncertaintyM = 0) {
+    // `uncertainty` is { r, p }: the radius of the "probably here" circle and
+    // the point it is centred on. They are one measurement, and neither is the
+    // pose — the pose is the newest single reading, the circle is the spread
+    // the readings scattered over, so the circle moves far less than the dot.
+    // A null p (non-XR client, or no window yet) falls back to the pose.
+    updateClient(clientId, pose, seenTagIds = [], uncertainty = null) {
       let ph = clients.get(clientId);
       if (!ph) {
         const colorHex = ROOM_CLIENT_COLORS[clientId % ROOM_CLIENT_COLORS.length];
@@ -243,12 +261,14 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
           cur: { p: [...pose.p], fwd: [0, 0, 1] },
           target: null, seen: [], at: 0,
           uncertaintyM: 0, shownRadius: 0,
+          ringTarget: null, ringAt: null, ringSeeded: false,
         };
         clients.set(clientId, ph);
       }
       ph.target = pose;
       ph.seen = seenTagIds;
-      ph.uncertaintyM = uncertaintyM;
+      ph.uncertaintyM = uncertainty?.r ?? 0;
+      ph.ringTarget = uncertainty?.p ?? pose.p;
       ph.at = performance.now();
     },
 

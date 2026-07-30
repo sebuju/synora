@@ -200,6 +200,7 @@ function createSceneView(canvas) {
       seenTags: [],
       target: null, at: 0, colorHex, lastDraw: 0,
       uncertaintyM: 0, shownRadius: 0,
+      ringTarget: null, ringAt: new THREE.Vector3(), ringSeeded: false,
     };
     clients.set(clientId, ph);
     return ph;
@@ -276,14 +277,27 @@ function createSceneView(canvas) {
       const stale = performance.now() - ph.at > POSE_STALE_MS;
       ph.cone.material.color.setHex(stale ? 0x555555 : ph.colorHex);
       const p = ph.group.position;
-      ph.label.set(`C${ph.id} · ${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)}`);
+      ph.label.set(`C${ph.id} · ${p.x.toFixed(2)}, ${p.y.toFixed(2)}, ${p.z.toFixed(2)}`);
 
       const wantR = ph.uncertaintyM * UNCERTAINTY_SIGMA;
       const rAlpha = 1 - Math.exp(-dt / RADIUS_TAU_MS);
       ph.shownRadius += (wantR - ph.shownRadius) * rAlpha;
+      // Centre and radius are the same measurement and move on the same slow
+      // clock — the ring chasing the dot's 120 ms lerp is exactly the coupling
+      // this is here to break.
+      if (ph.ringTarget) {
+        if (!ph.ringSeeded) {
+          ph.ringAt.set(...ph.ringTarget);   // don't fly in from the origin
+          ph.ringSeeded = true;
+        } else {
+          ph.ringAt.x += (ph.ringTarget[0] - ph.ringAt.x) * rAlpha;
+          ph.ringAt.y += (ph.ringTarget[1] - ph.ringAt.y) * rAlpha;
+          ph.ringAt.z += (ph.ringTarget[2] - ph.ringAt.z) * rAlpha;
+        }
+      }
       ph.ring.visible = ph.shownRadius > RADIUS_MIN_M;
       if (ph.ring.visible) {
-        ph.ring.position.copy(p);
+        ph.ring.position.copy(ph.ringAt);
         ph.ring.scale.set(ph.shownRadius, 1, ph.shownRadius);
         ph.ring.material.color.setHex(stale ? 0x555555 : ph.colorHex);
       }
@@ -322,9 +336,12 @@ function createSceneView(canvas) {
     },
 
 
-    updateClient(clientId, pose, seenTagIds = [], uncertaintyM = 0) {
+    updateClient(clientId, pose, seenTagIds = [], uncertainty = null) {
       const ph = ensureClient(clientId);
-      ph.uncertaintyM = uncertaintyM;
+      ph.uncertaintyM = uncertainty?.r ?? 0;
+      // No centre reported (no jitter window yet, or a non-XR client): fall back
+      // to the pose so the ring is at worst where it used to be.
+      ph.ringTarget = uncertainty?.p ?? pose.p;
       ph.target = pose;
       ph.targetPos = new THREE.Vector3(...pose.p);
       ph.targetQuat = new THREE.Quaternion(...pose.q);
