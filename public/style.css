@@ -72,6 +72,8 @@ header .home:hover {
 }
 
 #clientLabel {
+  flex-shrink: 1;
+  min-width: 0;
   color: #eee;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 13px;
@@ -79,6 +81,10 @@ header .home:hover {
   background: #2d2d2d;
   border: 1px solid #444;
   border-radius: 6px;
+  /* Device names are free text and a phone header has no room to spare. */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* Empty until the server hands out an id — no bare chip in the meantime. */
@@ -214,6 +220,116 @@ main.tappable {
 
 body.paused #pauseOverlay {
   display: flex;
+}
+
+/* The id chip doubles as the way into the device picker on a capture page. */
+#clientLabel.clickable {
+  cursor: pointer;
+}
+
+#clientLabel.clickable:hover {
+  border-color: #666;
+}
+
+/* Device picker: which stored device this browser is. Above everything except
+   a blanked screen — blanking is the one thing that must win. */
+.device-picker {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgba(0, 0, 0, 0.75);
+}
+
+.device-picker .panel {
+  width: 100%;
+  max-width: 420px;
+  max-height: 100%;
+  padding: 16px;
+  background: #1c1c1c;
+  border: 1px solid #333;
+  border-radius: 10px;
+  overflow-y: auto;
+}
+
+.device-picker h2 {
+  margin-bottom: 6px;
+  font-size: 16px;
+}
+
+.device-picker p {
+  margin-bottom: 12px;
+  font-size: 13px;
+  line-height: 1.4;
+  color: #9a9a9a;
+}
+
+.device-picker .device {
+  display: block;
+  width: 100%;
+  margin-bottom: 8px;
+  padding: 10px 12px;
+  text-align: left;
+}
+
+.device-picker .device.current {
+  border-color: #2e8b47;
+}
+
+.device-picker .device .name {
+  font-size: 14px;
+}
+
+.device-picker .device .meta {
+  margin-top: 3px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  color: #9a9a9a;
+}
+
+/* Starting fresh is the destructive-by-omission choice — it leaves a stored
+   calibration behind — so it does not look like the others. */
+.device-picker .device.new {
+  margin-top: 4px;
+  color: #9a9a9a;
+  text-align: center;
+}
+
+/* Blanked screen: an opaque black page while the device keeps capturing. Above
+   everything on the page, including the XR DOM overlay's own chip. */
+.blank-screen {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  align-items: center;
+  justify-content: center;
+  background: #000;
+}
+
+.blank-screen.on {
+  display: flex;
+}
+
+/* Readable for a moment, then almost gone — enough to prove the page is alive
+   and say how to get back, without lighting up pixels for the next hour. */
+.blank-screen span {
+  color: #eee;
+  font-size: 13px;
+  animation: blank-fade 4s ease-in forwards;
+}
+
+@keyframes blank-fade {
+  from {
+    opacity: 0.55;
+  }
+
+  to {
+    opacity: 0.04;
+  }
 }
 
 /* Dashboard grid: combined view of all connected devices. */
