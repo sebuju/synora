@@ -15,24 +15,28 @@
     <button id="sceneBtn" class="toggle">3D</button>
     <button id="map2dBtn" class="toggle">Top</button>
     <button id="sideBtn" class="toggle">Side</button>
+    <button id="poseBtn" class="toggle">Pose</button>
     <button id="clientsBtn" class="toggle">Clients</button>
     <button id="muteBtn" class="toggle">Sound</button>
     <button id="fullscreenBtn">Full</button>
   </header>
   <main>
-    <div id="grid"></div>
-    <div id="backdrop"></div>
-    <canvas id="combined" width="1920" height="1080"></canvas>
-    <div id="roomViews">
-      <canvas id="scene"></canvas>
-      <div id="maps2d">
-        <canvas id="map2d"></canvas>
-        <canvas id="mapSide"></canvas>
+    <div id="stage">
+      <div id="grid"></div>
+      <div id="backdrop"></div>
+      <div id="roomViews">
+        <canvas id="scene"></canvas>
+        <div id="maps2d">
+          <canvas id="map2d"></canvas>
+          <canvas id="mapSide"></canvas>
+        </div>
+        <div id="roomStats"></div>
       </div>
-      <div id="roomStats"></div>
+      <div id="empty">No video feeds</div>
     </div>
-    <div id="clients"></div>
-    <div id="empty">No video feeds</div>
+    <div id="drawer">
+      <canvas id="combined" width="1920" height="1080"></canvas>
+    </div>
   </main>
   <script src="/vendor/three.min.js"></script>
   <script src="/vendor/OrbitControls.js"></script>

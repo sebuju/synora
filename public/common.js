@@ -490,6 +490,67 @@ function describeCameraModel(msg) {
 }
 
 // ---------------------------------------------------------------------------
+// Surveyed tag geometry, as right-angle distances. A map's own coordinates
+// cannot be checked against anything, but the distance between two tags can be
+// checked against a tape measure — and a tape measure runs along the room, so
+// each neighbour carries its three room-axis components as well as the straight
+// line. Components are magnitudes: a tape has no sign, and it makes a pair read
+// identically from either of its two tags.
+//
+// Each tag's nearest neighbour, deduplicated into pairs: two tags nearest each
+// other are one measurement, not two, and drawing it twice puts two labels on
+// the same line. `count` above 1 is there for a caller that wants a tag's whole
+// neighbourhood; the room views want the one distance that is easiest to check
+// against a tape and hardest to confuse with another.
+function markerNeighbourhood(markerMap, count = 1) {
+  const tags = [...(markerMap?.markers || [])].sort((a, b) => a.id - b.id);
+  const perTag = tags.map((tag) => ({
+    tag,
+    near: tags
+      .filter((b) => b.id !== tag.id)
+      .map((b) => ({
+        tag: b,
+        delta: [0, 1, 2].map((k) => Math.abs(b.p[k] - tag.p[k])),
+        d: Math.hypot(...[0, 1, 2].map((k) => b.p[k] - tag.p[k])),
+      }))
+      .sort((x, y) => x.d - y.d)
+      .slice(0, count),
+  }));
+  const pairs = [];
+  const seen = new Set();
+  const pairKey = (x, y) => (x < y ? `${x}-${y}` : `${y}-${x}`);
+  const add = (a, b, kind) => {
+    const key = pairKey(a.id, b.id);
+    if (seen.has(key)) return;
+    seen.add(key);
+    pairs.push({
+      a,
+      b,
+      kind,
+      delta: [0, 1, 2].map((k) => Math.abs(b.p[k] - a.p[k])),
+      d: Math.hypot(...[0, 1, 2].map((k) => b.p[k] - a.p[k])),
+    });
+  };
+  for (const { tag, near } of perTag) {
+    for (const n of near) add(tag, n.tag, 'near');
+  }
+  // Survey chain on top: a tag was measured against its parents, so that link is
+  // where its position came from and where any error in it was inherited. Two
+  // tags a metre apart that were never measured against each other say nothing
+  // about the chain, and a link four metres long that the whole far end hangs
+  // off says everything — which is exactly the pair the nearest-neighbour pass
+  // leaves out. Only added when that pass did not already draw it.
+  const byId = new Map(tags.map((t) => [t.id, t]));
+  for (const tag of tags) {
+    for (const parentId of tag.from || []) {
+      const parent = byId.get(parentId);
+      if (parent) add(tag, parent, 'chain');
+    }
+  }
+  return { perTag, pairs };
+}
+
+// ---------------------------------------------------------------------------
 // Clock sync. Clients and the dashboard run on independent clocks, so frames
 // can only be aligned against a shared reference: the server's clock. Probes
 // are NTP-style — the sample with the lowest round trip carries the least

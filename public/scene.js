@@ -22,6 +22,20 @@ function roomClientColor(id) {
 function roomClientColorCss(id) {
   return `#${roomClientColor(id).toString(16).padStart(6, '0')}`;
 }
+
+// Room axes, indexed the way a position is: x, y, z. These are three.js's own
+// AxesHelper defaults, and the helper below is told them explicitly rather than
+// left on its defaults — the 2D views and the drawer read the same three
+// numbers, and an axis that is red in one view and blue in another is worse
+// than no colour at all. `ROOM_AXIS_LEN_M` is the helper's length, so the 2D
+// cross is the same size as the 3D one and reads as the same object.
+const ROOM_AXIS_COLORS = [0xff0000, 0x00ff00, 0x0000ff];
+const ROOM_AXIS_NAMES = ['x', 'y', 'z'];
+const ROOM_AXIS_LEN_M = 0.5;
+
+function roomAxisColorCss(k) {
+  return `#${ROOM_AXIS_COLORS[k].toString(16).padStart(6, '0')}`;
+}
 const ROOM_POSE_STALE_MS = 2000;
 
 // Green head-on sliding to red as the view of a tag gets oblique — pose
@@ -49,6 +63,10 @@ function createSceneView(canvas) {
 
   let three = null;             // lazy — no WebGL context until first activation
   let active = false;
+  // On: the frustum sits at the reported pose. Off (default): it parks on the
+  // uncertainty ring's centre — still showing direction, but anchored on the
+  // steadier claim and moving on the ring's slow clock.
+  let showPose = false;
   let markerMapPending = null;
   const clients = new Map();     // clientId -> { group, cone, label, target, at, colorHex }
 
@@ -107,7 +125,9 @@ function createSceneView(canvas) {
     const grid = new THREE.GridHelper(20, 40, 0x3a3a3a, 0x242424);
     grid.position.y = FLOOR_Y;
     scene.add(grid);
-    scene.add(new THREE.AxesHelper(0.5));
+    const axes = new THREE.AxesHelper(ROOM_AXIS_LEN_M);
+    axes.setColors(...ROOM_AXIS_COLORS.map((c) => new THREE.Color(c)));
+    scene.add(axes);
 
     const markerGroup = new THREE.Group();
     scene.add(markerGroup);
@@ -282,13 +302,10 @@ function createSceneView(canvas) {
     for (const ph of clients.values()) {
       if (!ph.target) continue;
       ph.group.visible = true;
-      ph.group.position.lerp(ph.targetPos, alpha);
       ph.group.quaternion.slerp(ph.targetQuat, alpha);
       // Stale pose: keep the last position but say so with a grey cone.
       const stale = performance.now() - ph.at > POSE_STALE_MS;
       ph.cone.material.color.setHex(stale ? 0x555555 : ph.colorHex);
-      const p = ph.group.position;
-      ph.label.set(`C${ph.id} · ${p.x.toFixed(2)}, ${p.y.toFixed(2)}, ${p.z.toFixed(2)}`);
 
       const wantR = ph.uncertaintyM * UNCERTAINTY_SIGMA;
       const rAlpha = 1 - Math.exp(-dt / RADIUS_TAU_MS);
@@ -306,6 +323,12 @@ function createSceneView(canvas) {
           ph.ringAt.z += (ph.ringTarget[2] - ph.ringAt.z) * rAlpha;
         }
       }
+      // Positioned after the ring update so the parked frustum tracks this
+      // frame's centre, not the last one's.
+      if (showPose || !ph.ringSeeded) ph.group.position.lerp(ph.targetPos, alpha);
+      else ph.group.position.copy(ph.ringAt);
+      const p = ph.group.position;
+      ph.label.set(`C${ph.id} · ${p.x.toFixed(2)}, ${p.y.toFixed(2)}, ${p.z.toFixed(2)}`);
       ph.ring.visible = ph.shownRadius > RADIUS_MIN_M;
       if (ph.ring.visible) {
         ph.ring.position.copy(ph.ringAt);
@@ -344,6 +367,10 @@ function createSceneView(canvas) {
     setMarkerMap(map) {
       if (three) rebuildMarkers(map);
       else markerMapPending = map;
+    },
+
+    setShowPose(on) {
+      showPose = on;
     },
 
 

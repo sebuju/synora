@@ -157,6 +157,21 @@ main {
   position: relative;
 }
 
+/* The dashboard's viewing area, beside the drawer rather than under it. Every
+   view inside it is absolutely positioned against this box, which is why it
+   carries the relative position and the centring that <main> used to: the
+   drawer takes its width out of the row, so "inset: 0" has to mean the space
+   that is left, not the whole window. */
+#stage {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
 video {
   max-width: 100%;
   max-height: 100%;
@@ -431,26 +446,18 @@ body.paused #pauseOverlay {
   z-index: 1;
 }
 
+/* The combined stream lives in the drawer, above the cards. It used to float
+   over the room views as a picture-in-picture, which meant the one view that
+   shows the actual cameras was also the one covering up whatever was underneath
+   it. In the drawer it takes space instead of borrowing it. The canvas keeps its
+   1920x1080 backing store — that is what the compositing and sync code reads —
+   and CSS only shrinks what is drawn. */
 #combined {
   display: none;
-  position: relative;
-  max-width: 100%;
-  max-height: 100%;
-  background: #000;
-  z-index: 2;
-}
-
-/* Combined stream floating over the room views: picture-in-picture in the
-   top-left. The canvas keeps its 1920x1080 backing store; CSS just shrinks
-   it. */
-#combined.pip {
-  position: absolute;
-  left: 12px;
-  top: 12px;
-  width: 384px;
-  max-width: 30vw;
+  width: 100%;
   height: auto;
-  z-index: 3;
+  margin-bottom: 8px;
+  background: #000;
   border: 1px solid #333;
   border-radius: 6px;
 }
@@ -506,65 +513,110 @@ body.paused #pauseOverlay {
   border-top: 1px solid #333;
 }
 
-/* Client drawer: the roster with its remote controls. Above the room views and
-   the combined pip, since it is the thing being interacted with. */
-#clients {
+/* The cut follows the window's own shape: it runs across the longer dimension,
+   so neither view is squeezed into a slot nothing like the aspect it wants. A
+   portrait window therefore stacks the 3D scene above the 2D pane — and the 2D
+   pair splits the other way, because whichever way the outer cut went, the pane
+   it left behind is long in the other axis. The flex children carry an explicit
+   size along the old axis, so each one has to be handed back. */
+@media (max-aspect-ratio: 1/1) {
+  #roomViews.active {
+    flex-direction: column;
+  }
+
+  #roomViews > canvas,
+  #maps2d {
+    width: 100%;
+    height: auto;
+    min-height: 0;
+  }
+
+  #roomViews > canvas.active ~ #maps2d.active {
+    border-left: 0;
+    border-top: 1px solid #333;
+  }
+
+  #maps2d.active {
+    flex-direction: row;
+  }
+
+  #maps2d canvas {
+    width: auto;
+    height: 100%;
+    min-width: 0;
+  }
+
+  #maps2d canvas.active + canvas.active {
+    border-top: 0;
+    border-left: 1px solid #333;
+  }
+}
+
+/* The side drawer: the camera composite, the client roster with its remote
+   controls, and the surveyed tags. Not named after any one of them — it started
+   as the client list and grew the other two, and a name that only covers the
+   first is how the third ends up somewhere else instead.
+
+   A column of the layout, not a sheet over it: it takes its width out of the
+   row so the views beside it get the rest, which is why nothing in it needs a
+   z-index or a translucent background any more. Capped at half the window so a
+   narrow one cannot squeeze the views away entirely. */
+#drawer {
   display: none;
-  position: absolute;
-  top: 0;
-  right: 0;
-  bottom: 0;
-  z-index: 4;
-  width: 340px;
-  max-width: 100%;
+  flex: 0 0 340px;
+  max-width: 50%;
+  height: 100%;
   padding: 8px;
-  background: rgba(12, 12, 12, 0.92);
+  background: #0c0c0c;
   border-left: 1px solid #333;
   overflow-y: auto;
 }
 
-#clients.active {
+#drawer.active {
   display: block;
 }
 
-#clients .none {
+#drawer .none {
   padding: 8px 4px;
   font-size: 13px;
   color: #777;
 }
 
-.client-card {
+/* One card shape for everything the drawer lists — a connected client and a
+   surveyed tag are both "a thing in the room, with a heading and a few lines
+   about it", and giving the second one its own class is how the two drift
+   apart. Which is why this is not named after clients. */
+.drawer-card {
   margin-bottom: 8px;
   padding: 8px 10px;
   background: #1c1c1c;
   border: 1px solid #333;
-  border-left: 3px solid #444;
   border-radius: 8px;
 }
 
 /* Offline means the server still lists it but nothing is arriving. */
-.client-card.gone {
+.drawer-card.gone {
   opacity: 0.55;
 }
 
-.client-card .head {
+.drawer-card .head {
   display: flex;
   align-items: baseline;
   gap: 8px;
   margin-bottom: 4px;
 }
 
-.client-card .name {
+.drawer-card .name {
   font-weight: 600;
   font-size: 14px;
   cursor: text;
 }
 
-.client-card .name:hover {
+.drawer-card .name:hover {
   text-decoration: underline dotted;
 }
 
-.client-card .rename {
+.drawer-card .rename {
   flex: 1;
   min-width: 0;
   padding: 2px 6px;
@@ -576,12 +628,12 @@ body.paused #pauseOverlay {
   font-size: 14px;
 }
 
-.client-card .kind {
+.drawer-card .kind {
   font-size: 12px;
   color: #9a9a9a;
 }
 
-.client-card .lines {
+.drawer-card .lines {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 11px;
   line-height: 1.6;
@@ -589,19 +641,19 @@ body.paused #pauseOverlay {
   white-space: pre-wrap;
 }
 
-.client-card .lines .room {
+.drawer-card .lines .room {
   color: #8fc79d;
 }
 
-.client-card .ctrls {
+.drawer-card .ctrls {
   display: flex;
   flex-wrap: wrap;
   gap: 4px;
   margin-top: 6px;
 }
 
-.client-card .ctrls button,
-.client-card .ctrls select {
+.drawer-card .ctrls button,
+.drawer-card .ctrls select {
   padding: 3px 7px;
   font-size: 12px;
 }
@@ -622,12 +674,6 @@ body.paused #pauseOverlay {
 
 #roomStats:empty {
   display: none;
-}
-
-/* Both live in the top-right; the drawer is the wider one, so the compact
-   readout steps aside rather than being hidden behind it. */
-#roomViews.with-panel #roomStats {
-  right: 352px;
 }
 
 #empty {

@@ -301,6 +301,7 @@ const combinedBtn = document.getElementById('combinedBtn');
 const sceneBtn = document.getElementById('sceneBtn');
 const map2dBtn = document.getElementById('map2dBtn');
 const sideBtn = document.getElementById('sideBtn');
+const poseBtn = document.getElementById('poseBtn');
 const sceneCanvas = document.getElementById('scene');
 const map2dCanvas = document.getElementById('map2d');
 const mapSideCanvas = document.getElementById('mapSide');
@@ -309,7 +310,7 @@ const roomViews = document.getElementById('roomViews');
 const backdrop = document.getElementById('backdrop');
 const syncLabel = document.getElementById('syncLabel');
 const ctx = combined.getContext('2d');
-let combinedActive = true;   // starts as the pip over the room views
+let combinedActive = true;   // shown at the top of the drawer
 const sceneView = createSceneView(sceneCanvas);
 // Double-clicking a tag in the top view forgets it — the escape hatch for
 // tags that are gone from the room (e.g. one that was shown on a screen).
@@ -539,14 +540,17 @@ function drawCombined() {
   requestAnimationFrame(drawCombined);
 }
 
-// Overlay views above the tile grid: the combined canvas and/or the room
-// views (3D scene and 2D floor plan — independently toggleable, side by side
-// when both are on). Combined alongside a room view shrinks into a floating
-// pip in the top-left. The grid keeps rendering underneath behind the opaque
-// backdrop.
+// Room views above the tile grid: the 3D scene and the 2D projections,
+// independently toggleable, splitting the pane across the window's longer
+// dimension. The grid keeps rendering underneath behind the opaque backdrop.
+// The combined canvas is not one of these — it lives in the drawer.
 let show3d = true;
 let show2d = true;      // top-down floor plan
 let showSide = false;   // side elevation (height)
+// Not a view of its own but how all of them draw a client: on, the reported
+// pose with the uncertainty circle around it; off, only the circle, with the
+// heading anchored on its centre.
+let showPoseMarker = false;
 
 // ---------------------------------------------------------------------------
 // One description of a client, merged from everything that knows part of one:
@@ -632,17 +636,19 @@ setInterval(() => {
 // client can do to itself is drivable from here; the client owns the behaviour
 // and reports back what it actually did, so nothing here is optimistic.
 const clientsBtn = document.getElementById('clientsBtn');
-const clientsPanel = createClientsPanel(document.getElementById('clients'), {
+const clientsPanel = createClientsPanel(document.getElementById('drawer'), {
   onControl: (clientId, action, value) =>
     signaling.send({ type: 'control', clientId, action, value }),
   onVcam: (clientId, on) => setVcam(on ? clientId : null),
   onRename: (clientId, name) => signaling.send({ type: 'device-rename', clientId, name }),
 });
-let showClients = false;
+// Open by default: the drawer is the only place that lists a client which has no
+// tile, so starting closed hides exactly the clients worth knowing about.
+let showClients = true;
 
 function refreshClientsPanel() {
   if (!showClients) return;
-  clientsPanel.update(clientIds().map(clientInfo));
+  clientsPanel.update(clientIds().map(clientInfo), markerMap);
 }
 
 // Recording byte counts and pose ages move on their own; the roster message
@@ -656,13 +662,16 @@ function refreshViews() {
   map2dBtn.classList.toggle('on', show2d);
   sideBtn.classList.toggle('on', showSide);
   clientsBtn.classList.toggle('on', showClients);
+  poseBtn.classList.toggle('on', showPoseMarker);
+  roomViewList.forEach((v) => v.setShowPose(showPoseMarker));
   clientsPanel.setActive(showClients);
-  // Both live in the top-right; the compact readout steps aside for the drawer.
-  roomViews.classList.toggle('with-panel', showClients);
   refreshClientsPanel();
-  backdrop.style.display = combinedActive || room ? 'block' : '';
+  // The backdrop hides the tile grid behind a full-bleed view. The combined
+  // canvas is in the drawer now and covers nothing, so it no longer asks for
+  // one — a 340px drawer blacking out the whole grid behind it was the old
+  // pip's rule outliving the pip.
+  backdrop.style.display = room ? 'block' : '';
   combined.style.display = combinedActive ? 'block' : '';
-  combined.classList.toggle('pip', combinedActive && room);
   roomViews.classList.toggle('active', room);
   sceneCanvas.classList.toggle('active', show3d);
   maps2d.classList.toggle('active', show2d || showSide);
@@ -679,30 +688,64 @@ function refreshViews() {
   }
 }
 
-combinedBtn.onclick = () => {
-  combinedActive = !combinedActive;
-  refreshViews();
-};
-sceneBtn.onclick = () => {
-  show3d = !show3d;
-  refreshViews();
-};
-map2dBtn.onclick = () => {
-  show2d = !show2d;
-  refreshViews();
-};
-sideBtn.onclick = () => {
-  showSide = !showSide;
-  refreshViews();
-};
-clientsBtn.onclick = () => {
-  showClients = !showClients;
-  refreshViews();
-};
+// Which views are open, remembered across reloads. One table rather than five
+// near-identical handlers and five near-identical storage reads — that is five
+// places for one of them to drift, and the dashboard is reloaded constantly
+// while the layout someone wants is the same every time.
+//
+// One key holding one object, so a partial write cannot leave the set of
+// toggles half in one state and half in another. The legacy `streamer-` prefix
+// is kept deliberately; see the note on storage keys in CLAUDE.md.
+const VIEW_STATE_KEY = 'streamer-viewer-views';
+
+const viewToggles = [
+  { key: 'cams', btn: combinedBtn, get: () => combinedActive, set: (v) => { combinedActive = v; } },
+  { key: 'scene', btn: sceneBtn, get: () => show3d, set: (v) => { show3d = v; } },
+  { key: 'top', btn: map2dBtn, get: () => show2d, set: (v) => { show2d = v; } },
+  { key: 'side', btn: sideBtn, get: () => showSide, set: (v) => { showSide = v; } },
+  { key: 'pose', btn: poseBtn, get: () => showPoseMarker, set: (v) => { showPoseMarker = v; } },
+  { key: 'clients', btn: clientsBtn, get: () => showClients, set: (v) => { showClients = v; } },
+];
+
+function loadViewState() {
+  let saved = null;
+  try {
+    saved = JSON.parse(localStorage.getItem(VIEW_STATE_KEY) || 'null');
+  } catch {
+    return;   // unreadable or unparseable: the defaults above stand
+  }
+  if (!saved) return;
+  for (const t of viewToggles) {
+    // Only keys actually stored, and only if they are booleans. A toggle added
+    // after someone last saved must keep its own default rather than come back
+    // as undefined and read as off.
+    if (typeof saved[t.key] === 'boolean') t.set(saved[t.key]);
+  }
+}
+
+function saveViewState() {
+  try {
+    localStorage.setItem(VIEW_STATE_KEY,
+      JSON.stringify(Object.fromEntries(viewToggles.map((t) => [t.key, t.get()]))));
+  } catch {
+    // Private mode, or storage full. Which panels are open is not worth
+    // breaking the click over.
+  }
+}
+
+for (const t of viewToggles) {
+  t.btn.onclick = () => {
+    t.set(!t.get());
+    saveViewState();
+    refreshViews();
+  };
+}
+
+loadViewState();
 
 
-// Fullscreen the active view. Overlays (combined, room views, pip) all live
-// inside <main>, so fullscreening it keeps whatever combination is showing.
+// Fullscreen the active view. The room views and the drawer both live inside
+// <main>, so fullscreening it keeps whatever combination is showing.
 fullscreenBtn.onclick = () => {
   const overlayActive = combinedActive || show3d || show2d || showSide;
   (overlayActive ? document.querySelector('main') : grid).requestFullscreen?.();
