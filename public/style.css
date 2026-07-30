@@ -390,6 +390,106 @@ body.paused #pauseOverlay {
   border-top: 1px solid #333;
 }
 
+/* Client drawer: the roster with its remote controls. Above the room views and
+   the combined pip, since it is the thing being interacted with. */
+#clients {
+  display: none;
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 4;
+  width: 340px;
+  max-width: 100%;
+  padding: 8px;
+  background: rgba(12, 12, 12, 0.92);
+  border-left: 1px solid #333;
+  overflow-y: auto;
+}
+
+#clients.active {
+  display: block;
+}
+
+#clients .none {
+  padding: 8px 4px;
+  font-size: 13px;
+  color: #777;
+}
+
+.client-card {
+  margin-bottom: 8px;
+  padding: 8px 10px;
+  background: #1c1c1c;
+  border: 1px solid #333;
+  border-left: 3px solid #444;
+  border-radius: 8px;
+}
+
+/* Offline means the server still lists it but nothing is arriving. */
+.client-card.gone {
+  opacity: 0.55;
+}
+
+.client-card .head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.client-card .name {
+  font-weight: 600;
+  font-size: 14px;
+  cursor: text;
+}
+
+.client-card .name:hover {
+  text-decoration: underline dotted;
+}
+
+.client-card .rename {
+  flex: 1;
+  min-width: 0;
+  padding: 2px 6px;
+  background: #2d2d2d;
+  color: #eee;
+  border: 1px solid #2e8b47;
+  border-radius: 4px;
+  font: inherit;
+  font-size: 14px;
+}
+
+.client-card .kind {
+  font-size: 12px;
+  color: #9a9a9a;
+}
+
+.client-card .lines {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.6;
+  color: #9a9a9a;
+  white-space: pre-wrap;
+}
+
+.client-card .lines .room {
+  color: #8fc79d;
+}
+
+.client-card .ctrls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.client-card .ctrls button,
+.client-card .ctrls select {
+  padding: 3px 7px;
+  font-size: 12px;
+}
+
 /* Client roster overlaying the room views. */
 #roomStats {
   position: absolute;
@@ -406,6 +506,12 @@ body.paused #pauseOverlay {
 
 #roomStats:empty {
   display: none;
+}
+
+/* Both live in the top-right; the drawer is the wider one, so the compact
+   readout steps aside rather than being hidden behind it. */
+#roomViews.with-panel #roomStats {
+  right: 352px;
 }
 
 #empty {
