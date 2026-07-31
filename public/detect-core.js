@@ -46,6 +46,31 @@ const FULL_SCAN_MS = 700;
 const IDLE_AFTER_MS = 1500;
 const IDLE_SCAN_MS = 350;
 
+// Feature tracking (see createFeatureTracker). Every one of these is applied in
+// *tracking* pixels — the downscaled image — which is the one space the tracker
+// works in; only the points it returns are back in full-frame pixels.
+//
+// Tracking runs downscaled where detection deliberately does not: a rescaled
+// frame is a rescaled camera model and tag corners are refined at native
+// resolution on purpose, but a tracked feature is only ever a correspondence.
+// Measured, more clean pixels lose to fewer: 720p at 1 Mbps localized to 58 mm
+// where 1080p at 1.5 Mbps managed 125 mm. 720 is the operating point, not a
+// compromise.
+const TRACK_WIDTH = 720;
+const TRACK_MAX_CORNERS = 300;
+const TRACK_QUALITY = 0.01;      // Shi-Tomasi default; not independently tuned
+const TRACK_MIN_DIST = 24;
+const TRACK_RESEED_EVERY = 5;
+// A tag's own corners are the strongest features in the frame and are already
+// in the marker map, so tracking them would inflate the anchor count with
+// points the survey has anyway.
+const TRACK_TAG_MASK_PAD = 24;
+const TRACK_LK_WIN = 21;
+const TRACK_LK_LEVELS = 3;
+// A point on the frame edge is half-visible and drifts; drop it rather than
+// carry a corner that is really the picture ending.
+const TRACK_EDGE_PX = 2;
+
 function createDetectCore() {
   let cv = null;
   let fullDetector = null;
@@ -280,8 +305,11 @@ function createDetectCore() {
     const mode = rect ? 'roi' : 'full';
     const whole = { x: 0, y: 0, w: fw, h: fh };
     if (!grabbed) {
+      // scanned: null, not the requested rect — the grab failed, so nothing
+      // was actually looked at, and a coverage claim here would let a blank
+      // frame read as "no tag where one should be" downstream.
       return {
-        tags: [], boxes: [], mode, w: fw, h: fh, scanned: rect ?? whole,
+        tags: [], boxes: [], mode, w: fw, h: fh, scanned: null,
         grab: t1 - t0, detect: 0, solve: 0,
       };
     }
@@ -518,5 +546,196 @@ function createDetectCore() {
       return result;
     },
 
+  };
+}
+
+// Lucas-Kanade feature tracking, alongside the tag detector and deliberately
+// independent of it: it is the new thing here and must not be able to break
+// detection, so it owns its own pixels, its own OpenCV objects and its own
+// failure. A caller that drops it loses landmarks and nothing else.
+//
+// What it produces is *correspondence*, not geometry: the same image feature
+// followed across frames under a per-session id. It does not triangulate, does
+// not know the marker map, and does not know where anything is in the room —
+// that all stays on the server, as it does for tags.
+//
+// Two things it cannot do, both discovered rather than assumed:
+//
+//   - It cannot track on the luma the detector grabbed. Once tags are in view
+//     that Mat is only a crop of the frame (see ROI scanning above), so
+//     consecutive calls would be comparing different regions of the picture.
+//   - It cannot even share the detector's luma *source*. The VideoFrame source
+//     caches its backing Mat keyed on format and size, so alternating a
+//     full-frame grab with a crop grab through one source deletes and
+//     reallocates in the wasm heap every single cycle.
+//
+// So it takes its own source, which the caller builds with a maxWidth of
+// TRACK_WIDTH — the downscale then happens inside drawImage on the GPU rather
+// than as a full-resolution readback followed by a resize.
+function createFeatureTracker(cv, source, opts = {}) {
+  const maxCorners = opts.maxCorners ?? TRACK_MAX_CORNERS;
+  const quality = opts.quality ?? TRACK_QUALITY;
+  const minDist = opts.minDist ?? TRACK_MIN_DIST;
+  const reseedEvery = opts.reseedEvery ?? TRACK_RESEED_EVERY;
+  const maskPad = opts.maskPad ?? TRACK_TAG_MASK_PAD;
+
+  const winSize = new cv.Size(opts.winSize ?? TRACK_LK_WIN, opts.winSize ?? TRACK_LK_WIN);
+  const criteria = new cv.TermCriteria(
+    cv.TERM_CRITERIA_EPS | cv.TERM_CRITERIA_COUNT, 30, 0.01);
+
+  let prevGray = null;   // owned here: the source's Mat is overwritten next call
+  let mask = null;
+  let live = [];         // [{ id, u, v }] in tracking pixels
+  let nextId = 0;
+  // Ids mean nothing across a reset — the picture changed, so the point that
+  // was id 7 is gone and a new id 7 would be somewhere else entirely. The
+  // server fuses observations by id, so it has to be told; it drops everything
+  // for a client whose generation moved. Getting this wrong does not lose a
+  // landmark, it *invents* one, by averaging two different physical points.
+  let generation = 1;
+  let cycles = 0;
+
+  // The picture changed underneath us (camera switch, resume, new track), so
+  // every id in flight now means something else. `nextId` deliberately keeps
+  // climbing: a reused id spanning a reset is the one mistake here that does
+  // not lose a landmark but invents one.
+  function reset() {
+    prevGray?.delete();
+    prevGray = null;
+    live = [];
+    cycles = 0;
+    generation++;
+  }
+
+  // Written straight into the Mat's data rather than through cv.rectangle: the
+  // fill is trivial and this must not depend on another binding in a build that
+  // has already been caught missing three.
+  function buildMask(w, h, boxes, scale) {
+    if (!mask || mask.cols !== w || mask.rows !== h) {
+      mask?.delete();
+      mask = new cv.Mat(h, w, cv.CV_8UC1);
+    }
+    mask.data.fill(255);
+    for (const b of boxes) {
+      const x0 = Math.max(0, Math.floor(b.x * scale - maskPad));
+      const y0 = Math.max(0, Math.floor(b.y * scale - maskPad));
+      const x1 = Math.min(w - 1, Math.ceil((b.x + b.w) * scale + maskPad));
+      const y1 = Math.min(h - 1, Math.ceil((b.y + b.h) * scale + maskPad));
+      for (let y = y0; y <= y1; y++) mask.data.fill(0, y * w + x0, y * w + x1 + 1);
+    }
+    return mask;
+  }
+
+  function pointsMat(list) {
+    const flat = new Float32Array(list.length * 2);
+    for (let i = 0; i < list.length; i++) {
+      flat[i * 2] = list[i].u;
+      flat[i * 2 + 1] = list[i].v;
+    }
+    return cv.matFromArray(list.length, 1, cv.CV_32FC2, flat);
+  }
+
+  function follow(gray, w, h) {
+    const p0 = pointsMat(live);
+    const p1 = new cv.Mat();
+    const st = new cv.Mat();
+    const errM = new cv.Mat();
+    try {
+      cv.calcOpticalFlowPyrLK(prevGray, gray, p0, p1, st, errM,
+        winSize, opts.levels ?? TRACK_LK_LEVELS, criteria);
+      const kept = [];
+      for (let k = 0; k < live.length; k++) {
+        if (!st.data[k]) continue;
+        const u = p1.data32F[k * 2];
+        const v = p1.data32F[k * 2 + 1];
+        if (!(u > TRACK_EDGE_PX && v > TRACK_EDGE_PX
+          && u < w - TRACK_EDGE_PX && v < h - TRACK_EDGE_PX)) continue;
+        kept.push({ id: live[k].id, u, v });
+      }
+      live = kept;
+    } finally {
+      p0.delete();
+      p1.delete();
+      st.delete();
+      errM.delete();
+    }
+  }
+
+  // Tracks die constantly — occlusion, leaving frame, drift — so without a
+  // top-up the set decays to nothing within seconds of starting.
+  function reseed(gray, boxes, scale) {
+    const found = new cv.Mat();
+    try {
+      cv.goodFeaturesToTrack(gray, found, maxCorners, quality, minDist,
+        buildMask(gray.cols, gray.rows, boxes, scale), 3, false, 0.04);
+      for (let k = 0; k < found.rows; k++) {
+        const u = found.data32F[k * 2];
+        const v = found.data32F[k * 2 + 1];
+        // Do not stack a second track on a point already being followed: two
+        // ids on one feature is one measurement counted twice.
+        let near = false;
+        for (const p of live) {
+          if (Math.hypot(p.u - u, p.v - v) < minDist) { near = true; break; }
+        }
+        if (!near) live.push({ id: nextId++, u, v });
+      }
+    } finally {
+      found.delete();
+    }
+  }
+
+  return {
+    // `frame` is whatever the source understands; `boxes` are the tag bounding
+    // boxes of this frame in full-frame pixels, straight off the detection
+    // result. Returns points in full-frame pixels — the same discipline the
+    // ROI scan applies to tag corners, so only one coordinate space ever leaves
+    // this file — or null if the frame could not be read.
+    async track(frame, boxes = []) {
+      const t0 = performance.now();
+      const grabbed = await source.luma(frame, null);
+      if (!grabbed) return null;
+      const gray = grabbed.mat;
+      const scale = grabbed.scale ?? 1;
+      const w = gray.cols;
+      const h = gray.rows;
+
+      if (prevGray && (prevGray.cols !== w || prevGray.rows !== h)) {
+        // A resolution switch without a reset: the old points describe a
+        // different picture, so start over rather than follow them into it.
+        reset();
+      }
+      if (prevGray && live.length) follow(gray, w, h);
+      if (cycles % reseedEvery === 0 || live.length < maxCorners / 3) {
+        reseed(gray, boxes, scale);
+      }
+      cycles++;
+
+      prevGray?.delete();
+      prevGray = gray.clone();
+
+      return {
+        gen: generation,
+        ms: performance.now() - t0,
+        points: live.map((p) => ({
+          id: p.id,
+          u: p.u / scale + grabbed.rect.x,
+          v: p.v / scale + grabbed.rect.y,
+        })),
+      };
+    },
+
+    reset,
+
+    get generation() {
+      return generation;
+    },
+
+    dispose() {
+      prevGray?.delete();
+      mask?.delete();
+      prevGray = null;
+      mask = null;
+      live = [];
+    },
   };
 }

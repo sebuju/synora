@@ -396,7 +396,23 @@ const ARUCO3_MIN_LONG_EDGE = 2560;
 function makeRoomDetector(cv, profile = 'full', longEdge = Infinity) {
   const dict = cv.getPredefinedDictionary(cv[ROOM_DICT]);
   const params = new cv.aruco_DetectorParameters();
-  // Subpixel corner refinement is most of the pose accuracy at range.
+  // Subpixel corner refinement is most of the pose accuracy at range — but
+  // ArUco3 does its own, and while it is on this assignment is inert. Measured
+  // on 4K frames: with useAruco3Detection set, CORNER_REFINE_NONE, _SUBPIX and
+  // _APRILTAG return bit-identical corners and cornerRefinementWinSize changes
+  // nothing, while cornerRefinementMaxIterations still moves them 1.4 px mean.
+  // So the refinement above the ArUco3 downscale is real (that is the "costs
+  // pose accuracy nothing" claim on DETECT_PROFILES.full), the iteration count
+  // is the only knob that reaches it, and tuning a window size at 4K measures
+  // nothing. The line still bites on the roi profile and below
+  // ARUCO3_MIN_LONG_EDGE, which is why it stays.
+  //
+  // CORNER_REFINE_APRILTAG was measured and rejected. It genuinely produces the
+  // best corners — 4K with ArUco3 off, 124 frames: 0.127 px median reprojection
+  // against 0.240 for subpix and 0.359 unrefined, inter-tag distance MAD 8.2 mm
+  // against 11.6 — but only reachable by turning ArUco3 off, at 370 ms/frame
+  // against 28 for the profile as it stands. At 1080p, where the method does
+  // apply, three sessions gave no consistent accuracy win for 2.6-3.6x the CPU.
   params.cornerRefinementMethod = cv.CORNER_REFINE_SUBPIX;
   const settings = { ...DETECT_PROFILES[profile] };
   if (settings.useAruco3Detection && longEdge < ARUCO3_MIN_LONG_EDGE) {
@@ -455,10 +471,77 @@ function evenRect(rect, fw, fh) {
   return { x: x0, y: y0, w: Math.max(2, x1 - x0), h: Math.max(2, y1 - y0) };
 }
 
+// Raw RGBA bytes, as glReadPixels hands them over: the XR client's camera
+// arrives as a GL texture, so there is no VideoFrame to take a luma plane from
+// and no point drawing it through a canvas only to read it straight back. The
+// "image" here is `{ data, w, h, flipY }`.
+//
+// flipY is the GL convention — readPixels returns bottom-up and every corner
+// downstream is measured top-down — and it is done during the copy into the
+// Mat rather than as a second pass over the image.
+//
+// Only the requested rectangle is converted: on an ROI scan that is a small
+// crop of a 1920-row frame, and colour conversion over the whole frame to throw
+// most of it away was the largest avoidable cost on this path.
+function createRgbaLumaSource(cv) {
+  let rgba = null;
+  let gray = null;
+  let rw = 0;
+  let rh = 0;
+  let gw = 0;
+  let gh = 0;
+
+  return {
+    luma(image, rect) {
+      const { data, w: fw, h: fh, flipY } = image;
+      if (!fw || !fh || !data) return null;
+      if (rw !== fw || rh !== fh) {
+        rgba?.delete();
+        rgba = new cv.Mat(fh, fw, cv.CV_8UC4);
+        rw = fw;
+        rh = fh;
+      }
+      const row = fw * 4;
+      if (flipY) {
+        for (let y = 0; y < fh; y++) {
+          rgba.data.set(data.subarray((fh - 1 - y) * row, (fh - y) * row), y * row);
+        }
+      } else {
+        rgba.data.set(data);
+      }
+      const r = rect ? evenRect(rect, fw, fh) : { x: 0, y: 0, w: fw, h: fh };
+      if (gw !== r.w || gh !== r.h) {
+        gray?.delete();
+        gray = new cv.Mat(r.h, r.w, cv.CV_8UC1);
+        gw = r.w;
+        gh = r.h;
+      }
+      const whole = r.x === 0 && r.y === 0 && r.w === fw && r.h === fh;
+      const src = whole ? rgba : rgba.roi(new cv.Rect(r.x, r.y, r.w, r.h));
+      cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+      if (!whole) src.delete();
+      return { mat: gray, rect: r, scale: 1 };
+    },
+    dispose() {
+      rgba?.delete();
+      gray?.delete();
+      rgba = gray = null;
+      rw = rh = gw = gh = 0;
+    },
+  };
+}
+
 // Draws through a 2D canvas: the universal path, and the only one available
 // when the frame cannot be reached as a VideoFrame. drawImage crops on the GPU,
 // so getImageData only ever reads back the crop.
-function createCanvasLumaSource(cv) {
+//
+// `maxWidth` caps the width actually read back, and drawImage does the
+// downscale on the GPU during the same blit. Detection never uses it — a
+// rescaled frame is a rescaled camera model, and corners are refined at native
+// resolution on purpose — but the feature tracker wants a small image and
+// nothing else, and asking for it here is far cheaper than reading back a 4K
+// luma plane only to shrink it in the wasm heap.
+function createCanvasLumaSource(cv, { maxWidth = 0 } = {}) {
   const canvas = typeof OffscreenCanvas === 'function'
     ? new OffscreenCanvas(2, 2)
     : document.createElement('canvas');
@@ -477,19 +560,22 @@ function createCanvasLumaSource(cv) {
   }
 
   return {
-    // `rect` in source pixels, omitted for the whole frame. Returns the Mat and
-    // the rectangle actually read (rounded out), or null if the source has no
-    // frame yet. The Mat is owned here and valid until the next call.
+    // `rect` in source pixels, omitted for the whole frame. Returns the Mat, the
+    // rectangle actually read (rounded out) and the factor the Mat is scaled by
+    // against that rectangle, or null if the source has no frame yet. The Mat is
+    // owned here and valid until the next call.
     luma(image, rect) {
       const fw = image.videoWidth ?? image.displayWidth ?? image.width;
       const fh = image.videoHeight ?? image.displayHeight ?? image.height;
       if (!fw || !fh) return null;
       const r = rect ? evenRect(rect, fw, fh) : { x: 0, y: 0, w: fw, h: fh };
-      ensure(r.w, r.h);
-      ctx.drawImage(image, r.x, r.y, r.w, r.h, 0, 0, r.w, r.h);
-      rgba.data.set(ctx.getImageData(0, 0, r.w, r.h).data);
+      const dw = maxWidth && r.w > maxWidth ? maxWidth : r.w;
+      const dh = dw === r.w ? r.h : Math.max(1, Math.round(r.h * (dw / r.w)));
+      ensure(dw, dh);
+      ctx.drawImage(image, r.x, r.y, r.w, r.h, 0, 0, dw, dh);
+      rgba.data.set(ctx.getImageData(0, 0, dw, dh).data);
       cv.cvtColor(rgba, gray, cv.COLOR_RGBA2GRAY);
-      return { mat: gray, rect: r };
+      return { mat: gray, rect: r, scale: dw / r.w };
     },
     dispose() {
       rgba?.delete();
