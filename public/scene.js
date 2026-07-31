@@ -59,7 +59,9 @@ function roomAngleColor(angleDeg) {
 function createSceneView(canvas) {
   const CLIENT_COLORS = ROOM_CLIENT_COLORS;
   const POSE_STALE_MS = ROOM_POSE_STALE_MS;
-  const SMOOTH_TAU_MS = 120;
+  // Motion clock shared with the 2D maps (anim.js) — the same client easing at
+  // two different rates in two views of the same room reads as disagreement.
+  const SMOOTH_TAU_MS = MOTION_TAU_MS;
   // The reported pose is a point; the fix is not. The ring is the measured
   // spread of the last window of fixes, so it shrinks when the geometry is good
   // and swells when it is not — drawing a bare point implies a precision that
@@ -78,8 +80,17 @@ function createSceneView(canvas) {
   // uncertainty ring's centre — still showing direction, but anchored on the
   // steadier claim and moving on the ring's slow clock.
   let showPose = false;
+  // Eased 0..1 toward showPose — see the anchor blend in draw().
+  let poseMix = 0;
   let markerMapPending = null;
+  // Where the wheel has asked the camera to be, in metres from the orbit
+  // target. Only the wheel writes it: an orbit leaves the radius alone and a
+  // pan moves camera and target together.
+  let zoomTargetD = 0;
   const clients = new Map();     // clientId -> { group, cone, label, target, at, colorHex }
+  const GREY = new THREE.Color(0x555555);
+  const TAG_COLOR = new THREE.Color(0xcccccc);
+  const ANCHOR_COLOR = new THREE.Color(0xd4b34c);
 
   // Billboard text that can be rewritten cheaply; set() no-ops on unchanged
   // text so it is safe to call every frame.
@@ -89,7 +100,12 @@ function createSceneView(canvas) {
     cnv.height = 64;
     const c = cnv.getContext('2d');
     const texture = new THREE.CanvasTexture(cnv);
-    const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: texture, depthTest: false }));
+    // Transparent because everything in this view fades in and out rather than
+    // appearing and vanishing, and a sprite that ignores its opacity is the one
+    // thing left popping.
+    const sprite = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: texture, depthTest: false, transparent: true,
+    }));
     sprite.scale.set(1.6 * scale, 0.2 * scale, 1);
     let current = null;
     let currentColor = null;
@@ -127,6 +143,19 @@ function createSceneView(canvas) {
     const controls = new THREE.OrbitControls(camera, canvas);
     controls.target.set(1.5, 0, 2);
     controls.enableDamping = true;
+    // OrbitControls damps orbit and pan but applies a dolly whole in the frame
+    // the wheel arrives, so zoom is the one camera move that steps. The vendor
+    // build is fetched, not checked in, so the notch is taken here instead: the
+    // wheel moves a target distance and the camera eases onto it.
+    controls.enableZoom = false;
+    zoomTargetD = camera.position.distanceTo(controls.target);
+    canvas.addEventListener('wheel', (ev) => {
+      ev.preventDefault();
+      // The vendor's own step, so the feel of a notch is unchanged.
+      zoomTargetD = Math.max(0.3,
+        Math.min(60, zoomTargetD * 0.95 ** -Math.sign(ev.deltaY)));
+      scheduleDraw();
+    }, { passive: false });
 
     scene.add(new THREE.AmbientLight(0xffffff, 0.8));
     const sun = new THREE.DirectionalLight(0xffffff, 0.5);
@@ -155,38 +184,73 @@ function createSceneView(canvas) {
   }
 
 
-  // id -> { pos: Vector3, normal: Vector3 } for the client→tag lines.
+  // id -> the live tag, including the pos/normal the client→tag lines read.
+  // Those are the *drawn* position and normal, updated every frame from the
+  // eased holder: a line to where a tag is going to be leaves the tag behind.
   const markerInfo = new Map();
 
-  function rebuildMarkers(map) {
-    const group = three.markerGroup;
-    while (group.children.length) {
-      const child = group.children.pop();
-      child.traverse?.((o) => {
-        o.geometry?.dispose();
-        o.material?.map?.dispose();
-        o.material?.dispose();
-      });
-      group.remove(child);
+  function disposeMarker(holder) {
+    holder.traverse?.((o) => {
+      o.geometry?.dispose();
+      o.material?.map?.dispose();
+      o.material?.dispose();
+    });
+    three.markerGroup.remove(holder);
+  }
+
+  // Matched against what is on screen rather than rebuilt: the survey sends the
+  // whole map on every change, and tearing the group down means a refined,
+  // re-seeded or forgotten tag is a different picture on the next frame with
+  // nothing tying it to the last one. Tags the map dropped fade out and are
+  // disposed then, in draw().
+  function syncMarkers(map) {
+    const size = map?.sizeM || 0.15;
+    const live = new Set();
+    for (const m of map?.markers || []) {
+      live.add(m.id);
+      const anchor = m.id === map.anchorId;
+      let info = markerInfo.get(m.id);
+      if (!info) {
+        const holder = new THREE.Group();
+        holder.position.set(...m.p);
+        holder.quaternion.set(...m.q);
+        const quad = new THREE.Mesh(
+          new THREE.PlaneGeometry(size, size),
+          new THREE.MeshBasicMaterial({
+            color: anchor ? 0xd4b34c : 0xcccccc, side: THREE.DoubleSide,
+            transparent: true, opacity: 0,
+          }));
+        const label = makeTextSprite(String(m.id), '#eee');
+        label.sprite.position.set(0, size * 1.2, 0);
+        label.sprite.material.opacity = 0;
+        holder.add(quad, label.sprite);
+        three.markerGroup.add(holder);
+        info = {
+          holder, quad, label, size,
+          pos: holder.position,
+          normal: new THREE.Vector3(0, 0, 1).applyQuaternion(holder.quaternion),
+          targetPos: new THREE.Vector3(), targetQuat: new THREE.Quaternion(),
+          fade: 0, dead: false,
+          // Seeded at the answer: a tag that arrives as the anchor is the
+          // anchor, it did not become one.
+          anchorMix: anchor ? 1 : 0,
+        };
+        markerInfo.set(m.id, info);
+      } else if (info.size !== size) {
+        // The map can only change tag size by being a different marker set, but
+        // the quad is built from it and would otherwise keep the old one.
+        info.quad.geometry.dispose();
+        info.quad.geometry = new THREE.PlaneGeometry(size, size);
+        info.label.sprite.position.set(0, size * 1.2, 0);
+        info.size = size;
+      }
+      info.targetPos.set(...m.p);
+      info.targetQuat.set(...m.q);
+      info.anchor = anchor;
+      info.dead = false;
     }
-    markerInfo.clear();
-    if (!map) return;
-    const size = map.sizeM || 0.15;
-    for (const m of map.markers) {
-      const holder = new THREE.Group();
-      holder.position.set(...m.p);
-      holder.quaternion.set(...m.q);
-      const quad = new THREE.Mesh(
-        new THREE.PlaneGeometry(size, size),
-        new THREE.MeshBasicMaterial({ color: m.id === map.anchorId ? 0xd4b34c : 0xcccccc, side: THREE.DoubleSide }));
-      const label = makeTextSprite(String(m.id), '#eee');
-      label.sprite.position.set(0, size * 1.2, 0);
-      holder.add(quad, label.sprite);
-      group.add(holder);
-      markerInfo.set(m.id, {
-        pos: new THREE.Vector3(...m.p),
-        normal: new THREE.Vector3(0, 0, 1).applyQuaternion(new THREE.Quaternion(...m.q)),
-      });
+    for (const [id, info] of markerInfo) {
+      if (!live.has(id)) info.dead = true;
     }
   }
 
@@ -207,10 +271,12 @@ function createSceneView(canvas) {
     ];
     const geo = new THREE.BufferGeometry().setFromPoints(
       pts.map((p) => new THREE.Vector3(...p)));
-    const cone = new THREE.LineSegments(geo, new THREE.LineBasicMaterial({ color: colorHex }));
+    const cone = new THREE.LineSegments(geo,
+      new THREE.LineBasicMaterial({ color: colorHex, transparent: true, opacity: 0 }));
     const colorCss = `#${colorHex.toString(16).padStart(6, '0')}`;
     const label = makeTextSprite(`C${clientId}`, colorCss);
     label.sprite.position.set(0, 0.25, 0);
+    label.sprite.material.opacity = 0;
     group.add(cone, label.sprite);
     group.visible = false;
 
@@ -243,9 +309,31 @@ function createSceneView(canvas) {
       target: null, at: 0, colorHex, lastDraw: 0,
       uncertaintyM: 0, shownRadius: 0,
       ringTarget: null, ringAt: new THREE.Vector3(), ringSeeded: false,
+      // The pose anchor on its own clock, so the blend between it and the ring
+      // is a blend of two smoothed points rather than of one smoothed and one
+      // raw. `baseColor` is the client's colour to lerp the stale grey out of.
+      smoothPos: new THREE.Vector3(),
+      baseColor: new THREE.Color(colorHex),
+      fade: 0, dead: false, staleMix: 0,
     };
     clients.set(clientId, ph);
     return ph;
+  }
+
+  function disposeClient(ph) {
+    three?.scene.remove(ph.group, ph.tagLines, ph.ring);
+    ph.ring.geometry.dispose();
+    ph.ring.material.dispose();
+    ph.cone.geometry.dispose();
+    ph.cone.material.dispose();
+    ph.label.dispose();
+    ph.tagLines.geometry.dispose();
+    ph.tagLines.material.dispose();
+    for (const label of ph.distLabels.values()) {
+      three?.scene.remove(label.sprite);
+      label.dispose();
+    }
+    clients.delete(ph.id);
   }
 
   const ROOM_LINE_MAX = 16;
@@ -255,7 +343,10 @@ function createSceneView(canvas) {
   // pose quality falls off past ~60°).
   function updateTagLines(ph) {
     const stale = performance.now() - ph.at > POSE_STALE_MS;
-    const seen = stale ? [] : ph.seenTags.filter((id) => markerInfo.has(id));
+    // A tag on its way out is not something the client is seeing: the line
+    // would outlive the tag it points at.
+    const seen = stale ? []
+      : ph.seenTags.filter((id) => markerInfo.get(id) && !markerInfo.get(id).dead);
     const posAttr = ph.tagLines.geometry.getAttribute('position');
     const from = ph.group.position;
     const active = new Set();
@@ -276,6 +367,7 @@ function createSceneView(canvas) {
       }
       label.set(`${dist.toFixed(2)} m · ${Math.round(angle)}°`, roomAngleColor(angle));
       label.sprite.position.copy(from).add(info.pos).multiplyScalar(0.5);
+      label.sprite.material.opacity = ph.fade * info.fade;
       label.sprite.visible = true;
       active.add(id);
     });
@@ -309,18 +401,48 @@ function createSceneView(canvas) {
       three.camera.updateProjectionMatrix();
     }
 
-    const alpha = 1 - Math.exp(-dt / SMOOTH_TAU_MS);
+    const alpha = animAlpha(dt, SMOOTH_TAU_MS);
+    poseMix = animFade(poseMix, showPose, dt);
+
+    // Tags glide and fade rather than being torn down and rebuilt.
+    for (const [id, info] of markerInfo) {
+      info.fade = animFade(info.fade, !info.dead, dt);
+      if (info.dead && info.fade === 0) {
+        disposeMarker(info.holder);
+        markerInfo.delete(id);
+        continue;
+      }
+      info.holder.position.lerp(info.targetPos, alpha);
+      info.holder.quaternion.slerp(info.targetQuat, alpha);
+      info.normal.set(0, 0, 1).applyQuaternion(info.holder.quaternion);
+      // The anchor is the datum, and it changing is worth watching happen.
+      info.anchorMix = animFade(info.anchorMix, info.anchor, dt);
+      info.quad.material.color.copy(TAG_COLOR).lerp(ANCHOR_COLOR, info.anchorMix);
+      info.quad.material.opacity = info.fade;
+      info.label.sprite.material.opacity = info.fade;
+    }
+
     for (const ph of clients.values()) {
+      ph.fade = animFade(ph.fade, !ph.dead, dt);
+      if (ph.dead && ph.fade === 0) {
+        disposeClient(ph);
+        continue;
+      }
       if (!ph.target) continue;
       ph.group.visible = true;
       ph.group.quaternion.slerp(ph.targetQuat, alpha);
-      // Stale pose: keep the last position but say so with a grey cone.
-      const stale = performance.now() - ph.at > POSE_STALE_MS;
-      ph.cone.material.color.setHex(stale ? 0x555555 : ph.colorHex);
+      // Stale pose: keep the last position but say so with a grey cone — eased,
+      // so the client going quiet is something that happens rather than a
+      // different colour on one frame two seconds later.
+      ph.staleMix = animFade(ph.staleMix,
+        performance.now() - ph.at > POSE_STALE_MS, dt);
+      ph.cone.material.color.copy(ph.baseColor).lerp(GREY, ph.staleMix);
+      ph.cone.material.opacity = ph.fade;
+      ph.label.sprite.material.opacity = ph.fade;
+      ph.tagLines.material.opacity = ph.fade * 0.5;
 
       const wantR = ph.uncertaintyM * UNCERTAINTY_SIGMA;
-      const rAlpha = 1 - Math.exp(-dt / RADIUS_TAU_MS);
-      ph.shownRadius += (wantR - ph.shownRadius) * rAlpha;
+      ph.shownRadius = animApproach(ph.shownRadius, wantR, dt, RADIUS_TAU_MS);
       // Centre and radius are the same measurement and move on the same slow
       // clock — the ring chasing the dot's 120 ms lerp is exactly the coupling
       // this is here to break.
@@ -329,26 +451,45 @@ function createSceneView(canvas) {
           ph.ringAt.set(...ph.ringTarget);   // don't fly in from the origin
           ph.ringSeeded = true;
         } else {
+          const rAlpha = animAlpha(dt, RADIUS_TAU_MS);
           ph.ringAt.x += (ph.ringTarget[0] - ph.ringAt.x) * rAlpha;
           ph.ringAt.y += (ph.ringTarget[1] - ph.ringAt.y) * rAlpha;
           ph.ringAt.z += (ph.ringTarget[2] - ph.ringAt.z) * rAlpha;
         }
       }
       // Positioned after the ring update so the parked frustum tracks this
-      // frame's centre, not the last one's.
-      if (showPose || !ph.ringSeeded) ph.group.position.lerp(ph.targetPos, alpha);
-      else ph.group.position.copy(ph.ringAt);
+      // frame's centre, not the last one's. The two anchors are metres apart
+      // and the frustum, its label and every line off it hang on the result,
+      // so the switch slides between them instead of teleporting. Each anchor
+      // keeps its own clock — the pose's 120 ms, the ring's 400 ms — and only
+      // the blend between them is new.
+      ph.smoothPos.lerp(ph.targetPos, alpha);
+      if (!ph.ringSeeded) ph.group.position.copy(ph.smoothPos);
+      else ph.group.position.copy(ph.ringAt).lerp(ph.smoothPos, poseMix);
       const p = ph.group.position;
       ph.label.set(`C${ph.id} · ${p.x.toFixed(2)}, ${p.y.toFixed(2)}, ${p.z.toFixed(2)}`);
-      ph.ring.visible = ph.shownRadius > RADIUS_MIN_M;
+      // Faded rather than switched at the threshold: the ring is a measurement
+      // shrinking, not a thing that stops existing at 2 cm.
+      const ringAlpha = Math.min(1, Math.max(0,
+        (ph.shownRadius - RADIUS_MIN_M) / RADIUS_MIN_M));
+      ph.ring.visible = ringAlpha > 0.01;
       if (ph.ring.visible) {
         ph.ring.position.copy(ph.ringAt);
         ph.ring.scale.set(ph.shownRadius, 1, ph.shownRadius);
-        ph.ring.material.color.setHex(stale ? 0x555555 : ph.colorHex);
+        ph.ring.material.color.copy(ph.baseColor).lerp(GREY, ph.staleMix);
+        ph.ring.material.opacity = ph.fade * ringAlpha * 0.5;
       }
       updateTagLines(ph);
     }
 
+    // The wheel moved a target distance; the camera arrives on the motion
+    // clock. Before controls.update() so damping and this compose in one frame.
+    const orbitTarget = three.controls.target;
+    const d = three.camera.position.distanceTo(orbitTarget);
+    if (d > 1e-3) {
+      const want = animApproachGeo(d, zoomTargetD, dt, SMOOTH_TAU_MS);
+      three.camera.position.sub(orbitTarget).multiplyScalar(want / d).add(orbitTarget);
+    }
     three.controls.update();
     three.renderer.render(three.scene, three.camera);
     scheduleDraw();
@@ -367,7 +508,7 @@ function createSceneView(canvas) {
       if (on) {
         init();
         if (markerMapPending !== null) {
-          rebuildMarkers(markerMapPending);
+          syncMarkers(markerMapPending);
           markerMapPending = null;
         }
         lastFrameAt = 0;
@@ -376,7 +517,7 @@ function createSceneView(canvas) {
     },
 
     setMarkerMap(map) {
-      if (three) rebuildMarkers(map);
+      if (three) syncMarkers(map);
       else markerMapPending = map;
     },
 
@@ -396,29 +537,28 @@ function createSceneView(canvas) {
       ph.targetQuat = new THREE.Quaternion(...pose.q);
       ph.seenTags = seenTagIds;
       ph.at = performance.now();
+      // A client that comes back before its fade finished is the same client.
+      ph.dead = false;
       // First fix snaps into place rather than flying in from the origin.
       if (!ph.group.visible) {
         ph.group.position.copy(ph.targetPos);
         ph.group.quaternion.copy(ph.targetQuat);
+        ph.smoothPos.copy(ph.targetPos);
       }
     },
 
+    // Faded out and disposed by draw() — see disposeClient. A client that has
+    // never been drawn (no 3D view opened yet) has nothing to fade, so it goes
+    // straight out rather than waiting for a loop that is not running.
     removeClient(clientId) {
       const ph = clients.get(clientId);
       if (!ph) return;
-      three?.scene.remove(ph.group, ph.tagLines, ph.ring);
-      ph.ring.geometry.dispose();
-      ph.ring.material.dispose();
-      ph.cone.geometry.dispose();
-      ph.cone.material.dispose();
-      ph.label.dispose();
-      ph.tagLines.geometry.dispose();
-      ph.tagLines.material.dispose();
-      for (const label of ph.distLabels.values()) {
-        three?.scene.remove(label.sprite);
-        label.dispose();
+      if (!three || !active) {
+        disposeClient(ph);
+        return;
       }
-      clients.delete(clientId);
+      ph.dead = true;
+      scheduleDraw();
     },
 
   };
