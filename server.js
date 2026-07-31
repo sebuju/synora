@@ -305,6 +305,13 @@ function serveStatic(req, res) {
     });
     return;
   }
+  // Everything else is this app's own source, edited constantly and served over
+  // a LAN to devices that are awkward to clear the cache on. With no headers at
+  // all a browser is free to cache heuristically, and it does not have to make
+  // the same choice for the page as for the script it loads: a fresh page with
+  // a stale script is a button that exists and does nothing, which looks like a
+  // bug in the code rather than a copy of last week's.
+  headers['Cache-Control'] = 'no-store';
   fs.readFile(filePath, (err, data) => {
     if (err) {
       res.writeHead(404);
@@ -358,6 +365,7 @@ const CLIENT_COLUMNS = [
   ['pose', (id, s) => onOff(s.pose)],
   ['paused', (id, s) => onOff(s.paused)],
   ['blank', (id, s) => onOff(s.blank)],
+  ['map', (id, s) => s.map || '?'],
 ];
 const CLIENT_COL_WIDTH = 12;
 
@@ -408,6 +416,51 @@ function clientList() {
 
 function sendClients() {
   send(viewerSocket, { type: 'client-list', clients: clientList() });
+}
+
+// The dashboard is no longer the only thing that draws the room: a client that
+// reports `map` on renders the same top-down view on the phone, so whoever is
+// walking the room can see the survey without walking back to the PC. Those
+// clients are room *watchers* — they get the same room messages the viewer gets
+// and nothing else changes about them.
+//
+// `bulk` marks a whole-snapshot message (the carved floor, the wall set): those
+// are resent on a timer, so a socket with bytes still queued skips one rather
+// than pushing a few thousand ints ahead of that client's own pose traffic — it
+// shares this socket with pose-config and room-pose. The next push is a second
+// away. The dashboard is never skipped: the room is all it is for.
+const ROOM_BULK_BACKLOG = 64 * 1024;
+
+function watchingRoom(ws) {
+  const m = ws.clientState?.map;
+  return m === 'split' || m === 'full';
+}
+
+function sendWatchers(obj, { bulk = false } = {}) {
+  for (const ws of clients.values()) {
+    if (!watchingRoom(ws)) continue;
+    if (bulk && ws.bufferedAmount > ROOM_BULK_BACKLOG) continue;
+    send(ws, obj);
+  }
+}
+
+function sendRoom(obj, opts) {
+  send(viewerSocket, obj);
+  sendWatchers(obj, opts);
+}
+
+// What a room view needs from a pose report: who, where, how good it is, and
+// which tags were in the frame. The dashboard keeps getting the whole report —
+// its tile labels read the camera-frame detail — but a client drawing the map
+// does not, and the tag corners and the ARCore matrix are nearly all of it, ten
+// times a second, on the same socket as that client's own pose traffic.
+function roomPoseMessage(clientId, msg, room) {
+  return {
+    type: 'pose',
+    clientId,
+    room,
+    tags: (msg.tags || []).map((t) => ({ id: t.id })),
+  };
 }
 
 function closeRecording(ws) {
@@ -533,16 +586,29 @@ const WALLS_LOG_MS = 5000;
 let wallsPushTimer = null;
 let lastWallsLog = 0;
 
+// One snapshot, two audiences: a socket that has just asked for the room, and
+// everything already watching it. Built in one place so a newly connected
+// viewer and a mid-session push can never describe the grid differently.
+function wallsMessages() {
+  return [
+    { type: 'floor', ...walls.getFloor() },
+    { type: 'walls', walls: walls.getWalls() },
+  ];
+}
+
 function sendWalls(ws) {
-  send(ws, { type: 'floor', ...walls.getFloor() });
-  send(ws, { type: 'walls', walls: walls.getWalls() });
+  for (const m of wallsMessages()) send(ws, m);
+}
+
+function broadcastWalls() {
+  for (const m of wallsMessages()) sendRoom(m, { bulk: true });
 }
 
 function scheduleWallsPush() {
   if (wallsPushTimer) return;
   wallsPushTimer = setTimeout(() => {
     wallsPushTimer = null;
-    sendWalls(viewerSocket);
+    broadcastWalls();
     if (Date.now() - lastWallsLog > WALLS_LOG_MS) {
       lastWallsLog = Date.now();
       const s = walls.stats();
@@ -551,7 +617,10 @@ function scheduleWallsPush() {
         + `reports ${s.reports.accepted}/${s.reports.total}`
         + (Object.keys(s.reports.rej).length ? ` (rej: ${rej(s.reports.rej)})` : '')
         + `, rays ${s.rays.accepted}/${s.rays.total}`
-        + (Object.keys(s.rays.rej).length ? ` (rej: ${rej(s.rays.rej)})` : ''));
+        + (Object.keys(s.rays.rej).length ? ` (rej: ${rej(s.rays.rej)})` : '')
+        + (s.deduced || s.neg.tags.deposited
+          ? `, deduced ${s.deduced} (neg rays ${s.neg.tags.deposited}/${s.neg.tags.total})`
+          : ''));
     }
   }, WALLS_PUSH_MS);
 }
@@ -586,7 +655,7 @@ function applyMarkerSize(m) {
   for (const client of clients.values()) {
     send(client, { type: 'pose-config', ...POSE_CONFIG });
   }
-  send(viewerSocket, { type: 'marker-map', ...survey.getMarkerMap() });
+  sendRoom({ type: 'marker-map', ...survey.getMarkerMap() });
   return { ok: true, markerSizeM: m, changed: true };
 }
 
@@ -738,6 +807,7 @@ function handleSignal(ws, msg) {
   }
   if (msg.type === 'client-state') {
     if (ws.role === 'client') {
+      const watched = watchingRoom(ws);
       // Copied field by field rather than spread: this object is echoed to the
       // dashboard, and a client should not be able to put arbitrary keys in it.
       ws.clientState = {
@@ -754,6 +824,10 @@ function handleSignal(ws, msg) {
         blank: !!msg.blank,
         // XR only: whether the AR session is actually running.
         session: msg.session === undefined ? null : !!msg.session,
+        // Whether this client is drawing the room map itself, and how much of
+        // its screen it gives it. Anything but these two is off — the value is
+        // also what decides whether the room messages are sent at all.
+        map: msg.map === 'split' || msg.map === 'full' ? msg.map : 'off',
       };
       // The XR client shares a browser, and therefore a deviceId, with /client
       // on the same phone. It has no mic, no recorder and no resolution to
@@ -767,6 +841,13 @@ function handleSignal(ws, msg) {
           facing: ws.clientState.facing,
           pose: ws.clientState.pose,
         });
+      }
+      // A client that has just started watching gets the room as it stands.
+      // Waiting for the next survey change or walls push would leave it staring
+      // at an empty map for as long as nothing moved.
+      if (!watched && watchingRoom(ws)) {
+        send(ws, { type: 'marker-map', ...survey.getMarkerMap() });
+        sendWalls(ws);
       }
       logClients();
       sendClients();
@@ -829,17 +910,17 @@ function handleSignal(ws, msg) {
       const anchor = survey.getMarkerMap().anchorId;
       if (anchor != null) survey.removeMarker(anchor);
       const map = survey.getMarkerMap();
-      send(ws, { type: 'marker-map', ...map });
+      sendRoom({ type: 'marker-map', ...map });
       walls.reset();
       walls.setMarkerMap(map);
-      sendWalls(ws);
+      broadcastWalls();
     }
     return;
   }
   if (msg.type === 'walls-clear') {
     if (ws.role === 'viewer') {
       walls.reset();
-      sendWalls(ws);
+      broadcastWalls();
     }
     return;
   }
@@ -847,12 +928,12 @@ function handleSignal(ws, msg) {
     if (ws.role === 'viewer' && Number.isInteger(msg.id)) {
       survey.removeMarker(msg.id);
       const map = survey.getMarkerMap();
-      send(ws, { type: 'marker-map', ...map });
+      sendRoom({ type: 'marker-map', ...map });
       // Removing the anchor resets the survey; the grid was measured in that
       // room frame and must not survive into the next one.
       if (map.anchorId == null) walls.reset();
       walls.setMarkerMap(map);
-      sendWalls(ws);
+      broadcastWalls();
     }
     return;
   }
@@ -907,12 +988,13 @@ function handleSignal(ws, msg) {
       journalPose(ws, entry);
       send(viewerSocket, {
         ...msg, type: 'pose', clientId: ws.clientId, room: entry.room });
+      sendWatchers(roomPoseMessage(ws.clientId, msg, entry.room));
       // jitter rides back to the client: the measurement needs both the phone's
       // own pose and the room pose, and only this side has both.
       send(ws, { type: 'room-pose', pose, quality, jitter });
       if (mapChanged) {
         const map = survey.getMarkerMap();
-        send(viewerSocket, { type: 'marker-map', ...map });
+        sendRoom({ type: 'marker-map', ...map });
         walls.setMarkerMap(map);
       }
       if (walls.handleReport(entry)) scheduleWallsPush();
@@ -930,12 +1012,13 @@ function handleSignal(ws, msg) {
       };
       journalPose(ws, entry);
       send(viewerSocket, { ...msg, clientId: ws.clientId, room: entry.room });
+      sendWatchers(roomPoseMessage(ws.clientId, msg, entry.room));
       // The client cannot know its room pose on its own (the marker map lives
       // here) — reflect it back for the on-client stats overlay.
       send(ws, { type: 'room-pose', pose, quality });
       if (mapChanged) {
         const map = survey.getMarkerMap();
-        send(viewerSocket, { type: 'marker-map', ...map });
+        sendRoom({ type: 'marker-map', ...map });
         walls.setMarkerMap(map);
       }
       if (walls.handleReport(entry)) scheduleWallsPush();
@@ -1007,7 +1090,10 @@ function main() {
         if (ws.clientId === vcamClientId) stopVcam();
         log(`Client ${ws.clientId} disconnected (${clients.size} total)`);
         logClients();
-        send(viewerSocket, { type: 'client-gone', clientId: ws.clientId });
+        // To the watchers too, or a client that left keeps a dot on every map
+        // still drawing it — the departed socket is exactly the one that can no
+        // longer say it has gone.
+        sendRoom({ type: 'client-gone', clientId: ws.clientId });
         sendClients();
       } else if (ws === viewerSocket) {
         viewerSocket = null;
