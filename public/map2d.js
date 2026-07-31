@@ -134,13 +134,23 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover } = {}) {
 
   // The pointer id is carried so a second pointer arriving mid-drag cannot end
   // the first one's capture, which releasePointerCapture treats as an error.
+  //
+  // Right button, matching the 3D view — OrbitControls pans on the right button
+  // and orbits on the left, and one map panning with a gesture the other one
+  // does something else with is worse than either choice. It leaves the left
+  // button free on the canvas, and costs the touch drag: a touch pointer has no
+  // button 2. Zoom is still the wheel, so a mouse loses nothing.
+  const PAN_BUTTON = 2;
   let drag = null;
   canvas.addEventListener('pointerdown', (ev) => {
-    if (ev.button !== 0 || !takeOver()) return;
+    if (ev.button !== PAN_BUTTON || !takeOver()) return;
     drag = { x: ev.clientX, y: ev.clientY, id: ev.pointerId };
     canvas.setPointerCapture(ev.pointerId);
     canvas.style.cursor = 'grabbing';
   });
+  // Or the menu opens on the button that starts the pan, over the map it is
+  // panning, and the drag never gets its pointerup.
+  canvas.addEventListener('contextmenu', (ev) => ev.preventDefault());
   // Distance from a point to a segment, not to its infinite line: a tag bar is
   // 150 mm of wall and the line it lies on runs the length of the room.
   function distToSeg(x, y, x1, y1, x2, y2) {
