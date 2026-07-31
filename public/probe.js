@@ -301,7 +301,9 @@ els.view.addEventListener('click', (ev) => {
   const v = (ev.clientY - r.top) * (els.view.height / r.height);
   const list = labels.get(active);
   const i = list.findIndex((o) => o.t === at);
-  const entry = { t: at, u, v, w: frame.w, h: frame.h, pose: frame.pose };
+  const entry = {
+    t: at, u, v, w: frame.w, h: frame.h, K: intrinsicsAt(frame.w, frame.h), pose: frame.pose,
+  };
   if (i >= 0) list[i] = entry; else list.push(entry);
   renderLandmarks();
   draw();
@@ -335,126 +337,13 @@ function renderLandmarks() {
 
 // ---------------------------------------------------------------------------
 // Geometry.
-
-// Unit ray in room coordinates through a labelled pixel.
-function rayOf(o) {
-  const K = intrinsicsAt(o.w, o.h);
-  const d = [(o.u - K.cx) / K.fx, (o.v - K.cy) / K.fy, 1];
-  const r = quatRotate(o.pose.q, d);
-  const n = Math.hypot(r[0], r[1], r[2]);
-  return [r[0] / n, r[1] / n, r[2] / n];
-}
-
-function solve3(A, b) {
-  const M = [[...A[0], b[0]], [...A[1], b[1]], [...A[2], b[2]]];
-  for (let c = 0; c < 3; c++) {
-    let piv = c;
-    for (let r = c + 1; r < 3; r++) if (Math.abs(M[r][c]) > Math.abs(M[piv][c])) piv = r;
-    if (Math.abs(M[piv][c]) < 1e-12) return null;
-    [M[c], M[piv]] = [M[piv], M[c]];
-    for (let r = 0; r < 3; r++) {
-      if (r === c) continue;
-      const f = M[r][c] / M[c][c];
-      for (let k = c; k < 4; k++) M[r][k] -= f * M[c][k];
-    }
-  }
-  return [M[0][3] / M[0][0], M[1][3] / M[1][1], M[2][3] / M[2][2]];
-}
-
-// Point minimising the summed squared perpendicular distance to a set of rays.
-function triangulate(obs) {
-  if (obs.length < 2) return null;
-  const A = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
-  const b = [0, 0, 0];
-  for (const o of obs) {
-    const d = rayOf(o);
-    const C = o.pose.p;
-    for (let i = 0; i < 3; i++) {
-      for (let j = 0; j < 3; j++) {
-        const m = (i === j ? 1 : 0) - d[i] * d[j];
-        A[i][j] += m;
-        b[i] += m * C[j];
-      }
-    }
-  }
-  return solve3(A, b);
-}
-
-function reproject(P, o) {
-  const K = intrinsicsAt(o.w, o.h);
-  const c = transformPoint(se3Invert(o.pose), P);
-  if (!(c[2] > 1e-6)) return null;
-  return [K.fx * c[0] / c[2] + K.cx, K.fy * c[1] / c[2] + K.cy];
-}
-
-// Where the camera sat around the point, in the room's horizontal plane. The
-// arc this spans is what makes a viewpoint-correlated bias visible at all.
-function azimuthOf(P, o) {
-  return Math.atan2(o.pose.p[0] - P[0], o.pose.p[2] - P[2]) * 180 / Math.PI;
-}
-
-function rms(P, obs) {
-  let sum = 0;
-  let n = 0;
-  for (const o of obs) {
-    const q = reproject(P, o);
-    if (!q) continue;
-    sum += (q[0] - o.u) ** 2 + (q[1] - o.v) ** 2;
-    n++;
-  }
-  return n ? Math.sqrt(sum / n) : NaN;
-}
-
-const dist3 = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
-
-// Azimuths are angles on a circle, so sorting them raw splits any arc that
-// happens to straddle ±180° into two clumps at opposite ends of the list — and
-// every window and half-split below would then be nonsense. Cut the circle at
-// the widest gap between observations instead, which is where the arc actually
-// ends, and unwrap from there.
-function unwrapAzimuths(obs, P) {
-  const rows = obs.map((o) => ({ o, az: azimuthOf(P, o) })).sort((a, b) => a.az - b.az);
-  let cut = 0;
-  let widest = -1;
-  for (let i = 0; i < rows.length; i++) {
-    const next = rows[(i + 1) % rows.length];
-    const gap = i === rows.length - 1
-      ? next.az + 360 - rows[i].az
-      : next.az - rows[i].az;
-    if (gap > widest) { widest = gap; cut = (i + 1) % rows.length; }
-  }
-  const out = [];
-  for (let i = 0; i < rows.length; i++) {
-    const r = rows[(cut + i) % rows.length];
-    const az = out.length && r.az < out[0].az ? r.az + 360 : r.az;
-    out.push({ o: r.o, az });
-  }
-  return out;
-}
-
-// The measurement §2 turns into a runtime rule: triangulate each half of the
-// viewing arc separately and compare. A point that really is fixed gives the
-// same answer from both halves; a silhouette centroid does not, and the gap is
-// roughly the object's depth. Reported against arc width so the width at which
-// the two separate can be read off — that width is X in the plan.
-function splitArc(obs, P) {
-  const rows = unwrapAzimuths(obs, P);
-  const span = rows[rows.length - 1].az - rows[0].az;
-  const mid = (rows[0].az + rows[rows.length - 1].az) / 2;
-  const out = [];
-  for (const width of [20, 40, 60, 80, 120, 180, 360]) {
-    const win = rows.filter((r) => Math.abs(r.az - mid) <= width / 2);
-    if (win.length < 4) continue;
-    const half = Math.floor(win.length / 2);
-    const a = triangulate(win.slice(0, half).map((r) => r.o));
-    const b = triangulate(win.slice(win.length - half).map((r) => r.o));
-    if (!a || !b) continue;
-    const actual = win[win.length - 1].az - win[0].az;
-    out.push({ width: Math.round(Math.min(width, actual)), n: win.length, gap: dist3(a, b) * 1000 });
-    if (width >= span) break;
-  }
-  return { span, rows: out };
-}
+//
+// triangulate / splitArc / unwrapAzimuths / rms / reproject / azimuthOf /
+// dist3 / qualifyTrack all live in landmark-math.js now: the server's landmark
+// map runs the identical functions, so what this page measures and what the
+// product then does cannot drift apart. Each observation carries its own `K`
+// rather than looking one up by frame size, because on the server the camera
+// model arrives per message.
 
 // M2: how much the estimate moves when any single sighting is removed.
 function leaveOneOut(obs, P) {
@@ -550,14 +439,11 @@ function compute() {
 // dependency, no model, no download. Checked rather than assumed, because this
 // build silently lacks solvePnPGeneric and cornerSubPix.
 
-const GFTT_MAX = 300;
-const GFTT_QUALITY = 0.01;
-const GFTT_MIN_DIST = 24;
-const RESEED_EVERY = 5;        // frames between top-ups as tracks die
-const TAG_MASK_PAD = 24;       // px of margin around a tag before masking it out
-const LK_WIN = 21;
-const LK_LEVELS = 3;
-const CLUSTER_M = 0.05;        // two anchors closer than this are one anchor
+// The tracker itself is createFeatureTracker in detect-core.js — the same one
+// the client runs, so what qualifies here is what would qualify in the room.
+// It works on a downscaled frame where this page used to track at full
+// resolution; that is the measured operating point, not a saving.
+//
 // Descriptors for re-identification. cv.KeyPoint is not constructible in this
 // build, so a descriptor cannot be computed at an arbitrary point — ORB has to
 // pick its own keypoints and each track then adopts the nearest one. That is
@@ -570,53 +456,22 @@ const DESC_PER_ANCHOR = 12;    // kept per anchor, spread across the arc
 const MATCH_RATIO = 0.75;      // Lowe ratio
 const RELOC_MIN_MATCHES = 6;
 
-// A tag's own corners are the strongest features in the frame and are already
-// mapped, so tracking them would flatter the result with points the survey has
-// anyway. Mask them out. Written straight into the Mat's data rather than via
-// cv.rectangle: the fill is trivial and this cannot depend on another binding.
-function maskTags(cv, w, h, tags) {
-  const mask = new cv.Mat(h, w, cv.CV_8UC1);
-  mask.data.fill(255);
-  for (const t of tags) {
-    let x0 = Infinity; let y0 = Infinity; let x1 = -Infinity; let y1 = -Infinity;
-    for (let i = 0; i < 8; i += 2) {
-      x0 = Math.min(x0, t.corners[i]); x1 = Math.max(x1, t.corners[i]);
-      y0 = Math.min(y0, t.corners[i + 1]); y1 = Math.max(y1, t.corners[i + 1]);
-    }
-    x0 = Math.max(0, Math.floor(x0 - TAG_MASK_PAD));
-    y0 = Math.max(0, Math.floor(y0 - TAG_MASK_PAD));
-    x1 = Math.min(w - 1, Math.ceil(x1 + TAG_MASK_PAD));
-    y1 = Math.min(h - 1, Math.ceil(y1 + TAG_MASK_PAD));
-    for (let y = y0; y <= y1; y++) mask.data.fill(0, y * w + x0, y * w + x1 + 1);
-  }
-  return mask;
-}
-
-function ptsMat(cv, list) {
-  const flat = new Float32Array(list.length * 2);
-  for (let i = 0; i < list.length; i++) {
-    flat[i * 2] = list[i].u;
-    flat[i * 2 + 1] = list[i].v;
-  }
-  return cv.matFromArray(list.length, 1, cv.CV_32FC2, flat);
-}
-
 async function autoCollect() {
   if (!shots.length || !core?.ready) { status('load frames first'); return; }
   const cv = core.cv;
   const minObs = Math.max(4, Number(els.minObs.value) || 12);
   const minArc = Math.max(10, Number(els.minArc.value) || 60);
 
-  const tracks = new Map();     // id -> [{ t, u, v, w, h, pose }]
+  const tracks = new Map();     // id -> [{ t, u, v, w, h, K, pose }]
   framePose = new Array(shots.length).fill(null);
   autoVerdict = new Map();
-  let nextId = 0;
-  let live = [];                // [{ id, u, v }] — parallel to the LK point Mat
-  let prevGray = null;
+  let live = [];                // [{ id, u, v }] in full-frame pixels
   let posed = 0;
 
-  const winSize = new cv.Size(LK_WIN, LK_WIN);
-  const criteria = new cv.TermCriteria(cv.TERM_CRITERIA_EPS | cv.TERM_CRITERIA_COUNT, 30, 0.01);
+  // Its own luma source, at the tracker's own width — see createFeatureTracker
+  // for why it cannot share the detector's.
+  const tracker = createFeatureTracker(cv,
+    createCanvasLumaSource(cv, { maxWidth: TRACK_WIDTH }));
   const orb = new cv.ORB(ORB_FEATURES);
   const descs = new Map();      // track id -> [Uint8Array(32), ...]
 
@@ -628,9 +483,7 @@ async function autoCollect() {
     if (!K) { bm.close(); continue; }
     if (!core.hasIntrinsics(w, h)) core.setIntrinsics(w, h, { ...K, calibrated: true });
 
-    // Tags first: core.detect drives the same luma source, so the gray below
-    // has to be taken after it or the crop it may leave behind is what gets
-    // cloned.
+    // Tags first: the tracker masks them out, so it needs this frame's boxes.
     core.resetScan();
     const det = await core.detect(lumaSource, bm, w, h, performance.now());
     const tags = det?.tags ?? [];
@@ -639,28 +492,11 @@ async function autoCollect() {
     if (pose) posed++;
     framePose[i] = pose;
 
-    const grabbed = await lumaSource.luma(bm, null);
-    const gray = grabbed.mat.clone();
-    bm.close();
-
-    // Follow existing tracks into this frame.
-    if (prevGray && live.length) {
-      const p0 = ptsMat(cv, live);
-      const p1 = new cv.Mat();
-      const st = new cv.Mat();
-      const errM = new cv.Mat();
-      cv.calcOpticalFlowPyrLK(prevGray, gray, p0, p1, st, errM, winSize, LK_LEVELS, criteria);
-      const kept = [];
-      for (let k = 0; k < live.length; k++) {
-        if (!st.data[k]) continue;
-        const u = p1.data32F[k * 2];
-        const v = p1.data32F[k * 2 + 1];
-        if (!(u > 1 && v > 1 && u < w - 2 && v < h - 2)) continue;
-        kept.push({ id: live[k].id, u, v });
-      }
-      live = kept;
-      p0.delete(); p1.delete(); st.delete(); errM.delete();
-    }
+    // Every seek is a jump on this page, but auto-collect walks the frames in
+    // order, so the tracker is followed rather than reset — that is the whole
+    // source of correspondence.
+    const tracked = await tracker.track(bm, det?.boxes ?? []);
+    live = tracked ? tracked.points : [];
 
     // Record a sighting for every live track that has a camera pose to pin it
     // to. Tracks keep running through unposed frames — losing the pose loses
@@ -668,18 +504,20 @@ async function autoCollect() {
     if (pose) {
       for (const p of live) {
         if (!tracks.has(p.id)) tracks.set(p.id, []);
-        tracks.get(p.id).push({ t: i, u: p.u, v: p.v, w, h, pose });
+        tracks.get(p.id).push({ t: i, u: p.u, v: p.v, w, h, K, pose });
       }
     }
 
     // Describe: let ORB find its own keypoints, then hand each live track the
     // descriptor of the keypoint sitting on it. Only where there is a pose —
     // an undescribed sighting is no loss, but a described one that cannot be
-    // triangulated is a descriptor with no 3D point behind it.
+    // triangulated is a descriptor with no 3D point behind it. This runs on the
+    // full-resolution luma because the tracked points are in full-frame pixels.
     if (pose && live.length) {
+      const grabbed = await lumaSource.luma(bm, null);
       const kp = new cv.KeyPointVector();
       const dsc = new cv.Mat();
-      orb.detectAndCompute(gray, new cv.Mat(), kp, dsc);
+      orb.detectAndCompute(grabbed.mat, new cv.Mat(), kp, dsc);
       if (dsc.rows) {
         for (const p of live) {
           const have = descs.get(p.id);
@@ -700,30 +538,7 @@ async function autoCollect() {
       kp.delete();
       dsc.delete();
     }
-
-    // Top up. Tracks die constantly (occlusion, leaving frame, drift), so
-    // without this the set decays to nothing a few seconds in.
-    if (i % RESEED_EVERY === 0 || live.length < GFTT_MAX / 3) {
-      const mask = maskTags(cv, w, h, tags);
-      const found = new cv.Mat();
-      cv.goodFeaturesToTrack(gray, found, GFTT_MAX, GFTT_QUALITY, GFTT_MIN_DIST,
-        mask, 3, false, 0.04);
-      for (let k = 0; k < found.rows; k++) {
-        const u = found.data32F[k * 2];
-        const v = found.data32F[k * 2 + 1];
-        // Do not stack a new track on a point already being followed.
-        let near = false;
-        for (const p of live) {
-          if (Math.hypot(p.u - u, p.v - v) < GFTT_MIN_DIST) { near = true; break; }
-        }
-        if (!near) live.push({ id: nextId++, u, v });
-      }
-      found.delete();
-      mask.delete();
-    }
-
-    prevGray?.delete();
-    prevGray = gray;
+    bm.close();
 
     if (i % 5 === 0) {
       status(`auto-collect ${i + 1}/${shots.length} · ${live.length} live tracks · `
@@ -731,37 +546,27 @@ async function autoCollect() {
       await new Promise((r) => setTimeout(r, 0));
     }
   }
-  prevGray?.delete();
+  tracker.dispose();
 
   // ---- qualify ------------------------------------------------------------
   const judged = [];
   let tooFew = 0;
   let tooNarrow = 0;
   for (const [id, obs] of tracks) {
-    if (obs.length < minObs) { tooFew++; continue; }
-    const P = triangulate(obs);
-    if (!P) { tooFew++; continue; }
-    const sa = splitArc(obs, P);
-    if (!sa.rows.length || sa.span < minArc) { tooNarrow++; continue; }
-    const first = sa.rows[0];
-    const last = sa.rows[sa.rows.length - 1];
-    const err = rms(P, obs);
+    const j = qualifyTrack(obs, { minObs, minArcDeg: minArc });
+    if (j.reason === 'few-obs' || j.reason === 'no-triangulation') { tooFew++; continue; }
+    if (j.reason === 'narrow-arc' || j.reason === 'no-windows') { tooNarrow++; continue; }
     judged.push({
-      id, P, n: obs.length, span: sa.span, err,
-      first: first.gap, last: last.gap,
-      ok: err < 10 && last.gap < first.gap / 5,
-      range: Math.hypot(P[0] - obs[0].pose.p[0], P[1] - obs[0].pose.p[1], P[2] - obs[0].pose.p[2]),
+      ...j,
+      id,
+      range: dist3(j.P, obs[0].pose.p),
     });
   }
 
   // Several tracks often sit on one physical feature, so a raw count overstates
   // how many anchors the room actually gained.
   const good = judged.filter((j) => j.ok).sort((a, b) => a.last - b.last);
-  const clusters = [];
-  for (const j of good) {
-    const hit = clusters.find((c) => dist3(c[0].P, j.P) < CLUSTER_M);
-    if (hit) hit.push(j); else clusters.push([j]);
-  }
+  const clusters = clusterAnchors(good);
 
   orb.delete();
   autoTracks = tracks;
@@ -1008,14 +813,8 @@ function holdoutM3() {
   const anchors = new Map();
   for (const [id, obs] of autoTracks) {
     const build = obs.filter((o) => o.t % 2 === 0);
-    if (build.length < minObs) continue;
-    const P = triangulate(build);
-    if (!P) continue;
-    const sa = splitArc(build, P);
-    if (!sa.rows.length || sa.span < minArc) continue;
-    const first = sa.rows[0];
-    const last = sa.rows[sa.rows.length - 1];
-    if (rms(P, build) < 10 && last.gap < first.gap / 5) anchors.set(id, P);
+    const j = qualifyTrack(build, { minObs, minArcDeg: minArc });
+    if (j.ok) anchors.set(id, j.P);
   }
 
   // ---- localize each odd frame from those anchors alone -------------------
@@ -1030,7 +829,7 @@ function holdoutM3() {
     for (const [id, P] of anchors) {
       const o = autoTracks.get(id).find((x) => x.t === i);
       if (!o) continue;
-      K ??= intrinsicsAt(o.w, o.h);
+      K ??= o.K;
       objs.push(P);
       imgs.push([o.u, o.v]);
     }
