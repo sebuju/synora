@@ -23,24 +23,121 @@
       position: fixed; inset: 0; z-index: 20; display: none;
     }
     #overlay.on { display: block; }
+    /* Everything visible lives in here, and this is the only element with a
+       size of its own: viewport units, so it cannot take part in the loop that
+       once grew the map to four million pixels (a canvas with no resolvable CSS
+       size reports its backing store as its client size, the backing store is
+       set from the client size, and the root then stretches to the canvas). Its
+       children size and position against *it*, in percentages.
+       It also carries the rotation. The phone's orientation lock keeps the
+       layout portrait however the device is held, which is how the user wants
+       it — so the screen is turned the other way instead, by the angle read off
+       ARCore's gravity in xr-client.js. The transform makes this the containing
+       block for the children, so one rotation moves map, camera and buttons
+       together and nothing has to know it happened. */
+    #overlayRot {
+      position: fixed; left: 50%; top: 50%;
+      width: 100vw; height: 100dvh;
+      transform: translate(-50%, -50%) rotate(0deg);
+      transform-origin: 50% 50%;
+    }
+    #overlay.rot90 #overlayRot,
+    #overlay.rot270 #overlayRot { width: 100dvh; height: 100vw; }
+    #overlay.rot90 #overlayRot { transform: translate(-50%, -50%) rotate(90deg); }
+    #overlay.rot180 #overlayRot { transform: translate(-50%, -50%) rotate(180deg); }
+    #overlay.rot270 #overlayRot { transform: translate(-50%, -50%) rotate(-90deg); }
     #overlayText {
       position: absolute;
       /* Clear the status bar and the punch-hole camera. env() covers the
          status bar where the UA reports it; the constant is the camera cutout,
          which no inset describes. */
       top: calc(env(safe-area-inset-top, 0px) + 56px);
-      left: 8px; right: 8px;
+      /* Shrink-wrapped to the longest line it is actually showing. A block fills
+         whatever width it is given, so capping it was not enough — edge to edge
+         or capped at 440px, a chip of short monospace lines is mostly black.
+         The cap stays as the ceiling for the one long sentence in the
+         tracking-lost message. */
+      left: 8px; right: auto;
+      width: fit-content;
+      max-width: min(380px, calc(100% - 16px));
       background: rgba(0,0,0,0.72); border-radius: 6px; padding: 10px;
-      font-family: ui-monospace, monospace; font-size: 12px; color: #eee;
+      font-family: ui-monospace, monospace; font-size: 10px; color: #eee;
       white-space: pre-line;
     }
-    /* Sits under the text chip, clear of the same status bar and cutout. */
-    #blankBtn {
-      position: absolute;
-      right: 8px;
-      bottom: calc(env(safe-area-inset-bottom, 0px) + 16px);
-      padding: 8px 14px;
+    /* Turned sideways the chip goes to the top right. The 56px above is the
+       punch-hole camera, which is on the portrait top edge and nowhere near
+       this one, so it goes; the safe-area inset would describe the unturned
+       screen and is dropped for the same reason. */
+    #overlay.rot90 #overlayText,
+    #overlay.rot270 #overlayText {
+      left: auto; right: 8px; top: 8px;
     }
+    /* The room map, drawn on the phone so the survey can be read while walking
+       it. Under .blank-screen (z-index 100), so blanking still covers
+       everything; over the passthrough, which is behind the whole overlay. */
+    /* dvh, not vh or a bottom inset: the Android navigation bar comes and goes
+       and the map has to end where the screen does either way. */
+    /* No CSS background: the backdrop is painted by the renderer, which is what
+       lets it be turned off — a background here would still be opaque under a
+       cleared canvas. */
+    #mapCanvas {
+      position: absolute; left: 0; width: 100%; display: none;
+      z-index: 30;
+    }
+    #mapCanvas.split { display: block; top: 50%; height: 50%; }
+    #mapCanvas.full { display: block; top: 0; height: 100%; }
+    /* The camera, scaled down, for when the map has the whole screen. The AR
+       passthrough cannot be shrunk — the UA composites it behind the entire
+       overlay — but the detector already reads the camera image back every
+       detection frame, so this is that image at a tenth of the size and is
+       also exactly what the tag detector is looking at. */
+    /* Bottom right, clear of both the buttons under it and the text chip up
+       top: those are the two things that must stay readable over the map. */
+    #camCanvas {
+      position: absolute; display: none;
+      right: 8px;
+      bottom: calc(env(safe-area-inset-bottom, 0px) + 64px);
+      width: 30%; height: auto; z-index: 35;
+      border-radius: 6px; border: 1px solid rgba(255,255,255,0.25);
+    }
+    #camCanvas.on { display: block; }
+    /* Out of the way of the button column, and smaller: 30% of a landscape box
+       is a third of the long edge, which is a much bigger picture than the same
+       number upright. */
+    #overlay.rot90 #camCanvas,
+    #overlay.rot270 #camCanvas {
+      right: auto; left: 8px;
+      bottom: calc(env(safe-area-inset-bottom, 0px) + 8px);
+      width: 18%;
+    }
+    /* Above the map: the chip is the diagnostic surface and the buttons are the
+       only way back out of a full-screen map. */
+    #overlayText, #overlayBtns { z-index: 40; }
+    /* One row, one set of edge insets — the buttons moved as a group when the
+       screen turned, and three separate anchors meant three places to get that
+       wrong. Upright they run along the bottom, clear of the gesture bar. */
+    #overlayBtns {
+      position: absolute;
+      left: 8px; right: 8px;
+      bottom: calc(env(safe-area-inset-bottom, 0px) + 16px);
+      display: flex; justify-content: space-between; align-items: flex-end;
+      gap: 10px;
+    }
+    /* Turned sideways they stack down the right-hand edge instead: the bottom
+       of a landscape screen is where Android's own bars sit, and a row of
+       buttons across it is both cramped and in their way. */
+    #overlay.rot90 #overlayBtns,
+    #overlay.rot270 #overlayBtns {
+      left: auto; right: 8px;
+      top: 8px; bottom: 8px;
+      /* Bottom of the column, not the middle: the chip now has the top of this
+         same edge, and centred buttons reached up into it. */
+      flex-direction: column; justify-content: flex-end; align-items: flex-end;
+    }
+    #overlayBtns button { padding: 5px 9px; font-size: 11px; }
+    /* Only while there is a map for them to act on. */
+    #minimalBtn, #headingBtn { display: none; }
+    #minimalBtn.on, #headingBtn.on { display: block; }
   </style>
 </head>
 <body>
@@ -54,13 +151,25 @@
     <button id="startBtn" class="wide" type="button" disabled>Start XR session</button>
   </main>
   <div id="overlay">
-    <div id="overlayText"></div>
-    <button id="blankBtn" type="button">Blank</button>
+    <div id="overlayRot">
+      <canvas id="mapCanvas"></canvas>
+      <canvas id="camCanvas"></canvas>
+      <div id="overlayText"></div>
+      <div id="overlayBtns">
+        <button id="mapBtn" type="button">Map</button>
+        <button id="minimalBtn" type="button">Minimal</button>
+        <button id="headingBtn" type="button">Heading</button>
+        <button id="blankBtn" type="button">Blank</button>
+      </div>
+    </div>
   </div>
   <script src="/common.js"></script>
   <script src="/cv-common.js"></script>
   <script src="/pose-math.js"></script>
   <script src="/detect-core.js"></script>
+  <script src="/anim.js"></script>
+  <script src="/map2d.js"></script>
+  <script src="/room-feed.js"></script>
   <script src="/xr-client.js"></script>
 </body>
 </html>
