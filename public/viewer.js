@@ -315,14 +315,15 @@ const wallsBtn = document.getElementById('wallsBtn');
 const clearTagsBtn = document.getElementById('clearTagsBtn');
 const clearCarveBtn = document.getElementById('clearCarveBtn');
 
-// Actions, not toggles. Clearing the survey forgets the anchor — the whole
-// room frame — so it asks; the carve grid rebuilds in one sweep and does not.
-clearTagsBtn.onclick = () => {
-  if (confirm('Reset the whole survey? Every tag, including the anchor, is forgotten.')) {
-    signaling.send({ type: 'survey-clear' });
-  }
-};
-clearCarveBtn.onclick = () => signaling.send({ type: 'walls-clear' });
+// Actions, not toggles, and both forget something no undo brings back, so both
+// arm on the first click and act on the second — the same two-click gesture as
+// the per-tag remove in the drawer, from the same primitive.
+confirmButton(clearTagsBtn, () => signaling.send({ type: 'survey-clear' }), {
+  armedTitle: 'Click again to forget every tag, the anchor included — the whole room frame',
+});
+confirmButton(clearCarveBtn, () => signaling.send({ type: 'walls-clear' }), {
+  armedTitle: 'Click again to wipe the carved free space and walls',
+});
 const sceneCanvas = document.getElementById('scene');
 const map2dCanvas = document.getElementById('map2d');
 const mapSideCanvas = document.getElementById('mapSide');
@@ -339,8 +340,10 @@ let combinedActive = true;   // shown at the top of the drawer
 // canvas forever.
 const camsVisible = () => combinedActive && showDrawer;
 const sceneView = createSceneView(sceneCanvas);
-// Double-clicking a tag in the top view forgets it — the escape hatch for
-// tags that are gone from the room (e.g. one that was shown on a screen).
+// The escape hatch for tags that are gone from the room (e.g. one that was
+// shown on a screen). Driven from the drawer card's own remove button, not from
+// the room views: the gesture there was a double-click on the tag, sharing one
+// gesture with the view reset on a target a few pixels across.
 // Forgetting the anchor resets the whole survey.
 const forgetMarker = (id) => signaling.send({ type: 'marker-remove', id });
 // Which tag the pointer is on, wherever it is: a card in the drawer, a bar in
@@ -355,7 +358,7 @@ function setHoveredTag(id) {
   roomViewList.forEach((v) => v.setHoveredMarker?.(id));
   clientsPanel.setHoveredTag(id);
 }
-const mapOpts = { onMarkerDblClick: forgetMarker, onMarkerHover: setHoveredTag };
+const mapOpts = { onMarkerHover: setHoveredTag };
 const map2dView = createMap2dView(map2dCanvas, 'top', mapOpts);
 const mapSideView = createMap2dView(mapSideCanvas, 'side', mapOpts);
 // All room views consume identical updates.
@@ -687,6 +690,7 @@ const clientsPanel = createClientsPanel(document.getElementById('drawer'), {
   onVcam: (clientId, on) => setVcam(on ? clientId : null),
   onRename: (clientId, name) => signaling.send({ type: 'device-rename', clientId, name }),
   onTagHover: setHoveredTag,
+  onTagRemove: forgetMarker,
 });
 // Open by default: the drawer is the only place that lists a client which has no
 // tile, so starting closed hides exactly the clients worth knowing about.

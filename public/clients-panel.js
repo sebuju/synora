@@ -18,7 +18,7 @@ const PANEL_RESOLUTIONS = ['480p', '720p', '1080p', '1440p', '4K'];
 // A pose older than this says nothing about where the client is now.
 const PANEL_POSE_STALE_MS = 2000;
 
-function createClientsPanel(el, { onControl, onVcam, onRename, onTagHover }) {
+function createClientsPanel(el, { onControl, onVcam, onRename, onTagHover, onTagRemove }) {
   const cards = new Map();   // clientId -> card DOM
 
   function button(label, title) {
@@ -231,8 +231,16 @@ function createClientsPanel(el, { onControl, onVcam, onRename, onTagHover }) {
   // measures. What a card answers instead is what the drawing cannot say: where
   // the tag sits, which way it faces, how well established it is, and whether
   // anyone is looking at it right now.
-  const tagCards = new Map();   // tag id -> { root, live }
+  const tagCards = new Map();   // tag id -> { root, live, confirm }
   let tagsFrom = null;
+  // Which tag's remove button is halfway through its two-click confirmation,
+  // held for the same reason the hover is: the cards are rebuilt whenever the
+  // marker map object is replaced, which is every time any tag is refined —
+  // several times a second while a client is streaming. The arming is about the
+  // tag, not the button that was torn out, so it is carried across; otherwise
+  // the second click can never land while a survey is running.
+  let armedTagId = null;
+  let armedTagConfirm = null;
   // Whether each tag's stored pose is still walking anywhere. `resid` alone
   // cannot answer that — it is one fix's disagreement, and the fixes are noisy,
   // so it never falls to the few millimetres that read as converged and every
@@ -269,6 +277,8 @@ function createClientsPanel(el, { onControl, onVcam, onRename, onTagHover }) {
     // every marker-map message and this panel repaints four times a second.
     if (tagsFrom === markerMap) return;
     tagsFrom = markerMap;
+    const wasArmed = armedTagId;
+    armedTagConfirm?.disarm();
     tagsEl.replaceChildren();
     tagCards.clear();
     for (const tag of [...(markerMap?.markers || [])].sort((a, b) => a.id - b.id)) {
@@ -388,6 +398,30 @@ function createClientsPanel(el, { onControl, onVcam, onRename, onTagHover }) {
       const live = document.createElement('div');
       lines.append(live);
 
+      // The escape hatch for a tag that is gone from the room — one shown on a
+      // screen, or a wall that was repainted. This is the only way to forget one
+      // now: it used to be a double-click on the tag in the top view, which is
+      // also the gesture that resets that view, on a target a few pixels across.
+      const rm = document.createElement('button');
+      rm.type = 'button';
+      rm.className = 'icon-btn mini rm';
+      rm.title = isAnchor
+        ? `Forget tag ${tag.id} — it is the anchor, so the whole survey resets`
+        : `Forget tag ${tag.id}`;
+      rm.setAttribute('aria-label', `Forget tag ${tag.id}`);
+      rm.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"'
+        + ' stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12"/><path d="M18 6L6 18"/></svg>';
+      const confirm = confirmButton(rm, () => onTagRemove?.(tag.id), {
+        armedTitle: isAnchor
+          ? 'Click again to forget the anchor — the whole survey resets'
+          : `Click again to forget tag ${tag.id}`,
+        onArmed: (on) => {
+          armedTagId = on ? tag.id : null;
+          armedTagConfirm = on ? confirm : null;
+        },
+      });
+      head.append(rm);
+
       // Pointing at a tag here points at it in the room views, and vice versa.
       // Reported, never applied: which tag is hot is the viewer's to decide, or
       // the card and the map would each hold their own answer and disagree the
@@ -398,8 +432,9 @@ function createClientsPanel(el, { onControl, onVcam, onRename, onTagHover }) {
       root.append(head, lines);
       root.classList.toggle('hot', tag.id === hotTagId);
       tagsEl.append(root);
-      tagCards.set(tag.id, { root, live });
+      tagCards.set(tag.id, { root, live, confirm });
     }
+    if (wasArmed !== null) tagCards.get(wasArmed)?.confirm.arm();
     // A removed tag that comes back is a re-survey, not a continuation, so its
     // old stillness is not evidence about the new pose.
     for (const id of settleHist.keys()) {

@@ -450,6 +450,95 @@ function createBlankScreen(root, onChange) {
   };
 }
 
+// Two-click confirmation for a button that forgets something. The first click
+// arms it — red, and its title says what the second one will do — and only the
+// second acts.
+//
+// Shared, and with the armed button held module-wide, because the disarming is
+// the whole of it: at most one button on the page is armed at a time, anything
+// else the pointer goes down on disarms it, and so does taking the pointer
+// away. A per-button copy of that leaves two buttons armed at once, which is
+// the one state where the wrong one catches the second click.
+//
+// Not a confirm() dialog: the dashboard repaints four times a second behind a
+// modal, and one of these buttons is a hover-revealed icon a modal would take
+// the pointer away from.
+const CONFIRM_SLACK_PX = 64;   // pointer further than this from the button disarms it
+let armedConfirm = null;
+
+function disarmConfirm() {
+  armedConfirm?.disarm();
+}
+
+function confirmButton(el, onConfirm, { armedTitle = 'Click again to confirm', onArmed } = {}) {
+  const idleTitle = el.title;
+
+  // Capture phase: a click on anything else must disarm this before that
+  // control's own handler runs, or one gesture reads as two actions.
+  function onPointerDown(ev) {
+    if (!el.contains(ev.target)) disarm();
+  }
+
+  // "Away" with slack rather than a pointerleave: these are small buttons (the
+  // per-tag one is 18 px), and a hand that wobbles a pixel off one has not
+  // changed its mind. The connectedness check is the other way an armed button
+  // leaves — the drawer rebuilds its cards out from under it.
+  function onPointerMove(ev) {
+    if (!el.isConnected) {
+      disarm();
+      return;
+    }
+    const r = el.getBoundingClientRect();
+    const dx = Math.max(r.left - ev.clientX, 0, ev.clientX - r.right);
+    const dy = Math.max(r.top - ev.clientY, 0, ev.clientY - r.bottom);
+    if (Math.hypot(dx, dy) > CONFIRM_SLACK_PX) disarm();
+  }
+
+  function onKeyDown(ev) {
+    if (ev.key === 'Escape') disarm();
+  }
+
+  function arm() {
+    if (armedConfirm === handle) return;
+    disarmConfirm();
+    armedConfirm = handle;
+    el.classList.add('confirm');
+    el.title = armedTitle;
+    document.addEventListener('pointerdown', onPointerDown, true);
+    document.addEventListener('pointermove', onPointerMove, true);
+    document.addEventListener('keydown', onKeyDown, true);
+    onArmed?.(true);
+  }
+
+  function disarm() {
+    if (armedConfirm !== handle) return;
+    armedConfirm = null;
+    el.classList.remove('confirm');
+    el.title = idleTitle;
+    document.removeEventListener('pointerdown', onPointerDown, true);
+    document.removeEventListener('pointermove', onPointerMove, true);
+    document.removeEventListener('keydown', onKeyDown, true);
+    onArmed?.(false);
+  }
+
+  const handle = {
+    arm,
+    disarm,
+    get armed() {
+      return armedConfirm === handle;
+    },
+  };
+  el.addEventListener('click', () => {
+    if (handle.armed) {
+      disarm();
+      onConfirm();
+    } else {
+      arm();
+    }
+  });
+  return handle;
+}
+
 // How a pose message's camera model should be described and how loudly. Both
 // the client overlay and the dashboard tile report this, from the same wire
 // fields, so the wording cannot drift between them.

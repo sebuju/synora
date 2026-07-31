@@ -200,6 +200,30 @@ button.toggle.on::before {
   height: 16px;
 }
 
+/* Smaller again, for an icon that sits inside a card rather than in a row of
+   controls: it is an escape hatch, not something being reached for. */
+.icon-btn.mini {
+  padding: 2px;
+  border-radius: 5px;
+}
+
+.icon-btn.mini svg {
+  width: 12px;
+  height: 12px;
+}
+
+/* Armed by `confirmButton`: this click was the first of two, and the next one
+   forgets something. Red is the whole signal, so it overrides the hover and the
+   active fills too — a hovered armed button that went grey would read as having
+   dropped back to idle under the pointer that armed it. */
+button.confirm,
+button.confirm:hover:not(:disabled),
+button.confirm:active:not(:disabled) {
+  background: #a5231f;
+  border-color: #d8443e;
+  color: #fff;
+}
+
 /* Mic and speaker carry their own strike-through, shown while they are off —
    the one state an audio icon must read at a glance without the fill. */
 #micBtn.active .slash,
@@ -656,6 +680,8 @@ body.paused #pauseOverlay {
    about it", and giving the second one its own class is how the two drift
    apart. Which is why this is not named after clients. */
 .drawer-card {
+  /* Anchors the tag card's remove button to the corner. */
+  position: relative;
   margin-bottom: 8px;
   padding: 8px 10px;
   background: #1c1c1c;
@@ -719,6 +745,24 @@ body.paused #pauseOverlay {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 11px;
   color: #9a9a9a;
+}
+
+/* Forgetting a tag is rare and the card is a readout, so the button is there
+   when the pointer is and out of the way otherwise. Kept visible while armed —
+   the pointer can be within the slack that holds the arming but off the card,
+   and a confirmation that vanishes with the thing it is confirming is worse
+   than none. `visibility` rather than `display`, so it still has a box to
+   measure against for that slack. */
+.drawer-card .rm {
+  position: absolute;
+  top: 5px;
+  right: 6px;
+  visibility: hidden;
+}
+
+.drawer-card:hover .rm,
+.drawer-card .rm.confirm {
+  visibility: visible;
 }
 
 .drawer-card .lines {
