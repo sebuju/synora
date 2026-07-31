@@ -6,8 +6,21 @@
 // Same data feeds as the 3D scene — markers and client poses — rendered
 // with plain canvas 2D. Viewport auto-fits whatever exists.
 
-function createMap2dView(canvas, mode = 'top', { onMarkerHover } = {}) {
+// `raf` is injectable because the XR client draws this map from inside an
+// immersive-AR session, where the page's own requestAnimationFrame is not
+// guaranteed to run — there the session's frame loop drives it instead.
+// Ceiling on the drawn canvas's backing store, in pixels — about 16 MB of
+// RGBA. Comfortably above a desktop map at DPR 2 and a phone screen at DPR 3,
+// and below what an Android renderer will refuse to allocate.
+const MAX_BACKING_PX = 4e6;
+
+function createMap2dView(canvas, mode = 'top', { onMarkerHover, raf, maxPixels } = {}) {
   const ctx = canvas.getContext('2d');
+  const nextFrame = raf || ((cb) => requestAnimationFrame(cb));
+  // A caller that is paying for every pixel twice — once to draw, once for the
+  // compositor to lift a full-screen layer over camera passthrough every frame
+  // — can buy sharpness back down. See MAX_BACKING_PX.
+  const maxBackingPx = maxPixels || MAX_BACKING_PX;
   // Projection of a room-frame point onto this view's two axes; the second
   // axis is drawn downward for the floor plan and upward for the elevation.
   const proj = mode === 'side'
@@ -53,6 +66,9 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover } = {}) {
   // empty space at either end of a bar seen edge-on.
   // [{ id, x1, y1, x2, y2, chip: { cx, cy, ang, halfW, halfH } }]
   let lastGlyphs = [];
+  // text -> half its width in pixels, for the label dodge. Lives across frames:
+  // the font never changes, so a string measured once is measured for good.
+  const textHalfWidths = new Map();
   // Which tag is highlighted. Set from outside only: the drawer and both map
   // views highlight the same tag at once, so the one place that can know is the
   // viewer, and every renderer here is told rather than deciding for itself.
@@ -80,9 +96,35 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover } = {}) {
   let nextWallKey = 1;
   let showWalls = true;
   let wallsAlpha = 1;
+  // The dark backdrop and the 1 m grid it carries: everything that is only
+  // there to be drawn *on*. Turned off, the canvas is cleared instead of
+  // filled, so whatever is behind it shows through — on the XR client that is
+  // the camera passthrough, and the map becomes a HUD over the room rather than
+  // a picture of it. Faded rather than switched for the same reason every other
+  // toggle here is.
+  let showBackdrop = true;
+  let backdropAlpha = 1;
+  // The right-angle legs between neighbouring tags and their length labels.
+  // Separate from the backdrop because they are a different kind of clutter —
+  // the backdrop is what the room is drawn on, these are a measurement drawn
+  // over it — and a caller may want the room without either.
+  let showPairs = true;
+  let pairsAlpha = 1;
+  // Heading-up: the map turns and the client marker stops turning, instead of
+  // the other way round. Held as the angle the whole drawing is rotated by,
+  // eased like everything else — heading comes off a live pose and a map that
+  // tracked it frame for frame would shiver. Only the floor plan can do this;
+  // an elevation has no heading to be up.
+  let headingRad = null;   // null: north up, the room frame's own orientation
+  let viewRot = 0;
+  const HEADING_TAU_MS = 260;
   const FLOOR_FREE_CSS = 'rgba(127,184,164,0.16)';
   const FLOOR_OCC_CSS = 'rgba(223,120,100,0.25)';
   const FLOOR_EDGE_CSS = 'rgba(190,208,200,0.35)';
+  // Deduced obstructions (blocked sight lines, enclosed never-visited
+  // pockets): inferred, not measured — amber, the same standing the dashed
+  // inferred walls have against asserted ones.
+  const FLOOR_DEDUCED_CSS = 'rgba(212,168,90,0.30)';
   // Neutral white, not a tag colour: the highlight has to read the same on
   // every tag, and each tag already owns a colour of its own.
   const HOVER_HALO_CSS = 'rgba(255,255,255,0.55)';
@@ -272,20 +314,65 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover } = {}) {
     const obstacles = [];
     const queueLabel = (key, text, x, y, color, bg, alpha = 1) =>
       labels.push({ key, text, x, y, color, bg, alpha });
+    // Nearest first, so a label sits as close to its mark as it can. The ring
+    // reaches further than it used to because labels now block each other as
+    // well as the strokes: a cluster of sight lines to one tag exhausted the
+    // old nine spots and fell back to overprinting at the anchor.
     const LABEL_OFFSETS = [
-      [0, 0], [0, -12], [0, 12], [14, 0], [-14, 0],
-      [14, -12], [-14, -12], [0, -24], [0, 24],
+      [0, 0],
+      [0, -12], [0, 12],
+      [14, 0], [-14, 0],
+      [14, -12], [-14, -12], [14, 12], [-14, 12],
+      [0, -24], [0, 24],
+      [14, -24], [-14, -24], [14, 24], [-14, 24],
+      [28, 0], [-28, 0],
+      [0, -36], [0, 36],
     ];
+    // Boxes already taken by a label drawn this frame. A label is an obstacle
+    // to the next label exactly as a wall is: the dodge searched only the
+    // strokes, so two labels landing on the same spot both took it.
+    const taken = [];
+    const LABEL_PAD = 2;
+    // Set from viewRot once the map's rotation is known, and applied per label
+    // to cancel it. Zero when the map is north-up, which is every frame on the
+    // dashboard.
+    let labelRot = 0;
     function flushLabels() {
-      for (const lb of labels) {
+      // Widths are measured once per distinct string, not once per label per
+      // frame: the font is a constant here, so the same twenty-odd strings were
+      // being measured thirty times a second for no new information.
+      const halfWidth = (text) => {
+        let half = textHalfWidths.get(text);
+        if (half === undefined) {
+          if (textHalfWidths.size > 512) textHalfWidths.clear();
+          half = ctx.measureText(text).width / 2;
+          textHalfWidths.set(text, half);
+        }
+        return half;
+      };
+      // Solid labels claim their spot first and the fading ones dodge around
+      // them, never the other way round. Below half opacity a label stops
+      // reserving at all — a ghost about to disappear must not push a live
+      // label aside for good, since a kept spot is only given up when blocked.
+      const order = labels.slice().sort((a, b) => b.alpha - a.alpha);
+      for (const lb of order) {
         if (lb.alpha <= 0.01) continue;
         ctx.globalAlpha = lb.alpha;
-        const half = ctx.measureText(lb.text).width / 2;
+        const half = halfWidth(lb.text);
         let x = lb.x;
         let y = lb.y;
+        const boxAt = (ox, oy) => ({
+          minX: lb.x + ox - half - LABEL_PAD,
+          minY: lb.y + oy - 11 - LABEL_PAD,
+          maxX: lb.x + ox + half + LABEL_PAD,
+          maxY: lb.y + oy + 3 + LABEL_PAD,
+        });
         const clearAt = (ox, oy) => {
           const cx = lb.x + ox;
           const cy = lb.y + oy;
+          const b = boxAt(ox, oy);
+          if (taken.some((t) => t.minX < b.maxX && t.maxX > b.minX
+            && t.minY < b.maxY && t.maxY > b.minY)) return false;
           return obstacles.every((o) => !segHitsBox(o.x1, o.y1, o.x2, o.y2,
             cx - half - o.r, cy - 10 - o.r, cx + half + o.r, cy + 2 + o.r));
         };
@@ -306,6 +393,20 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover } = {}) {
           labelSpots.set(lb.key, picked);
           labelSeen.add(lb.key);
         }
+        // Reserved whether or not a clear spot was found: with every offset
+        // blocked the label still lands somewhere and still covers that box,
+        // so the next label has to route around it either way.
+        if (lb.alpha > 0.5) taken.push(boxAt(x - lb.x, y - lb.y));
+        // The dodge above runs in the same turned space as the geometry it is
+        // dodging; only the drawing is straightened, about the spot the label
+        // ended up at. Text that rode the rotation would be sideways or upside
+        // down exactly when the map is most in use.
+        if (labelRot) {
+          ctx.save();
+          ctx.translate(x, y);
+          ctx.rotate(labelRot);
+          ctx.translate(-x, -y);
+        }
         if (lb.bg) {
           const w2 = half + 4;
           ctx.fillStyle = lb.bg;
@@ -313,6 +414,7 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover } = {}) {
         }
         ctx.fillStyle = lb.color;
         ctx.fillText(lb.text, x, y);
+        if (labelRot) ctx.restore();
       }
       ctx.globalAlpha = 1;
       // A label that stopped being queued has nothing to remember.
@@ -328,9 +430,33 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover } = {}) {
       schedule();
       return;
     }
-    if (canvas.width !== w || canvas.height !== h) {
-      canvas.width = w;
-      canvas.height = h;
+    // Backing store in device pixels, drawing in CSS pixels: every coordinate
+    // below (and every font size) is laid out against `w`/`h`, and the pointer
+    // reports the same units, so the ratio lives in the transform and nowhere
+    // else. On a phone at DPR 3 — the XR client's map, full screen — a CSS-pixel
+    // backing store is visibly soft. Writing canvas.width resets the transform,
+    // so it is re-applied here rather than once at construction.
+    //
+    // Capped in total pixels, and the cap is not paranoia: a canvas whose
+    // backing store cannot be allocated does not throw or fall back, it renders
+    // as a broken-image icon and takes the whole view with it. The element's
+    // client size is not always in CSS pixels — inside an immersive-AR DOM
+    // overlay it can already be device pixels while devicePixelRatio still
+    // reports 3, which asks for nine times the area of the screen it is drawn
+    // on. Below 1 is allowed: a soft map beats a broken one.
+    // Bounded by the display as well as by the constant: no canvas needs more
+    // pixels than the screen it is drawn on, and a canvas whose CSS size does
+    // not resolve reports its own backing store as its client size — which
+    // makes every frame ask for dpr times the last one. That loop is a layout
+    // bug wherever it happens, but it must not be able to take the view down.
+    const screenPx = (window.innerWidth || w) * (window.innerHeight || h)
+      * (window.devicePixelRatio || 1) ** 2;
+    const dpr = Math.min(window.devicePixelRatio || 1,
+      Math.sqrt(Math.min(maxBackingPx, screenPx) / (w * h)));
+    if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+      canvas.width = Math.round(w * dpr);
+      canvas.height = Math.round(h * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     }
 
     // Smooth clients toward their latest pose (same time constant as 3D).
@@ -400,6 +526,17 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover } = {}) {
 
     poseMix = animFade(poseMix, showPose, dt);
     wallsAlpha = animFade(wallsAlpha, showWalls, dt);
+    backdropAlpha = animFade(backdropAlpha, showBackdrop, dt);
+    pairsAlpha = animFade(pairsAlpha, showPairs, dt);
+    // Eased the short way round, or turning past the wrap point sends the whole
+    // room the long way about.
+    {
+      const target = mode === 'top' && headingRad !== null ? headingRad : 0;
+      // `target - delta` is the current angle re-expressed within half a turn of
+      // the target; easing from there can only go the short way.
+      const delta = Math.atan2(Math.sin(target - viewRot), Math.cos(target - viewRot));
+      viewRot = animApproach(target - delta, target, dt, HEADING_TAU_MS);
+    }
     floorMix = animFade(floorMix, true, dt);
     if (floorMix === 1) prevFloor = null;
 
@@ -438,10 +575,18 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover } = {}) {
     }
     let spanA = Math.max(maxA - minA, 5);
     let spanB = Math.max(maxB - minB, 5);
+    // Rotating, the fit is taken against the shorter side for *both* spans: a
+    // fit that used the true bounds would change as the room turned, so the map
+    // would breathe in and out while walking a curve. This one is stable at
+    // every angle, at the cost of being a little further out than it must be.
+    const turning = Math.abs(viewRot) > 1e-3
+      || (mode === 'top' && headingRad !== null);
     lastFit = {
       ca: (minA + maxA) / 2,
       cb: (minB + maxB) / 2,
-      scale: Math.min((w - 60) / spanA, (h - 60) / spanB),
+      scale: turning
+        ? (Math.min(w, h) - 60) / Math.max(spanA, spanB)
+        : Math.min((w - 60) / spanA, (h - 60) / spanB),
     };
     // Ease toward whichever view is in force. The scale eases geometrically —
     // a zoom is a ratio, and easing it linearly makes zooming out crawl while
@@ -461,8 +606,32 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover } = {}) {
     const toPx = (a, b) => [(a - ca) * scale + w / 2, orient * (b - cb) * scale + h / 2];
     const px = (p) => toPx(...proj(p));
 
-    ctx.fillStyle = '#181818';
-    ctx.fillRect(0, 0, w, h);
+    // Cleared, not just painted over: a transparent backdrop has to actually
+    // erase the last frame, and the fill below is what makes it opaque again.
+    // Both in screen space, before the rotation below — the backdrop is the
+    // canvas, not part of the drawing, and a rotated fill would leave the
+    // corners of the screen bare.
+    ctx.clearRect(0, 0, w, h);
+    if (backdropAlpha > 0.01) {
+      ctx.globalAlpha = backdropAlpha;
+      ctx.fillStyle = '#181818';
+      ctx.fillRect(0, 0, w, h);
+      ctx.globalAlpha = 1;
+    }
+
+    // Everything from here to flushLabels() is drawn in a space turned by
+    // `viewRot` about the middle of the canvas. One transform rather than a
+    // rotation baked into toPx: the carved floor is a bitmap and can only be
+    // turned by the context, and a projection that rotated points but not the
+    // raster would tear the two apart. Labels undo it one at a time when they
+    // are finally drawn, so text stays upright whatever the map is doing.
+    const turned = Math.abs(viewRot) > 1e-4;
+    if (turned) {
+      ctx.save();
+      ctx.translate(w / 2, h / 2);
+      ctx.rotate(viewRot);
+      ctx.translate(-w / 2, -h / 2);
+    }
 
     // Attested free space, under everything: it is the claim the rest of the
     // drawing stands on. Only the floor plan can show it — the side view has
@@ -485,21 +654,31 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover } = {}) {
       ctx.imageSmoothingEnabled = true;
     }
 
-    // 1 m grid.
-    ctx.strokeStyle = '#242424';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    for (let ga = Math.ceil(ca - spanA); ga <= Math.floor(ca + spanA); ga++) {
-      const [sx] = toPx(ga, 0);
-      ctx.moveTo(sx, 0);
-      ctx.lineTo(sx, h);
+    // 1 m grid. Part of the backdrop, not of the room: it is a ruler drawn on
+    // the paper, and over camera passthrough it is the first thing in the way.
+    if (backdropAlpha > 0.01) {
+      ctx.globalAlpha = backdropAlpha;
+      ctx.strokeStyle = '#242424';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      // Turned, the screen's corners reach past the span that covers it square
+      // on — worst case the diagonal, so the lines are run and drawn that much
+      // further out. Cheap: they are clipped, not rasterised.
+      const reach = turned ? Math.SQRT2 : 1;
+      const over = turned ? (Math.SQRT2 - 1) / 2 : 0;
+      for (let ga = Math.ceil(ca - spanA * reach); ga <= Math.floor(ca + spanA * reach); ga++) {
+        const [sx] = toPx(ga, 0);
+        ctx.moveTo(sx, -h * over);
+        ctx.lineTo(sx, h * (1 + over));
+      }
+      for (let gb = Math.ceil(cb - spanB * reach); gb <= Math.floor(cb + spanB * reach); gb++) {
+        const [, sy] = toPx(0, gb);
+        ctx.moveTo(-w * over, sy);
+        ctx.lineTo(w * (1 + over), sy);
+      }
+      ctx.stroke();
+      ctx.globalAlpha = 1;
     }
-    for (let gb = Math.ceil(cb - spanB); gb <= Math.floor(cb + spanB); gb++) {
-      const [, sy] = toPx(0, gb);
-      ctx.moveTo(0, sy);
-      ctx.lineTo(w, sy);
-    }
-    ctx.stroke();
 
     ctx.font = '12px ui-monospace, monospace';
     ctx.textAlign = 'center';
@@ -606,7 +785,7 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover } = {}) {
     // the same decomposition the client drawer lists. Drawn under the tags and
     // the clients, being the static thing.
     ctx.lineWidth = 1;
-    for (const { a, b, kind } of pairs) {
+    for (const { a, b, kind } of pairsAlpha > 0.01 ? pairs : []) {
       // Read off the live tags rather than off the positions the map arrived
       // with: the tags are gliding to those positions, and a leg drawn to
       // where a tag is going to be detaches from the tag it belongs to.
@@ -614,7 +793,8 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover } = {}) {
       const bp = markers.get(b.id)?.pos || b.p;
       // A leg is a statement about two tags, so it is only as present as the
       // less present of them.
-      const legAlpha = Math.min(markers.get(a.id)?.fade ?? 1, markers.get(b.id)?.fade ?? 1);
+      const legAlpha = pairsAlpha
+        * Math.min(markers.get(a.id)?.fade ?? 1, markers.get(b.id)?.fade ?? 1);
       if (legAlpha <= 0.01) continue;
       ctx.globalAlpha = legAlpha;
       // The elbow: b's first axis, a's second. Whichever component the mode
@@ -845,14 +1025,19 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover } = {}) {
       ctx.globalAlpha = 1;
     }
 
+    // Back to screen space for the text. The labels carry turned-space
+    // coordinates, so the context has to still be turned while they are placed
+    // — each one straightens itself about its own anchor instead.
+    labelRot = -viewRot;
     flushLabels();
+    if (turned) ctx.restore();
     schedule();
   }
 
   function schedule() {
     if (!rafPending && active) {
       rafPending = true;
-      requestAnimationFrame(draw);
+      nextFrame(draw);
     }
   }
 
@@ -962,7 +1147,8 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover } = {}) {
       // clear: the carve going away is as much a change as the carve arriving.
       prevFloor = floor;
       floorMix = prevFloor ? 0 : 1;
-      if (!f || (!f.free.length && !f.occ.length)) {
+      const deduced = (f && f.deduced) || [];
+      if (!f || (!f.free.length && !f.occ.length && !deduced.length)) {
         floor = null;
         schedule();
         return;
@@ -979,6 +1165,7 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover } = {}) {
       };
       scan(f.free);
       scan(f.occ);
+      scan(deduced);
       const cw = maxIx - minIx + 1;
       const ch = maxIz - minIz + 1;
       const cnv = document.createElement('canvas');
@@ -992,6 +1179,7 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover } = {}) {
         }
       };
       paint(f.free, FLOOR_FREE_CSS);
+      paint(deduced, FLOOR_DEDUCED_CSS);
       paint(f.occ, FLOOR_OCC_CSS);
       // The rim of the carved region — free cells touching unknown — drawn a
       // shade brighter: it is where a wall *may* be, the tentative counterpart
@@ -1003,6 +1191,9 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover } = {}) {
       const keyOf = (ix, iz) => (ix + 2048) * 4096 + (iz + 2048);
       for (let i = 0; i < f.free.length; i += 2) known.add(keyOf(f.free[i], f.free[i + 1]));
       for (let i = 0; i < f.occ.length; i += 2) known.add(keyOf(f.occ[i], f.occ[i + 1]));
+      // Deduced cells count as known, or the frontier rim would outline a
+      // boundary the deduction already explains.
+      for (let i = 0; i < deduced.length; i += 2) known.add(keyOf(deduced[i], deduced[i + 1]));
       c.fillStyle = FLOOR_EDGE_CSS;
       for (let i = 0; i < f.free.length; i += 2) {
         const ix = f.free[i];
@@ -1124,7 +1315,30 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover } = {}) {
       if (name === 'walls') {
         showWalls = on;
         schedule();
+      } else if (name === 'backdrop') {
+        showBackdrop = on;
+        schedule();
+      } else if (name === 'pairs') {
+        showPairs = on;
+        schedule();
       }
+    },
+
+    // Turn the map so this room-frame direction points up the screen, or null
+    // to leave it in the room's own orientation. Given as the direction rather
+    // than as an angle so the caller never has to know which two axes this
+    // projection keeps or which way its second one runs — that convention lives
+    // here and has exactly one definition.
+    setHeadingUp(fwd) {
+      if (!fwd) {
+        headingRad = null;
+      } else {
+        const [fa, fb] = proj(fwd);
+        // The half turn is the difference between "which way am I facing" and
+        // "which way must the map be turned so that is up".
+        headingRad = Math.hypot(fa, fb) < 1e-6 ? headingRad : Math.atan2(-fa, -fb * orient);
+      }
+      schedule();
     },
 
   };

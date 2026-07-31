@@ -579,6 +579,58 @@ function describeCameraModel(msg) {
 }
 
 // ---------------------------------------------------------------------------
+// The room palette. Every view that draws the room reads it from here — the 3D
+// scene, both 2D maps, the client drawer, and the XR client's own map. It sat
+// in scene.js until the XR client started rendering the top-down map, and that
+// page cannot load three.js.
+
+const ROOM_CLIENT_COLORS = [0x4dabf7, 0xffa94d, 0x69db7c, 0xff6b6b, 0xda77f2, 0xffe066];
+
+// The one place a client's colour is picked. The 3D scene, the 2D maps, the
+// roster overlay and the client drawer all key off the same id, and a client
+// that reads as two different colours across them is worse than no colour.
+function roomClientColor(id) {
+  return ROOM_CLIENT_COLORS[id % ROOM_CLIENT_COLORS.length];
+}
+
+function roomClientColorCss(id) {
+  return `#${roomClientColor(id).toString(16).padStart(6, '0')}`;
+}
+
+// Room axes, indexed the way a position is: x, y, z. Near three.js's own
+// AxesHelper defaults, and the helper is told them explicitly rather than left
+// on its defaults — the 2D views and the drawer read the same three numbers,
+// and an axis that is red in one view and blue in another is worse than no
+// colour at all. `ROOM_AXIS_LEN_M` is the helper's length, so the 2D cross is
+// the same size as the 3D one and reads as the same object.
+// x and z are pulled off their pure primaries: #0000ff is the darkest colour a
+// screen can make and #ff0000 the most saturated, and the ordinates printed in
+// them were, respectively, unreadable and glaring on the drawer's near-black
+// card. Softened, not re-hued, so they stay the red and blue axes everywhere.
+const ROOM_AXIS_COLORS = [0xe05c5c, 0x00ff00, 0x4a90d9];
+const ROOM_AXIS_NAMES = ['x', 'y', 'z'];
+const ROOM_AXIS_LEN_M = 0.5;
+
+function roomAxisColorCss(k) {
+  return `#${ROOM_AXIS_COLORS[k].toString(16).padStart(6, '0')}`;
+}
+
+// Stable, distinctive colour per tag id — the golden-angle hue walk keeps any
+// two ids that appear together visually far apart. Shared by every view that
+// labels tags, so tag 3 is the same colour everywhere.
+function roomTagColorCss(id) {
+  return `hsl(${(id * 137.5) % 360}, 62%, 40%)`;
+}
+const ROOM_POSE_STALE_MS = 2000;
+
+// Green head-on sliding to red as the view of a tag gets oblique — pose
+// quality falls off hard past ~60°.
+function roomAngleColor(angleDeg) {
+  const badness = Math.min(1, Math.max(0, angleDeg / 75));
+  return `hsl(${Math.round(120 * (1 - badness))}, 85%, 55%)`;
+}
+
+// ---------------------------------------------------------------------------
 // Surveyed tag geometry, as right-angle distances. A map's own coordinates
 // cannot be checked against anything, but the distance between two tags can be
 // checked against a tape measure — and a tape measure runs along the room, so

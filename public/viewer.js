@@ -1,7 +1,6 @@
 'use strict';
 
 const grid = document.getElementById('grid');
-const empty = document.getElementById('empty');
 const muteBtn = document.getElementById('muteBtn');
 
 // clientId -> { pc, tile, video, label, camBtn }
@@ -24,8 +23,6 @@ const LOST_STALE_MS = 3500;
 let soundOn = false;
 let vcamAvailable = false;
 let vcamClientId = null;
-// Room-frame marker map, as surveyed by the server. Null until it arrives.
-let markerMap = null;
 
 const signaling = connectSignaling('viewer', {
   onOpen() {
@@ -44,6 +41,9 @@ const signaling = connectSignaling('viewer', {
   },
   async onMessage(msg) {
     if (clockSync.handle(msg)) return;
+    // Everything that describes the room — the survey, the carved floor, the
+    // walls — goes straight to the renderers through the shared feed.
+    if (roomFeed.handle(msg)) return;
     if (msg.type === 'rtp-map') {
       const dev = devices.get(msg.clientId);
       if (dev) {
@@ -74,21 +74,6 @@ const signaling = connectSignaling('viewer', {
       refreshClientsPanel();
       return;
     }
-    if (msg.type === 'marker-map') {
-      markerMap = msg;
-      roomViewList.forEach((v) => v.setMarkerMap(msg));
-      return;
-    }
-    // Carved free space and wall segments. Optional chaining because only the
-    // 2D views render them — the 3D scene opts out by not having the setter.
-    if (msg.type === 'floor') {
-      roomViewList.forEach((v) => v.setFloor?.(msg));
-      return;
-    }
-    if (msg.type === 'walls') {
-      roomViewList.forEach((v) => v.setWalls?.(msg.walls));
-      return;
-    }
     if (msg.type === 'offer') {
       await acceptOffer(msg.clientId, msg.description);
     } else if (msg.type === 'ice') {
@@ -104,7 +89,7 @@ const signaling = connectSignaling('viewer', {
       // Not folded into removeDevice: a client with no tile has no device entry
       // to remove, and an XR client never has one — it would have left its dot
       // sitting in the room views forever.
-      roomViewList.forEach((v) => v.removeClient(msg.clientId));
+      roomFeed.removeClient(msg.clientId);
       removeDevice(msg.clientId);
     } else if (msg.type === 'vcam-state') {
       if (msg.available !== undefined) vcamAvailable = msg.available;
@@ -149,22 +134,6 @@ function updateCamBtn(clientId, dev) {
 // (disabled, backgrounded) must not keep showing a distance.
 const POSE_LABEL_TTL_MS = 2000;
 
-// The room views' uncertainty ring: where this client probably is, and how
-// tightly, as the server measured it over its recent fixes. Both halves have
-// the phone's own motion divided out (ARCore knows it exactly), so the ring
-// describes the fix and not the walk — it does not swell just because the
-// client is moving, and its centre does not trail a window behind them. The
-// ring is the distribution, the dot is a single draw from it, and tying the
-// ring to the dot made the steadier of the two inherit the jitter of the
-// noisier.
-// Only the XR path reports any of this (it needs the phone's own pose to
-// separate real motion from fix noise), so anything else gets radius 0 and
-// draws no ring rather than inventing one.
-function uncertaintyOf(msg) {
-  const j = msg.room?.jitter;
-  return { r: (j?.jitterMm ?? 0) / 1000, p: j?.centre ?? null };
-}
-
 // clientId -> { msg, at } for the newest pose, whether or not that client has a
 // tile. A client with no tile is not a client with no position: the XR client
 // positions and maps without streaming, so it never opens a peer connection and
@@ -174,11 +143,7 @@ const poses = new Map();
 function updatePoseLabel(clientId, msg) {
   poses.set(clientId, { msg, at: performance.now() });
   const tags = msg.tags || [];
-  if (msg.room?.pose) {
-    const seen = tags.map((t) => t.id);
-    roomViewList.forEach((v) =>
-      v.updateClient(clientId, msg.room.pose, seen, uncertaintyOf(msg)));
-  }
+  roomFeed.applyPose(clientId, msg);
   // Only the per-tile label below needs a tile to live on.
   const dev = devices.get(clientId);
   if (!dev) return;
@@ -214,7 +179,6 @@ function updateStatus() {
   setStatus(total === 0
     ? 'no clients'
     : `${total} client${total === 1 ? '' : 's'} · ${streaming} streaming`);
-  empty.style.display = streaming === 0 ? '' : 'none';
 }
 
 function ensureDevice(clientId) {
@@ -264,7 +228,7 @@ function removeDevice(clientId) {
   if (!dev) return;
   dev.pc?.close();
   clearTimeout(dev.poseLabelTimer);
-  roomViewList.forEach((v) => v.removeClient(clientId));
+  roomFeed.removeClient(clientId);
   dev.tile.remove();
   dropFrames(dev);
   devices.delete(clientId);
@@ -363,6 +327,9 @@ const map2dView = createMap2dView(map2dCanvas, 'top', mapOpts);
 const mapSideView = createMap2dView(mapSideCanvas, 'side', mapOpts);
 // All room views consume identical updates.
 const roomViewList = [sceneView, map2dView, mapSideView];
+// The room messages reach the views through here, the same way they reach the
+// XR client's own map.
+const roomFeed = createRoomFeed(roomViewList);
 
 // --- Frame synchronisation -------------------------------------------------
 // Clients deliver frames with different end-to-end latency, so a naive
@@ -698,7 +665,7 @@ let showDrawer = true;
 
 function refreshClientsPanel() {
   if (!showDrawer) return;
-  clientsPanel.update(clientIds().map(clientInfo), markerMap);
+  clientsPanel.update(clientIds().map(clientInfo), roomFeed.getMarkerMap());
 }
 
 // Recording byte counts and pose ages move on their own; the roster message

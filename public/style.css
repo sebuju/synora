@@ -510,13 +510,6 @@ body.paused #pauseOverlay {
   min-height: 60vh;
 }
 
-#empty {
-  position: absolute;
-  color: #777;
-  font-size: 15px;
-  pointer-events: none;
-}
-
 /* Combined view: all feeds composited onto one canvas. The tile grid keeps
    rendering underneath — a hidden <video> stops producing frame callbacks,
    which is exactly what the compositing and sync code reads — so the combined
@@ -806,8 +799,4 @@ body.paused #pauseOverlay {
 
 #roomStats:empty {
   display: none;
-}
-
-#empty {
-  z-index: 3;
 }
