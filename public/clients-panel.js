@@ -18,7 +18,7 @@ const PANEL_RESOLUTIONS = ['480p', '720p', '1080p', '1440p', '4K'];
 // A pose older than this says nothing about where the client is now.
 const PANEL_POSE_STALE_MS = 2000;
 
-function createClientsPanel(el, { onControl, onVcam, onRename }) {
+function createClientsPanel(el, { onControl, onVcam, onRename, onTagHover }) {
   const cards = new Map();   // clientId -> card DOM
 
   function button(label, title) {
@@ -233,6 +233,36 @@ function createClientsPanel(el, { onControl, onVcam, onRename }) {
   // anyone is looking at it right now.
   const tagCards = new Map();   // tag id -> { root, live }
   let tagsFrom = null;
+  // Whether each tag's stored pose is still walking anywhere. `resid` alone
+  // cannot answer that — it is one fix's disagreement, and the fixes are noisy,
+  // so it never falls to the few millimetres that read as converged and every
+  // tag showed "settling" forever. What settling means is that refinement is
+  // still moving the pose, so that is what is measured: the stored pose against
+  // where it was, held here because the map object is replaced wholesale on
+  // every message and carries no history of itself.
+  const settleHist = new Map();   // tag id -> { p, q, stillAtMs }
+  // Last hover the viewer told this panel about. Held because the cards are
+  // rebuilt whenever the marker map object is replaced — several times a minute
+  // while a survey is running — and a rebuild would otherwise drop the
+  // highlight off a card the pointer is still sitting on.
+  let hotTagId = null;
+  const SETTLE_WINDOW_MS = 20000;
+  const SETTLE_MOVE_M = 0.001;
+  const SETTLE_MOVE_DEG = 0.1;
+
+  function settleState(tag) {
+    const prev = settleHist.get(tag.id);
+    const now = Date.now();
+    const moved = !prev
+      || Math.hypot(tag.p[0] - prev.p[0], tag.p[1] - prev.p[1], tag.p[2] - prev.p[2]) > SETTLE_MOVE_M
+      || quatAngleDeg(tag.q, prev.q) > SETTLE_MOVE_DEG;
+    const stillAtMs = moved ? now : prev.stillAtMs;
+    settleHist.set(tag.id, { p: tag.p, q: tag.q, stillAtMs });
+    // Tiny residual settles it immediately — otherwise a freshly opened viewer
+    // calls an obviously converged tag unsettled for the first window.
+    return (tag.resid ?? 0) <= 0.005 && (tag.residDeg ?? 0) <= 1
+      || now - stillAtMs >= SETTLE_WINDOW_MS;
+  }
 
   function buildTags(markerMap) {
     // Rebuilt only when the map object changes — it is replaced wholesale by
@@ -255,109 +285,125 @@ function createClientsPanel(el, { onControl, onVcam, onRename }) {
       // not the same claim, and that gap is usually what a position that looks
       // wrong turns out to be. The anchor has none — it is the datum, not a
       // measurement, and it is the one tag whose being wrong is undetectable.
-      kind.textContent = tag.id === markerMap.anchorId
-        ? 'anchor · room origin'
-        : `${tag.nObs} obs`;
+      const isAnchor = tag.id === markerMap.anchorId;
+      kind.textContent = isAnchor ? 'origin' : `${tag.nObs} obs`;
       head.append(name, kind);
+
+      // Everything below is a measurement, and the anchor is not one: it sits at
+      // the origin facing along the room axes by definition, was measured
+      // against nothing and can never be refined. Printing those as facts about
+      // it read as a survey result and, worse, as a fault.
+      if (!isAnchor) {
+        // Each ordinate in its own axis colour, the same three the 3D helper and
+        // the 2D crosses use. Three bare numbers give no clue which is the
+        // height, and height is the one that exposes a tilted room frame.
+        const at = document.createElement('span');
+        at.className = 'at';
+        tag.p.forEach((v, k) => {
+          const span = document.createElement('span');
+          span.style.color = roomAxisColorCss(k);
+          span.textContent = v.toFixed(2);
+          at.append(span, k < 2 ? ', ' : '');
+        });
+        head.append(at);
+      }
 
       const lines = document.createElement('div');
       lines.className = 'lines';
-      // Each ordinate in its own axis colour, the same three the 3D helper and
-      // the 2D crosses use. Three bare numbers on a line give no clue which is
-      // the height, and height is the one that exposes a tilted room frame.
-      const at = document.createElement('div');
-      at.append('at ');
-      tag.p.forEach((v, k) => {
-        const span = document.createElement('span');
-        span.style.color = roomAxisColorCss(k);
-        span.textContent = v.toFixed(2);
-        at.append(span, k < 2 ? ', ' : '');
-      });
-      // Which way the tag faces, in the same yaw/pitch convention the client
-      // rows use. A tag mounted a few degrees off is invisible in its position
-      // but is exactly what a mirror-flipped sighting leaves behind.
-      const n = quatRotate(tag.q, [0, 0, 1]);
-      const yaw = Math.atan2(n[0], n[2]) * 180 / Math.PI;
-      const pitch = Math.asin(Math.max(-1, Math.min(1, n[1]))) * 180 / Math.PI;
-      const facing = document.createElement('div');
-      facing.textContent = `faces yaw ${Math.round(yaw)}° · pitch ${Math.round(pitch)}°`;
-      // What placed this tag and how far that is from the datum. A position
-      // alone cannot say whether a tag carries the anchor's error once or three
-      // times over, and the deepest-chained tag is usually the one that looks
-      // wrong. Parents are ordered by how much of the placing each one did.
-      const via = document.createElement('div');
-      if (tag.id === markerMap.anchorId) {
-        via.textContent = 'measured against nothing';
-      } else if (tag.from?.length) {
-        // How many checks this tag has survived: promoting estimates measured
-        // against a two-known-tag fix, plus every refinement since — each one
-        // compared the stored pose against a fix from *other* tags and could
-        // have disagreed. Zero means genuinely unfalsified: placed and then
-        // never once seen beside another known tag.
-        const checked = tag.verified === null || tag.verified === undefined
-          ? 'checks unrecorded'
-          : `${tag.verified} cross-checked`;
-        via.textContent = `via ${tag.from.join(', ')} · `
-          + (tag.hops === null ? 'depth unrecorded' : `${tag.hops} hop${tag.hops === 1 ? '' : 's'} out`)
-          + ` · ${checked}`;
-        if (!tag.verified) via.className = 'warn';
-      } else {
-        // No tag in view when it was placed — the fix was ARCore carrying the
-        // pose, which is the weakest way into the map.
-        via.textContent = tag.from ? 'placed off ARCore alone' : 'placed before this was recorded';
-      }
-      // Whether the tag is still moving, and by how much it wants to. Without
-      // this the survey is a black box: a tag healing ten degrees over ten
-      // minutes and a tag frozen at the wrong orientation look identical, which
-      // is exactly how a stuck one went unnoticed. `resid` is what refinement is
-      // still being told to correct, not what it has corrected.
-      const settle = document.createElement('div');
-      if (tag.id === markerMap.anchorId) {
-        // The anchor is the room frame, not a measurement of it. It is pinned at
-        // the origin by definition and there is nothing it could be refined
-        // against — saying "never refined" about it reads as a fault when it is
-        // the one tag for which that is the correct and only possible state.
-        settle.textContent = 'fixed at the origin — the frame everything else is measured in';
-      } else if (tag.refinedAtMs) {
-        const mm = Math.round((tag.resid ?? 0) * 1000);
-        const deg = (tag.residDeg ?? 0).toFixed(1);
-        const age = Date.now() - tag.refinedAtMs;
-        const settled = mm <= 5 && (tag.residDeg ?? 0) <= 1;
-        settle.textContent = (settled ? 'settled' : 'settling')
-          + ` · off by ${mm} mm · ${deg}° · nudged ${fmtAge(age)}`;
-        if (!settled) settle.className = 'warn';
-      } else if (tag.checkedAtMs) {
-        // It has been seen beside a known tag — every check just landed too far
-        // away to average toward (past the reseed threshold refinement refuses,
-        // by design). Saying "needs another known tag in the same frame" here
-        // is false and sends whoever is holding the phone hunting the wrong
-        // problem: the tag is mis-placed, not unobserved.
-        const mm = Math.round((tag.checkOff ?? 0) * 1000);
-        settle.textContent = `disputed — checks land ${mm} mm away `
-          + `(last ${fmtAge(Date.now() - tag.checkedAtMs)} ago): too far to refine, `
-          + 'will drop and re-survey once enough witnesses agree';
-        settle.className = 'warn';
-      } else {
-        // Refinement needs two known tags in one frame, and a tag that is never
-        // seen beside another one is never corrected however long it is watched.
-        settle.textContent = 'never refined — needs another known tag in the same frame';
-        settle.className = 'warn';
-      }
-      // Asserted geometry, shown as such. This is the one number on the card
-      // that was not measured, so it says which tag it was snapped to and how
-      // far it was moved — a silent correction is indistinguishable from a
-      // survey that happened to come out clean.
-      const clip = document.createElement('div');
-      if (tag.clippedTo !== null && tag.clippedTo !== undefined) {
-        clip.textContent = `clipped ${tag.clippedMm ?? 0} mm and `
-          + `${(tag.clippedDeg ?? 0).toFixed(1)}° onto tag ${tag.clippedTo}'s plane`;
+      if (!isAnchor) {
+        // Which way the tag faces, in the same yaw/pitch convention the client
+        // rows use. A tag mounted a few degrees off is invisible in its position
+        // but is exactly what a mirror-flipped sighting leaves behind.
+        const n = quatRotate(tag.q, [0, 0, 1]);
+        const yaw = Math.atan2(n[0], n[2]) * 180 / Math.PI;
+        const pitch = Math.asin(Math.max(-1, Math.min(1, n[1]))) * 180 / Math.PI;
+        const facing = document.createElement('div');
+        facing.textContent = `yaw ${Math.round(yaw)}° · pitch ${Math.round(pitch)}°`;
+        // What placed this tag and how far that is from the datum. A position
+        // alone cannot say whether a tag carries the anchor's error once or
+        // three times over, and the deepest-chained tag is usually the one that
+        // looks wrong. Parents are ordered by how much of the placing each did.
+        const via = document.createElement('div');
+        if (tag.from?.length) {
+          // How many checks this tag has survived: promoting estimates measured
+          // against a two-known-tag fix, plus every refinement since — each one
+          // compared the stored pose against a fix from *other* tags and could
+          // have disagreed. Zero means genuinely unfalsified: placed and then
+          // never once seen beside another known tag.
+          const checked = tag.verified === null || tag.verified === undefined
+            ? 'checks unrecorded'
+            : `${tag.verified} cross-checked`;
+          via.textContent = `via ${tag.from.join(', ')} · `
+            + (tag.hops === null ? 'depth unrecorded' : `${tag.hops} hop${tag.hops === 1 ? '' : 's'} out`)
+            + ` · ${checked}`;
+          if (!tag.verified) via.className = 'warn';
+        } else {
+          // No tag in view when it was placed — the fix was ARCore carrying the
+          // pose, which is the weakest way into the map.
+          via.textContent = tag.from ? 'placed off ARCore alone' : 'placed before this was recorded';
+        }
+        // Whether the tag is still moving, and by how much it wants to. Without
+        // this the survey is a black box: a tag healing ten degrees over ten
+        // minutes and a tag frozen at the wrong orientation look identical,
+        // which is exactly how a stuck one went unnoticed. `resid` is what
+        // refinement is still being told to correct, not what it has corrected.
+        const settle = document.createElement('div');
+        if (tag.refinedAtMs) {
+          const mm = Math.round((tag.resid ?? 0) * 1000);
+          const deg = (tag.residDeg ?? 0).toFixed(1);
+          const age = Date.now() - tag.refinedAtMs;
+          const settled = settleState(tag);
+          settle.textContent = (settled ? 'settled' : 'settling')
+            + ` · off by ${mm} mm · ${deg}° · nudged ${fmtAge(age)}`;
+          if (!settled) settle.className = 'warn';
+        } else if (tag.checkedAtMs) {
+          // It has been seen beside a known tag — every check just landed too
+          // far away to average toward (past the reseed threshold refinement
+          // refuses, by design). Saying "needs another known tag in the same
+          // frame" here is false and sends whoever is holding the phone hunting
+          // the wrong problem: the tag is mis-placed, not unobserved.
+          const mm = Math.round((tag.checkOff ?? 0) * 1000);
+          settle.textContent = `disputed — checks land ${mm} mm away `
+            + `(last ${fmtAge(Date.now() - tag.checkedAtMs)} ago): too far to refine, `
+            + 'will drop and re-survey once enough witnesses agree';
+          settle.className = 'warn';
+        } else {
+          // Refinement needs two known tags in one frame, and a tag that is
+          // never seen beside another one is never corrected however long it
+          // is watched.
+          settle.textContent = 'never refined — needs another known tag in the same frame';
+          settle.className = 'warn';
+        }
+        // Asserted geometry, shown as such. This is the one number on the card
+        // that was not measured, so it says which tag it was snapped to and how
+        // far it was moved — a silent correction is indistinguishable from a
+        // survey that happened to come out clean.
+        const clip = document.createElement('div');
+        if (tag.clippedTo !== null && tag.clippedTo !== undefined) {
+          clip.textContent = `clipped ${tag.clippedMm ?? 0} mm and `
+            + `${(tag.clippedDeg ?? 0).toFixed(1)}° onto tag ${tag.clippedTo}'s plane`;
+        }
+        lines.append(facing, via, settle, clip);
       }
       const live = document.createElement('div');
-      lines.append(at, facing, via, settle, clip, live);
+      lines.append(live);
+
+      // Pointing at a tag here points at it in the room views, and vice versa.
+      // Reported, never applied: which tag is hot is the viewer's to decide, or
+      // the card and the map would each hold their own answer and disagree the
+      // moment the pointer moved between them.
+      root.onpointerenter = () => onTagHover?.(tag.id);
+      root.onpointerleave = () => onTagHover?.(null);
 
       root.append(head, lines);
+      root.classList.toggle('hot', tag.id === hotTagId);
       tagsEl.append(root);
       tagCards.set(tag.id, { root, live });
+    }
+    // A removed tag that comes back is a re-survey, not a continuation, so its
+    // old stillness is not evidence about the new pose.
+    for (const id of settleHist.keys()) {
+      if (!tagCards.has(id)) settleHist.delete(id);
     }
   }
 
@@ -400,6 +446,13 @@ function createClientsPanel(el, { onControl, onVcam, onRename }) {
   return {
     setActive(on) {
       el.classList.toggle('active', on);
+    },
+
+    // Told from outside, like the room views: one tag is hot across the whole
+    // dashboard, and this only draws it.
+    setHoveredTag(id) {
+      hotTagId = id;
+      for (const [tagId, card] of tagCards) card.root.classList.toggle('hot', tagId === id);
     },
     update(list, markerMap = null) {
       emptyEl.style.display = list.length ? 'none' : '';

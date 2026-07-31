@@ -23,18 +23,29 @@ function roomClientColorCss(id) {
   return `#${roomClientColor(id).toString(16).padStart(6, '0')}`;
 }
 
-// Room axes, indexed the way a position is: x, y, z. These are three.js's own
+// Room axes, indexed the way a position is: x, y, z. Near three.js's own
 // AxesHelper defaults, and the helper below is told them explicitly rather than
 // left on its defaults — the 2D views and the drawer read the same three
 // numbers, and an axis that is red in one view and blue in another is worse
 // than no colour at all. `ROOM_AXIS_LEN_M` is the helper's length, so the 2D
 // cross is the same size as the 3D one and reads as the same object.
-const ROOM_AXIS_COLORS = [0xff0000, 0x00ff00, 0x0000ff];
+// x and z are pulled off their pure primaries: #0000ff is the darkest colour a
+// screen can make and #ff0000 the most saturated, and the ordinates printed in
+// them were, respectively, unreadable and glaring on the drawer's near-black
+// card. Softened, not re-hued, so they stay the red and blue axes everywhere.
+const ROOM_AXIS_COLORS = [0xe05c5c, 0x00ff00, 0x4a90d9];
 const ROOM_AXIS_NAMES = ['x', 'y', 'z'];
 const ROOM_AXIS_LEN_M = 0.5;
 
 function roomAxisColorCss(k) {
   return `#${ROOM_AXIS_COLORS[k].toString(16).padStart(6, '0')}`;
+}
+
+// Stable, distinctive colour per tag id — the golden-angle hue walk keeps any
+// two ids that appear together visually far apart. Shared by every view that
+// labels tags, so tag 3 is the same colour everywhere.
+function roomTagColorCss(id) {
+  return `hsl(${(id * 137.5) % 360}, 62%, 40%)`;
 }
 const ROOM_POSE_STALE_MS = 2000;
 

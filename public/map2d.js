@@ -6,7 +6,7 @@
 // Same data feeds as the 3D scene — markers and client poses — rendered
 // with plain canvas 2D. Viewport auto-fits whatever exists.
 
-function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
+function createMap2dView(canvas, mode = 'top', { onMarkerDblClick, onMarkerHover } = {}) {
   const ctx = canvas.getContext('2d');
   // Projection of a room-frame point onto this view's two axes; the second
   // axis is drawn downward for the floor plan and upward for the elevation.
@@ -39,8 +39,17 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
   const RING_DOT_PX = 3;
   let rafPending = false;
   let lastFrameAt = 0;
-  // World->pixel mapping of the last drawn frame, for hit tests.
-  let lastPx = null;
+  // The tag glyphs of the last drawn frame, in pixels: the bar and the id chip,
+  // exactly as they were stroked. Hit tests read this rather than re-deriving a
+  // radius around the tag's centre — the glyph is a rotated bar with a chip
+  // beside it, so a circle around the middle both misses the chip and claims
+  // empty space at either end of a bar seen edge-on.
+  // [{ id, x1, y1, x2, y2, chip: { cx, cy, ang, halfW, halfH } }]
+  let lastGlyphs = [];
+  // Which tag is highlighted. Set from outside only: the drawer and both map
+  // views highlight the same tag at once, so the one place that can know is the
+  // viewer, and every renderer here is told rather than deciding for itself.
+  let hoverId = null;
   // Right-angle legs between neighbouring tags, derived once per map.
   let pairs = [];
   // Carved free-space grid, pre-rendered to a one-pixel-per-cell offscreen
@@ -52,6 +61,9 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
   const FLOOR_FREE_CSS = 'rgba(127,184,164,0.16)';
   const FLOOR_OCC_CSS = 'rgba(223,120,100,0.25)';
   const FLOOR_EDGE_CSS = 'rgba(190,208,200,0.35)';
+  // Neutral white, not a tag colour: the highlight has to read the same on
+  // every tag, and each tag already owns a colour of its own.
+  const HOVER_HALO_CSS = 'rgba(255,255,255,0.55)';
   const WALL_STROKE_CSS = '#dfe7ea';
   const WALL_FILL_CSS = 'rgba(223,231,234,0.10)';
 
@@ -97,14 +109,60 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
     canvas.setPointerCapture(ev.pointerId);
     canvas.style.cursor = 'grabbing';
   });
+  // Distance from a point to a segment, not to its infinite line: a tag bar is
+  // 150 mm of wall and the line it lies on runs the length of the room.
+  function distToSeg(x, y, x1, y1, x2, y2) {
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    const len2 = dx * dx + dy * dy;
+    const t = len2 ? Math.max(0, Math.min(1, ((x - x1) * dx + (y - y1) * dy) / len2)) : 0;
+    return Math.hypot(x - (x1 + t * dx), y - (y1 + t * dy));
+  }
+
+  // Which tag glyph is under the pointer, bar or chip. One hit test, used by
+  // both the hover highlight and the double-click that forgets a tag — two
+  // tests would mean a tag that lights up under the pointer and is not the one
+  // the click lands on.
+  const GLYPH_HIT_PX = 7;
+  function markerAt(x, y) {
+    for (const g of lastGlyphs) {
+      if (distToSeg(x, y, g.x1, g.y1, g.x2, g.y2) <= GLYPH_HIT_PX) return g.id;
+      // The chip is drawn rotated with the bar, so the point is rotated back
+      // into the chip's own frame rather than the box being grown to fit it.
+      const dx = x - g.chip.cx;
+      const dy = y - g.chip.cy;
+      const lx = Math.cos(g.chip.ang) * dx + Math.sin(g.chip.ang) * dy;
+      const ly = -Math.sin(g.chip.ang) * dx + Math.cos(g.chip.ang) * dy;
+      if (Math.abs(lx) <= g.chip.halfW && Math.abs(ly) <= g.chip.halfH) return g.id;
+    }
+    return null;
+  }
+
+  // What the pointer was last reported to be over, so a move across one tag
+  // does not repaint the drawer four hundred times.
+  let reportedHover = null;
+  function reportHover(id) {
+    if (id === reportedHover) return;
+    reportedHover = id;
+    onMarkerHover?.(id);
+  }
+
   canvas.addEventListener('pointermove', (ev) => {
-    if (!drag || drag.id !== ev.pointerId || !view) return;
+    if (!drag) {
+      const id = markerAt(ev.offsetX, ev.offsetY);
+      canvas.style.cursor = id === null ? '' : 'pointer';
+      reportHover(id);
+      return;
+    }
+    if (drag.id !== ev.pointerId || !view) return;
     view.ca -= (ev.clientX - drag.x) / view.scale;
     view.cb -= orient * (ev.clientY - drag.y) / view.scale;
     drag.x = ev.clientX;
     drag.y = ev.clientY;
     schedule();
   });
+
+  canvas.addEventListener('pointerleave', () => reportHover(null));
   const endDrag = (ev) => {
     if (!drag || drag.id !== ev.pointerId) return;
     canvas.releasePointerCapture(ev.pointerId);
@@ -118,13 +176,11 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
   // forgets that tag, anywhere else it gives the auto-fit back. Registered even
   // without onMarkerDblClick — the reset is not the caller's to opt out of.
   canvas.addEventListener('dblclick', (ev) => {
-    if (lastPx && onMarkerDblClick) {
-      for (const [id, m] of markers) {
-        const [mx, my] = lastPx(m.pos);
-        if (Math.hypot(ev.offsetX - mx, ev.offsetY - my) < 14) {
-          onMarkerDblClick(id);
-          return;
-        }
+    if (onMarkerDblClick) {
+      const id = markerAt(ev.offsetX, ev.offsetY);
+      if (id !== null) {
+        onMarkerDblClick(id);
+        return;
       }
     }
     view = null;
@@ -169,7 +225,7 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
     // strokes of this same frame, in pixels.
     const labels = [];
     const obstacles = [];
-    const queueLabel = (text, x, y, color) => labels.push({ text, x, y, color });
+    const queueLabel = (text, x, y, color, bg) => labels.push({ text, x, y, color, bg });
     const LABEL_OFFSETS = [
       [0, 0], [0, -12], [0, 12], [14, 0], [-14, 0],
       [14, -12], [-14, -12], [0, -24], [0, 24],
@@ -189,6 +245,11 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
             y = cy;
             break;
           }
+        }
+        if (lb.bg) {
+          const w2 = half + 4;
+          ctx.fillStyle = lb.bg;
+          ctx.fillRect(x - w2, y - 11, w2 * 2, 14);
         }
         ctx.fillStyle = lb.color;
         ctx.fillText(lb.text, x, y);
@@ -273,7 +334,6 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
     }
     const toPx = (a, b) => [(a - ca) * scale + w / 2, orient * (b - cb) * scale + h / 2];
     const px = (p) => toPx(...proj(p));
-    lastPx = px;
 
     ctx.fillStyle = '#181818';
     ctx.fillRect(0, 0, w, h);
@@ -341,11 +401,15 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
           const [x2, yB] = toPx(Math.max(seg.a[0], seg.b[0]), seg.y1);
           const top = Math.min(yA, yB);
           const bot = Math.max(yA, yB);
-          ctx.fillStyle = WALL_FILL_CSS;
-          ctx.fillRect(x1, top, x2 - x1, bot - top);
+          if (seg.inferred) ctx.setLineDash([7, 5]);
+          else {
+            ctx.fillStyle = WALL_FILL_CSS;
+            ctx.fillRect(x1, top, x2 - x1, bot - top);
+          }
           ctx.strokeStyle = WALL_STROKE_CSS;
           ctx.lineWidth = 1;
           ctx.strokeRect(x1, top, x2 - x1, bot - top);
+          ctx.setLineDash([]);
           // Labels dodge the rect's border, not its translucent inside.
           obstacles.push(
             { x1, y1: top, x2, y2: top, r: 2 },
@@ -356,14 +420,37 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
           const [x1, y1] = toPx(seg.a[0], seg.a[1]);
           const [x2, y2] = toPx(seg.b[0], seg.b[1]);
           ctx.strokeStyle = WALL_STROKE_CSS;
-          ctx.lineWidth = 4;
+          // Dashed and thinner: an inferred wall is a strong reading of the
+          // carve boundary, not an asserted tag plane, and the stroke says so.
+          ctx.lineWidth = seg.inferred ? 2 : 4;
+          if (seg.inferred) ctx.setLineDash([7, 5]);
           ctx.lineCap = 'round';
           ctx.beginPath();
           ctx.moveTo(x1, y1);
           ctx.lineTo(x2, y2);
           ctx.stroke();
           ctx.lineCap = 'butt';
-          obstacles.push({ x1, y1, x2, y2, r: 4 });
+          ctx.setLineDash([]);
+          obstacles.push({ x1, y1, x2, y2, r: seg.inferred ? 2 : 4 });
+          // Wall length, hung off the midpoint on the uncarved side — outside
+          // the room where it competes with nothing — falling back to either
+          // side when both are carved (or no floor snapshot yet).
+          const len = Math.hypot(seg.b[0] - seg.a[0], seg.b[1] - seg.a[1]);
+          if (len >= 0.6) {
+            const mx = (seg.a[0] + seg.b[0]) / 2;
+            const mz = (seg.a[1] + seg.b[1]) / 2;
+            const nx = -(seg.b[1] - seg.a[1]) / len;
+            const nz = (seg.b[0] - seg.a[0]) / len;
+            let sign = 1;
+            if (floor) {
+              const freeAt = (x, z) => floor.freeKeys.has(floor.keyOf(
+                Math.floor(x / floor.cellM), Math.floor(z / floor.cellM)));
+              if (freeAt(mx + nx * 0.25, mz + nz * 0.25)
+                && !freeAt(mx - nx * 0.25, mz - nz * 0.25)) sign = -1;
+            }
+            const [lx2, ly2] = toPx(mx + nx * 0.22 * sign, mz + nz * 0.22 * sign);
+            queueLabel(`${len.toFixed(2)}`, lx2, ly2 + 4, '#b9c6cb');
+          }
         }
       }
     }
@@ -407,20 +494,95 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
 
     // Markers: a stroke along the tag's x axis, projected.
     const half = (markerMap?.sizeM || 0.15) / 2;
+    lastGlyphs = [];
     for (const [id, m] of markers) {
       const end1 = m.pos.map((v, i) => v - m.ax3[i] * half);
       const end2 = m.pos.map((v, i) => v + m.ax3[i] * half);
       const [x1, y1] = px(end1);
       const [x2, y2] = px(end2);
-      ctx.strokeStyle = id === markerMap?.anchorId ? '#d4b34c' : '#cccccc';
+      // One colour per tag, shared by the stroke and the label chip, so the
+      // chip reads as a name for exactly that mark. The anchor keeps its
+      // gold — it is the datum, and the gold is what says so.
+      const tagColor = id === markerMap?.anchorId ? '#d4b34c' : roomTagColorCss(id);
+      const hot = id === hoverId;
+      // A halo under the stroke rather than a different colour on it: the tag
+      // colour is the tag's identity here and in the drawer, and swapping it to
+      // say "hovered" would break the one thing that ties the two together.
+      if (hot) {
+        ctx.strokeStyle = HOVER_HALO_CSS;
+        ctx.lineWidth = 12;
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(x2, y2);
+        ctx.stroke();
+        ctx.lineCap = 'butt';
+      }
+      ctx.strokeStyle = tagColor;
       ctx.lineWidth = 4;
       ctx.beginPath();
       ctx.moveTo(x1, y1);
       ctx.lineTo(x2, y2);
       ctx.stroke();
       obstacles.push({ x1, y1, x2, y2, r: 3 });
-      const [lx, ly] = px(m.pos);
-      queueLabel(String(id), lx, ly - 8, '#eee');
+      // The id is part of the tag glyph: a chip sitting on the bar itself,
+      // rotated with it, so the label and the mark can never drift apart and
+      // the bar's orientation stays readable through the chip. Kept out of
+      // the dodging label pass — a name printed on the thing it names has
+      // nowhere better to be.
+      let ang = Math.atan2(y2 - y1, x2 - x1);
+      // Never upside down.
+      if (ang > Math.PI / 2) ang -= Math.PI;
+      if (ang < -Math.PI / 2) ang += Math.PI;
+      const idText = String(id);
+      const chipHalf = ctx.measureText(idText).width / 2 + 4;
+      const [mx, my] = px(m.pos);
+      // Beside the bar rather than over it, on the wall's outside, close
+      // enough that chip and bar touch: chip half-height 7 plus the bar's
+      // half-width 2. Which local side is "outside" comes from projecting the
+      // anti-normal into the rotated frame.
+      const nh = Math.hypot(m.normal[0], m.normal[2]);
+      let side = -1;
+      if (nh > 0.3) {
+        const [ox, oy] = px([
+          m.pos[0] - m.normal[0] / nh * 0.1,
+          m.pos[1],
+          m.pos[2] - m.normal[2] / nh * 0.1,
+        ]);
+        const localY = -Math.sin(ang) * (ox - mx) + Math.cos(ang) * (oy - my);
+        side = localY >= 0 ? 1 : -1;
+      }
+      ctx.save();
+      ctx.translate(mx, my);
+      ctx.rotate(ang);
+      if (hot) {
+        ctx.strokeStyle = HOVER_HALO_CSS;
+        ctx.lineWidth = 3;
+        ctx.strokeRect(-chipHalf - 2, side * 9 - 9, chipHalf * 2 + 4, 18);
+      }
+      ctx.fillStyle = tagColor;
+      ctx.fillRect(-chipHalf, side * 9 - 7, chipHalf * 2, 14);
+      ctx.fillStyle = '#fff';
+      ctx.fillText(idText, 0, side * 9 + 4);
+      ctx.restore();
+
+      // The glyph as drawn, for the hit test. Recorded here so the shape the
+      // pointer is tested against is the shape on screen — the chip's offset
+      // and rotation are worked out once, above, and never a second time.
+      lastGlyphs.push({
+        id,
+        x1,
+        y1,
+        x2,
+        y2,
+        chip: {
+          cx: mx - Math.sin(ang) * side * 9,
+          cy: my + Math.cos(ang) * side * 9,
+          ang,
+          halfW: chipHalf,
+          halfH: 7,
+        },
+      });
     }
 
     // Clients: dot + heading + label, lines to the tags they see.
@@ -525,6 +687,12 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
       schedule();
     },
 
+    setHoveredMarker(id) {
+      if (id === hoverId) return;
+      hoverId = id;
+      schedule();
+    },
+
     setMarkerMap(map) {
       markerMap = map;
       markers.clear();
@@ -624,7 +792,13 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
           c.fillRect(ix - minIx, iz - minIz, 1, 1);
         }
       }
-      floor = { cellM: f.cellM, minIx, minIz, w: cw, h: ch, canvas: cnv };
+      // The packed free-cell set rides along for point lookups — label
+      // placement wants "is this world point carved free".
+      const freeKeys = new Set();
+      for (let i = 0; i < f.free.length; i += 2) {
+        freeKeys.add(keyOf(f.free[i], f.free[i + 1]));
+      }
+      floor = { cellM: f.cellM, minIx, minIz, w: cw, h: ch, canvas: cnv, freeKeys, keyOf };
       schedule();
     },
 

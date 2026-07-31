@@ -25,8 +25,11 @@ header {
   flex-shrink: 0;
   gap: 12px;
   height: 52px;
-  padding: 0 14px;
+  padding: 0 8px;
   background: #1c1c1c;
+  /* Same rule as the drawer's edge — the chrome is bounded by one line weight,
+     not one per surface. */
+  border-bottom: 1px solid #333;
 }
 
 header h1 {
@@ -58,6 +61,20 @@ header .home:hover {
 /* Takes the header's slack, so whatever follows it sits on the right. */
 .grow {
   flex: 1;
+}
+
+/* Gap between header button groups. Space rather than a rule: with a row of
+   icon buttons the drawn line was one more vertical stroke among the glyphs,
+   and grouping reads better from the emptiness alone. */
+header .sep {
+  flex-shrink: 0;
+  width: 8px;
+}
+
+/* Icon buttons carry no text to keep apart, so the row is closed up. Scoped:
+   the client's header is a thumb target and keeps its spacing. */
+header.tight {
+  gap: 6px;
 }
 
 #status,
@@ -96,22 +113,50 @@ button,
 select {
   background: #2d2d2d;
   color: #eee;
-  border: 1px solid #444;
+  /* Barely off the fill: the shape reads from its background, and a brighter
+     edge turned a row of icon buttons into a row of boxes. The on-state keeps
+     its own brighter border — that one is meant to be seen. */
+  border: 1px solid #383838;
   border-radius: 6px;
   padding: 4px 9px;
   font-size: 14px;
   cursor: pointer;
+  /* What the faded border stopped carrying: a lit top edge and a shadow under
+     the bottom one, so the control still reads as raised off the chrome. */
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.07), 0 1px 2px rgba(0, 0, 0, 0.45);
 }
 
-button:active {
+/* :disabled is excluded because nothing else marks one — a disabled button is
+   drawn exactly like a live one here, so lighting it under the pointer would be
+   the only signal it gives, and it would be the wrong one. */
+button:hover:not(:disabled) {
+  background: #363636;
+  border-color: #4a4a4a;
+}
+
+/* Pressed inverts the lighting rather than only darkening the fill. */
+button:active:not(:disabled) {
   background: #3a3a3a;
+  box-shadow: inset 0 2px 3px rgba(0, 0, 0, 0.5);
 }
 
-/* Toggle-on state, shared by the client's icon buttons and the dashboard's
-   per-tile webcam button. */
-button.active {
+/* Toggle-on state, shared by the client's icon buttons, the dashboard's
+   per-tile webcam button, and the drawer's icon toggles. An icon button has no
+   room for the dot a text toggle uses, so it fills instead — one declaration,
+   or the two on-states drift to different greens. */
+button.active,
+.icon-btn.on {
   background: #1d5c2e;
   border-color: #2e8b47;
+}
+
+/* An on button must answer the pointer too, and it comes after the plain hover
+   deliberately: equal specificity, so this is what keeps a hovered toggle green
+   instead of grey. */
+button.active:hover:not(:disabled),
+.icon-btn.on:hover:not(:disabled) {
+  background: #24713a;
+  border-color: #3aa459;
 }
 
 /* Text toggles show their state as a dot instead of on/off wording. */
@@ -143,8 +188,22 @@ button.toggle.on::before {
   height: 20px;
 }
 
-/* The mic icon carries its own strike-through, shown while the mic is off. */
-#micBtn.active .slash {
+/* A variant rather than a change to .icon-btn: that size is a thumb target on
+   the client page, which is held. The dashboard's are clicked with a mouse and
+   sit in a row with text buttons, so they match those in height instead. */
+.icon-btn.compact {
+  padding: 4px;
+}
+
+.icon-btn.compact svg {
+  width: 16px;
+  height: 16px;
+}
+
+/* Mic and speaker carry their own strike-through, shown while they are off —
+   the one state an audio icon must read at a glance without the fill. */
+#micBtn.active .slash,
+#muteBtn.on .slash {
   display: none;
 }
 
@@ -446,6 +505,16 @@ body.paused #pauseOverlay {
   z-index: 1;
 }
 
+/* The drawer's own controls, above the composite they act on. In the header
+   they were reachable while the drawer was shut, i.e. while the canvas they
+   toggle was not on screen at all. */
+#drawerTools {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
 /* The combined stream lives in the drawer, above the cards. It used to float
    over the room views as a picture-in-picture, which meant the one view that
    shows the actual cameras was also the one covering up whatever was underneath
@@ -599,6 +668,15 @@ body.paused #pauseOverlay {
   opacity: 0.55;
 }
 
+/* The same tag, pointed at here or in a room view. White rather than the tag's
+   own colour, matching the halo the map draws: the card carries no tag colour
+   to reinforce, and a highlight that changed hue per tag would read as a state
+   the tag is in. */
+.drawer-card.hot {
+  background: #262626;
+  border-color: #8d8d8d;
+}
+
 .drawer-card .head {
   display: flex;
   align-items: baseline;
@@ -630,6 +708,16 @@ body.paused #pauseOverlay {
 
 .drawer-card .kind {
   font-size: 12px;
+  color: #9a9a9a;
+}
+
+/* A tag's position on the title row, pushed to the right edge: it is the one
+   thing about a tag read across cards rather than within one, so it lines up
+   in a column instead of sitting at the head of the detail block. */
+.drawer-card .at {
+  margin-left: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
   color: #9a9a9a;
 }
 

@@ -7,19 +7,48 @@
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <header>
+  <header class="tight">
     <a class="home" href="/" title="Back to start">Dashboard</a>
     <span id="status" class="grow">connecting…</span>
     <span id="syncLabel"></span>
-    <button id="combinedBtn" class="toggle">Cams</button>
+    <!-- Views | room overlays | room-data wipes | the drawer. -->
     <button id="sceneBtn" class="toggle">3D</button>
     <button id="map2dBtn" class="toggle">Top</button>
     <button id="sideBtn" class="toggle">Side</button>
+    <span class="sep"></span>
     <button id="poseBtn" class="toggle">Pose</button>
     <button id="wallsBtn" class="toggle">Walls</button>
-    <button id="clientsBtn" class="toggle">Clients</button>
-    <button id="muteBtn" class="toggle">Sound</button>
-    <button id="fullscreenBtn">Full</button>
+    <span class="sep"></span>
+    <!-- The two wipes read as one pair: the same strike over the thing being
+         forgotten, a surveyed tag and a carved cell. -->
+    <button id="clearTagsBtn" class="icon-btn compact" type="button" title="Clear tags" aria-label="Clear tags">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M4 8V5.5A1.5 1.5 0 0 1 5.5 4H8"/>
+        <path d="M16 4h2.5A1.5 1.5 0 0 1 20 5.5V8"/>
+        <path d="M20 16v2.5a1.5 1.5 0 0 1-1.5 1.5H16"/>
+        <path d="M8 20H5.5A1.5 1.5 0 0 1 4 18.5V16"/>
+        <rect x="9" y="9" width="6" height="6"/>
+        <path d="M3.5 20.5l17-17"/>
+      </svg>
+    </button>
+    <button id="clearCarveBtn" class="icon-btn compact" type="button" title="Clear carve" aria-label="Clear carve">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="4" y="4" width="16" height="16" rx="1.5"/>
+        <path d="M12 4v16"/>
+        <path d="M4 12h16"/>
+        <path d="M3.5 20.5l17-17"/>
+      </svg>
+    </button>
+    <span class="sep"></span>
+    <button id="drawerBtn" class="icon-btn compact" type="button" title="Drawer" aria-label="Drawer">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="3" y="4.5" width="18" height="15" rx="2"/>
+        <path d="M14.5 4.5v15"/>
+      </svg>
+    </button>
   </header>
   <main>
     <div id="stage">
@@ -36,6 +65,28 @@
       <div id="empty">No video feeds</div>
     </div>
     <div id="drawer">
+      <!-- Controls for what the drawer itself holds: the composite below, and
+           the audio of the feeds it shows. Both were in the header, where they
+           were reachable while the only thing they act on was hidden. The panel
+           appends the roster and the tags after these, so they stay at the top. -->
+      <div id="drawerTools">
+        <button id="combinedBtn" class="icon-btn compact" type="button" title="Camera composite" aria-label="Camera composite">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="2.5" y="6" width="13" height="12" rx="2.5"/>
+            <path d="M15.5 10.5l5-3.2v9.4l-5-3.2z"/>
+          </svg>
+        </button>
+        <button id="muteBtn" class="icon-btn compact" type="button" title="Feed audio" aria-label="Feed audio">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M4 9.5h3.5L12 5.5v13L7.5 14.5H4z"/>
+            <path d="M15.3 9.4a4 4 0 0 1 0 5.2"/>
+            <path d="M17.9 6.9a7.5 7.5 0 0 1 0 10.2"/>
+            <path class="slash" d="M3.5 3.5l17 17"/>
+          </svg>
+        </button>
+      </div>
       <canvas id="combined" width="1920" height="1080"></canvas>
     </div>
   </main>

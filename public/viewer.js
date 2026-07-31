@@ -2,7 +2,6 @@
 
 const grid = document.getElementById('grid');
 const empty = document.getElementById('empty');
-const fullscreenBtn = document.getElementById('fullscreenBtn');
 const muteBtn = document.getElementById('muteBtn');
 
 // clientId -> { pc, tile, video, label, camBtn }
@@ -313,6 +312,17 @@ const map2dBtn = document.getElementById('map2dBtn');
 const sideBtn = document.getElementById('sideBtn');
 const poseBtn = document.getElementById('poseBtn');
 const wallsBtn = document.getElementById('wallsBtn');
+const clearTagsBtn = document.getElementById('clearTagsBtn');
+const clearCarveBtn = document.getElementById('clearCarveBtn');
+
+// Actions, not toggles. Clearing the survey forgets the anchor — the whole
+// room frame — so it asks; the carve grid rebuilds in one sweep and does not.
+clearTagsBtn.onclick = () => {
+  if (confirm('Reset the whole survey? Every tag, including the anchor, is forgotten.')) {
+    signaling.send({ type: 'survey-clear' });
+  }
+};
+clearCarveBtn.onclick = () => signaling.send({ type: 'walls-clear' });
 const sceneCanvas = document.getElementById('scene');
 const map2dCanvas = document.getElementById('map2d');
 const mapSideCanvas = document.getElementById('mapSide');
@@ -322,13 +332,32 @@ const backdrop = document.getElementById('backdrop');
 const syncLabel = document.getElementById('syncLabel');
 const ctx = combined.getContext('2d');
 let combinedActive = true;   // shown at the top of the drawer
+// The composite is *in* the drawer, and its toggle is too, so a closed drawer
+// is as good as cams off: nothing is on screen and nothing can reach the button
+// to say so. Compositing is the expensive path — per-frame bitmaps held per
+// device — so a closed drawer must stop it rather than paint into a hidden
+// canvas forever.
+const camsVisible = () => combinedActive && showDrawer;
 const sceneView = createSceneView(sceneCanvas);
 // Double-clicking a tag in the top view forgets it — the escape hatch for
 // tags that are gone from the room (e.g. one that was shown on a screen).
 // Forgetting the anchor resets the whole survey.
 const forgetMarker = (id) => signaling.send({ type: 'marker-remove', id });
-const map2dView = createMap2dView(map2dCanvas, 'top', { onMarkerDblClick: forgetMarker });
-const mapSideView = createMap2dView(mapSideCanvas, 'side', { onMarkerDblClick: forgetMarker });
+// Which tag the pointer is on, wherever it is: a card in the drawer, a bar in
+// the top view, the same tag's bar in the elevation. Held here because it is
+// the one thing every one of those has to agree about — each of them reports
+// what its own pointer is over and is told what to draw, so there is no way for
+// two of them to end up highlighting different tags.
+let hoveredTag = null;
+function setHoveredTag(id) {
+  if (id === hoveredTag) return;
+  hoveredTag = id;
+  roomViewList.forEach((v) => v.setHoveredMarker?.(id));
+  clientsPanel.setHoveredTag(id);
+}
+const mapOpts = { onMarkerDblClick: forgetMarker, onMarkerHover: setHoveredTag };
+const map2dView = createMap2dView(map2dCanvas, 'top', mapOpts);
+const mapSideView = createMap2dView(mapSideCanvas, 'side', mapOpts);
 // All room views consume identical updates.
 const roomViewList = [sceneView, map2dView, mapSideView];
 
@@ -507,7 +536,7 @@ function updateSyncLabel(feeds, latencies, worstErr) {
 }
 
 function drawCombined() {
-  if (!combinedActive) return;
+  if (!camsVisible()) return;
   const now = clockSync.now();
   const feeds = [...devices.entries()].filter(([, d]) => d.video.videoWidth > 0);
 
@@ -651,19 +680,20 @@ setInterval(() => {
 // Client drawer: the same roster with the controls attached. Everything a
 // client can do to itself is drivable from here; the client owns the behaviour
 // and reports back what it actually did, so nothing here is optimistic.
-const clientsBtn = document.getElementById('clientsBtn');
+const drawerBtn = document.getElementById('drawerBtn');
 const clientsPanel = createClientsPanel(document.getElementById('drawer'), {
   onControl: (clientId, action, value) =>
     signaling.send({ type: 'control', clientId, action, value }),
   onVcam: (clientId, on) => setVcam(on ? clientId : null),
   onRename: (clientId, name) => signaling.send({ type: 'device-rename', clientId, name }),
+  onTagHover: setHoveredTag,
 });
 // Open by default: the drawer is the only place that lists a client which has no
 // tile, so starting closed hides exactly the clients worth knowing about.
-let showClients = true;
+let showDrawer = true;
 
 function refreshClientsPanel() {
-  if (!showClients) return;
+  if (!showDrawer) return;
   clientsPanel.update(clientIds().map(clientInfo), markerMap);
 }
 
@@ -677,12 +707,12 @@ function refreshViews() {
   sceneBtn.classList.toggle('on', show3d);
   map2dBtn.classList.toggle('on', show2d);
   sideBtn.classList.toggle('on', showSide);
-  clientsBtn.classList.toggle('on', showClients);
+  drawerBtn.classList.toggle('on', showDrawer);
   poseBtn.classList.toggle('on', showPoseMarker);
   wallsBtn.classList.toggle('on', showWalls);
   roomViewList.forEach((v) => v.setShowPose(showPoseMarker));
   roomViewList.forEach((v) => v.setLayer?.('walls', showWalls));
-  clientsPanel.setActive(showClients);
+  clientsPanel.setActive(showDrawer);
   refreshClientsPanel();
   // The backdrop hides the tile grid behind a full-bleed view. The combined
   // canvas is in the drawer now and covers nothing, so it no longer asks for
@@ -698,7 +728,7 @@ function refreshViews() {
   sceneView.setActive(show3d);
   map2dView.setActive(show2d);
   mapSideView.setActive(showSide);
-  if (combinedActive) drawCombined();
+  if (camsVisible()) drawCombined();
   else {
     syncLabel.textContent = '';
     syncErrPeak = 0;
@@ -723,7 +753,10 @@ const viewToggles = [
   { key: 'side', btn: sideBtn, get: () => showSide, set: (v) => { showSide = v; } },
   { key: 'pose', btn: poseBtn, get: () => showPoseMarker, set: (v) => { showPoseMarker = v; } },
   { key: 'walls', btn: wallsBtn, get: () => showWalls, set: (v) => { showWalls = v; } },
-  { key: 'clients', btn: clientsBtn, get: () => showClients, set: (v) => { showClients = v; } },
+  // Key stays 'clients' although the button no longer is: it names a stored
+  // value, and renaming it would read every existing viewer's saved layout as
+  // "not stored" and reopen the drawer on someone who closed it.
+  { key: 'clients', btn: drawerBtn, get: () => showDrawer, set: (v) => { showDrawer = v; } },
 ];
 
 function loadViewState() {
@@ -762,13 +795,6 @@ for (const t of viewToggles) {
 
 loadViewState();
 
-
-// Fullscreen the active view. The room views and the drawer both live inside
-// <main>, so fullscreening it keeps whatever combination is showing.
-fullscreenBtn.onclick = () => {
-  const overlayActive = combinedActive || show3d || show2d || showSide;
-  (overlayActive ? document.querySelector('main') : grid).requestFullscreen?.();
-};
 
 muteBtn.onclick = () => {
   soundOn = !soundOn;
