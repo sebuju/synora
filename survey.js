@@ -14,7 +14,7 @@ const path = require('path');
 const {
   quatAngleDeg, quatMean, quatMedian, quatNudge, se3FromRvecTvec, se3Compose, se3Invert,
   se3Identity, quatFromRvec, quatRotate, quatMul, quatConj, transformPoint,
-  quatNormalize, quatFromTo,
+  quatNormalize, quatFromTo, tagPlaneAgreement, CLIP_PLANE_M, CLIP_PARALLEL_COS,
 } = require('./public/pose-math.js');
 
 // Observation gates. err is mean corner reprojection error in px — the best
@@ -208,6 +208,14 @@ function createSurvey({ file, markerSizeM, log }) {
         from: m.from || [],
         hops: Number.isFinite(m.hops) ? m.hops : null,
         verified: Number.isFinite(m.verified) ? m.verified : null,
+        // Restored only when actually recorded: the resid EMAs seed themselves
+        // on `=== undefined`, so a null here would arithmetic into the first
+        // sighting instead of being replaced by it.
+        ...(Number.isFinite(m.refinedAtMs) ? { refinedAtMs: m.refinedAtMs } : {}),
+        ...(Number.isFinite(m.resid) ? { resid: m.resid } : {}),
+        ...(Number.isFinite(m.residDeg) ? { residDeg: m.residDeg } : {}),
+        ...(Number.isFinite(m.checkedAtMs) ? { checkedAtMs: m.checkedAtMs } : {}),
+        ...(Number.isFinite(m.checkOff) ? { checkOff: m.checkOff } : {}),
       });
     }
     // The anchor is the datum by definition, whatever the file said.
@@ -331,6 +339,12 @@ function createSurvey({ file, markerSizeM, log }) {
           id, {
             p: m.pose.p, q: m.pose.q, nObs: m.nObs,
             from: m.from || [], hops: m.hops ?? null, verified: m.verified ?? null,
+            // Refinement provenance, not geometry: without it every tag reads
+            // "never refined" in the drawer after a restart, which is
+            // indistinguishable from the never-corrected state it warns about.
+            refinedAtMs: m.refinedAtMs ?? null,
+            resid: m.resid ?? null, residDeg: m.residDeg ?? null,
+            checkedAtMs: m.checkedAtMs ?? null, checkOff: m.checkOff ?? null,
           },
         ])),
       };
@@ -1066,8 +1080,8 @@ function createSurvey({ file, markerSizeM, log }) {
   // Always onto the plane of the tag nearer the anchor, never the reverse. The
   // anchor is the datum and is exact by definition, and a rule without a
   // direction would let two tags take turns dragging each other.
-  const CLIP_PLANE_M = 0.05;
-  const CLIP_PARALLEL_COS = Math.cos(10 * Math.PI / 180);
+  // (The plane predicate and its thresholds live in pose-math.js — the walls
+  // module groups tags by the same test, and the two must not drift apart.)
 
   // Distance from the datum, for deciding which of two tags is the authority.
   // The anchor is always 0 whatever its record says — it *is* the datum. A tag
@@ -1093,12 +1107,8 @@ function createSurvey({ file, markerSizeM, log }) {
       // on being right, and clipping either onto the other is a coin flip. Two
       // unknown-chain tags are both Infinity, so they leave each other alone.
       if (otherId === id || datumDepth(otherId, other) >= depth) continue;
-      const on = quatRotate(other.pose.q, [0, 0, 1]);
-      // Parallel either way — a tag mounted upside down is still on the wall.
-      if (Math.abs(n[0] * on[0] + n[1] * on[1] + n[2] * on[2]) < CLIP_PARALLEL_COS) continue;
-      const d = (m.pose.p[0] - other.pose.p[0]) * on[0]
-        + (m.pose.p[1] - other.pose.p[1]) * on[1]
-        + (m.pose.p[2] - other.pose.p[2]) * on[2];
+      const { cos, d, on } = tagPlaneAgreement(m.pose, other.pose);
+      if (cos < CLIP_PARALLEL_COS) continue;
       if (Math.abs(d) > CLIP_PLANE_M) continue;
       const od = datumDepth(otherId, other);
       if (!best || od < best.depth || (od === best.depth && Math.abs(d) < Math.abs(best.d))) {
@@ -1694,11 +1704,17 @@ function createSurvey({ file, markerSizeM, log }) {
         : slipping ? (slipReport && !slipReport.held ? camRoom : null)
           : (camRoom || (alignFresh ? roomPose : null));
       if (extPose && maintainSurvey(extPose, obs, false, clientId, modelSource)) mapChanged = true;
-      if (!A) return { pose: null, quality: 'unaligned', mapChanged };
+      // Whether this report may become *permanent* state elsewhere (the walls
+      // grid is as durable as markers.json). The survey's own quarantine —
+      // founding, unresolved mirror, slip — is invisible outside this closure,
+      // and quality alone cannot stand in for it: 'good' is reported while an
+      // unresolved alignment is still being tested.
+      const mapSafe = !!extPose;
+      if (!A) return { pose: null, quality: 'unaligned', mapChanged, mapSafe };
       if (slipping) {
         if (slipReport) {
           return {
-            pose: slipReport.pose, quality: 'slipping', mapChanged,
+            pose: slipReport.pose, quality: 'slipping', mapChanged, mapSafe,
             alignedObs: A.nObs, jitter: null,
           };
         }
@@ -1706,7 +1722,7 @@ function createSurvey({ file, markerSizeM, log }) {
         // the tag path — ARCore is the one thing that must not carry it here.
         const guess = predictPose(clientId);
         return {
-          pose: guess, quality: guess ? 'dead' : 'slipping', mapChanged,
+          pose: guess, quality: guess ? 'dead' : 'slipping', mapChanged, mapSafe,
           alignedObs: A.nObs, jitter: null,
         };
       }
@@ -1718,6 +1734,7 @@ function createSurvey({ file, markerSizeM, log }) {
         quality: confirmed ? 'good' : 'tracked',
         alignedObs: A.nObs,
         jitter,
+        mapSafe,
       };
     },
 
@@ -1754,7 +1771,7 @@ function createSurvey({ file, markerSizeM, log }) {
       // let the two agree with each other instead of with the room.
       if (pose && clientId !== undefined) {
         const r = reportFix(clientId, pose);
-        if (r.held) return { pose: r.pose, quality: 'weak', mapChanged };
+        if (r.held) return { pose: r.pose, quality: 'weak', mapChanged, mapSafe: false };
         smoothed = r.pose;
       }
 
@@ -1764,7 +1781,7 @@ function createSurvey({ file, markerSizeM, log }) {
       // extend the survey.
       if (!pose && clientId !== undefined) {
         const guess = predictPose(clientId);
-        if (guess) return { pose: guess, quality: 'dead', mapChanged };
+        if (guess) return { pose: guess, quality: 'dead', mapChanged, mapSafe: false };
       }
 
       if (pose) {
@@ -1772,14 +1789,19 @@ function createSurvey({ file, markerSizeM, log }) {
           (o) => o.err <= GOOD_MAX_ERR_PX && o.dist <= GOOD_MAX_DIST_M);
         if (maintainSurvey(pose, obs, true, clientId, msg.source)) mapChanged = true;
 
+        const quality = strong.length ? 'good' : 'weak';
         return {
           pose: smoothed,
-          quality: strong.length ? 'good' : 'weak',
+          quality,
           mapChanged,
+          // Same contract as alignXr's flag: may permanent state be built on
+          // this report. This path has no founding/slip machinery; a guessed
+          // camera model is its one silent poison.
+          mapSafe: quality === 'good' && msg.source !== 'guess',
         };
       }
 
-      return { pose: null, quality: 'unlocalized', mapChanged };
+      return { pose: null, quality: 'unlocalized', mapChanged, mapSafe: false };
     },
 
     // Forget a tag — the escape hatch for tags that were never permanent

@@ -268,6 +268,29 @@ function se3Identity() {
   return { p: [0, 0, 0], q: [0, 0, 0, 1] };
 }
 
+// Do two wall-tag poses assert one plane? Tags use the markers.html convention
+// (+z out of the wall into the room), so a pose's rotated z axis is its wall
+// normal. Lives here because two consumers need the identical predicate: the
+// survey's coplanar clip and the walls module's plane grouping — a threshold
+// that drifted between them would let a tag be "on the wall" for one and not
+// the other.
+//
+// Returns { cos, d, on }: |normal agreement| (absolute — a tag mounted upside
+// down is still on the wall), the signed out-of-plane offset of `a` from `b`'s
+// plane measured along `b`'s normal, and that normal `on` itself so the caller
+// can move a point onto the plane without recomputing it.
+const CLIP_PLANE_M = 0.05;
+const CLIP_PARALLEL_COS = Math.cos(10 * Math.PI / 180);
+function tagPlaneAgreement(a, b) {
+  const n = quatRotate(a.q, [0, 0, 1]);
+  const on = quatRotate(b.q, [0, 0, 1]);
+  const cos = Math.abs(n[0] * on[0] + n[1] * on[1] + n[2] * on[2]);
+  const d = (a.p[0] - b.p[0]) * on[0]
+    + (a.p[1] - b.p[1]) * on[1]
+    + (a.p[2] - b.p[2]) * on[2];
+  return { cos, d, on };
+}
+
 function transformPoint(t, v) {
   const r = quatRotate(t.q, v);
   return [r[0] + t.p[0], r[1] + t.p[1], r[2] + t.p[2]];
@@ -279,5 +302,6 @@ if (typeof module !== 'undefined') {
     quatAngleDeg, quatMean, quatMedian, quatNudge, se3FromRvecTvec, se3Compose,
     se3Invert, se3Identity, transformPoint, quatFromTo,
     matFromRvec, rvecFromMat, matMul3, mirrorRvecGuesses,
+    tagPlaneAgreement, CLIP_PLANE_M, CLIP_PARALLEL_COS,
   };
 }

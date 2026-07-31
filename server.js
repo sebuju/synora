@@ -8,6 +8,7 @@ const { spawn, spawnSync } = require('child_process');
 const { WebSocketServer } = require('ws');
 const qrcode = require('qrcode-terminal');
 const { createSurvey } = require('./survey.js');
+const { createWalls } = require('./walls.js');
 const { createDeviceRegistry, modelFromUa } = require('./devices.js');
 
 const PORT = Number(process.env.PORT) || 8443;
@@ -22,6 +23,7 @@ const VCAM_HEIGHT = 720;
 const VCAM_FPS = 30;
 const VENDOR_DIR = path.join(PUBLIC_DIR, 'vendor');
 const MARKER_MAP_FILE = path.join(__dirname, 'markers.json');
+const WALLS_FILE = path.join(__dirname, 'walls.json');
 const DEVICES_FILE = path.join(__dirname, 'devices.json');
 const POSE_SETTINGS_FILE = path.join(__dirname, 'pose-settings.json');
 const LOG_FILE = path.join(__dirname, 'server.log');
@@ -514,6 +516,46 @@ const survey = createSurvey({
   log,
 });
 
+// Free-space / wall estimate carved from quality-gated pose reports. Consumes
+// the same entry objects the pose journal records, so replay-walls.js can
+// re-run any session through the identical code path.
+const walls = createWalls({
+  file: WALLS_FILE,
+  markerSizeM: POSE_CONFIG.markerSizeM,
+  log,
+});
+
+// Debounced full-snapshot push: the grid takes evidence at 10 Hz per client
+// but the viewer only needs to see it settle, and a snapshot of a real room
+// is a few thousand flat ints — cheaper to resend than to diff.
+const WALLS_PUSH_MS = 1000;
+const WALLS_LOG_MS = 5000;
+let wallsPushTimer = null;
+let lastWallsLog = 0;
+
+function sendWalls(ws) {
+  send(ws, { type: 'floor', ...walls.getFloor() });
+  send(ws, { type: 'walls', walls: walls.getWalls() });
+}
+
+function scheduleWallsPush() {
+  if (wallsPushTimer) return;
+  wallsPushTimer = setTimeout(() => {
+    wallsPushTimer = null;
+    sendWalls(viewerSocket);
+    if (Date.now() - lastWallsLog > WALLS_LOG_MS) {
+      lastWallsLog = Date.now();
+      const s = walls.stats();
+      const rej = (r) => Object.entries(r).map(([k, v]) => `${k} ${v}`).join(', ');
+      log(`Walls: ${s.free} free / ${s.occ} occupied cells (${s.freeM2} m²), `
+        + `reports ${s.reports.accepted}/${s.reports.total}`
+        + (Object.keys(s.reports.rej).length ? ` (rej: ${rej(s.reports.rej)})` : '')
+        + `, rays ${s.rays.accepted}/${s.rays.total}`
+        + (Object.keys(s.rays.rej).length ? ` (rej: ${rej(s.rays.rej)})` : ''));
+    }
+  }, WALLS_PUSH_MS);
+}
+
 // Per-device state that has to outlive the browser holding it: capture settings
 // and, above all, camera calibration. The browser keeps only its id. See
 // devices.js for why, and for how a browser that has lost even that gets its
@@ -534,6 +576,11 @@ function applyMarkerSize(m) {
   POSE_CONFIG.markerSizeM = m;
   savePoseSettings();
   survey.setMarkerSize(m);
+  // The grid was carved in the old scale; a rescaled room invalidates it the
+  // same way it invalidates the survey.
+  walls.setMarkerSize(m);
+  walls.setMarkerMap(survey.getMarkerMap());
+  scheduleWallsPush();
   // Clients scale every distance they report by this, so none may keep the
   // old value for even one more pose message.
   for (const client of clients.values()) {
@@ -683,6 +730,7 @@ function handleSignal(ws, msg) {
       if (!vcamDeviceId) detectVcam();
       send(ws, { type: 'vcam-state', clientId: vcamClientId, available: !!vcamDeviceId });
       send(ws, { type: 'marker-map', ...survey.getMarkerMap() });
+      sendWalls(ws);
       sendClients();
       for (const client of clients.values()) send(client, { type: 'viewer-ready' });
     }
@@ -777,7 +825,13 @@ function handleSignal(ws, msg) {
   if (msg.type === 'marker-remove') {
     if (ws.role === 'viewer' && Number.isInteger(msg.id)) {
       survey.removeMarker(msg.id);
-      send(ws, { type: 'marker-map', ...survey.getMarkerMap() });
+      const map = survey.getMarkerMap();
+      send(ws, { type: 'marker-map', ...map });
+      // Removing the anchor resets the survey; the grid was measured in that
+      // room frame and must not survive into the next one.
+      if (map.anchorId == null) walls.reset();
+      walls.setMarkerMap(map);
+      sendWalls(ws);
     }
     return;
   }
@@ -819,16 +873,28 @@ function handleSignal(ws, msg) {
     if (ws.role === 'client') {
       // ARCore already knows where the camera is; the tags only say where the
       // room is relative to ARCore's frame.
-      const { pose, quality, mapChanged, jitter } =
+      const { pose, quality, mapChanged, jitter, mapSafe } =
         survey.alignXr(ws.clientId, msg.xr, msg.tags || [], msg.sid ?? null, msg.intrinsics,
           msg.source);
-      journalPose(ws, { kind: 'xr-pose', at: Date.now(), msg, room: { pose, quality, jitter }, mapChanged });
+      // One entry object for both consumers: the journal records it and the
+      // walls carve from it, so a replayed journal line goes through exactly
+      // the code a live report did.
+      const entry = {
+        kind: 'xr-pose', at: Date.now(), msg,
+        room: { pose, quality, jitter, mapSafe }, mapChanged,
+      };
+      journalPose(ws, entry);
       send(viewerSocket, {
-        ...msg, type: 'pose', clientId: ws.clientId, room: { pose, quality, jitter } });
+        ...msg, type: 'pose', clientId: ws.clientId, room: entry.room });
       // jitter rides back to the client: the measurement needs both the phone's
       // own pose and the room pose, and only this side has both.
       send(ws, { type: 'room-pose', pose, quality, jitter });
-      if (mapChanged) send(viewerSocket, { type: 'marker-map', ...survey.getMarkerMap() });
+      if (mapChanged) {
+        const map = survey.getMarkerMap();
+        send(viewerSocket, { type: 'marker-map', ...map });
+        walls.setMarkerMap(map);
+      }
+      if (walls.handleReport(entry)) scheduleWallsPush();
     }
     return;
   }
@@ -836,13 +902,22 @@ function handleSignal(ws, msg) {
     if (ws.role === 'client') {
       // The survey consumes the camera-frame observations and hands back the
       // room-frame pose; the viewer gets both in one message.
-      const { pose, quality, mapChanged } = survey.handlePose(msg, ws.clientId);
-      journalPose(ws, { kind: 'pose', at: Date.now(), msg, room: { pose, quality }, mapChanged });
-      send(viewerSocket, { ...msg, clientId: ws.clientId, room: { pose, quality } });
+      const { pose, quality, mapChanged, mapSafe } = survey.handlePose(msg, ws.clientId);
+      const entry = {
+        kind: 'pose', at: Date.now(), msg,
+        room: { pose, quality, mapSafe }, mapChanged,
+      };
+      journalPose(ws, entry);
+      send(viewerSocket, { ...msg, clientId: ws.clientId, room: entry.room });
       // The client cannot know its room pose on its own (the marker map lives
       // here) — reflect it back for the on-client stats overlay.
       send(ws, { type: 'room-pose', pose, quality });
-      if (mapChanged) send(viewerSocket, { type: 'marker-map', ...survey.getMarkerMap() });
+      if (mapChanged) {
+        const map = survey.getMarkerMap();
+        send(viewerSocket, { type: 'marker-map', ...map });
+        walls.setMarkerMap(map);
+      }
+      if (walls.handleReport(entry)) scheduleWallsPush();
     }
     return;
   }
@@ -870,6 +945,8 @@ function main() {
   detectVcam();
   probeAssets();
   survey.load();
+  walls.load();
+  walls.setMarkerMap(survey.getMarkerMap());
   registry.load();
   const tls = loadOrCreateCert();
   const server = https.createServer(tls, serveStatic);

@@ -4,6 +4,7 @@ recordings/
 tools/
 public/vendor/
 markers.json
+walls.json
 server.log
 .vscode/
 .claude/

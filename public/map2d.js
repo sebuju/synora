@@ -43,6 +43,17 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
   let lastPx = null;
   // Right-angle legs between neighbouring tags, derived once per map.
   let pairs = [];
+  // Carved free-space grid, pre-rendered to a one-pixel-per-cell offscreen
+  // canvas on arrival: the draw loop runs every frame and a few thousand
+  // fillRects per frame is exactly the cost drawImage exists to avoid.
+  let floor = null;      // { cellM, minIx, minIz, w, h, canvas }
+  let walls = [];        // [{ a:[x,z], b:[x,z], y0, y1, ids }]
+  let showWalls = true;
+  const FLOOR_FREE_CSS = 'rgba(127,184,164,0.16)';
+  const FLOOR_OCC_CSS = 'rgba(223,120,100,0.25)';
+  const FLOOR_EDGE_CSS = 'rgba(190,208,200,0.35)';
+  const WALL_STROKE_CSS = '#dfe7ea';
+  const WALL_FILL_CSS = 'rgba(223,231,234,0.10)';
 
   // Auto-fit until the user touches it, then their view, unchanged. The fit is
   // still computed every frame and kept in lastFit: it is what a reset returns
@@ -120,11 +131,69 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
     schedule();
   });
 
+  // Does the segment (x1,y1)-(x2,y2) hit the axis-aligned box? Liang–Barsky
+  // clip; used by the label pass to keep text off walls and tags.
+  function segHitsBox(x1, y1, x2, y2, minX, minY, maxX, maxY) {
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    const p = [-dx, dx, -dy, dy];
+    const q = [x1 - minX, maxX - x1, y1 - minY, maxY - y1];
+    let t0 = 0;
+    let t1 = 1;
+    for (let i = 0; i < 4; i++) {
+      if (p[i] === 0) {
+        if (q[i] < 0) return false;
+      } else {
+        const r = q[i] / p[i];
+        if (p[i] < 0) {
+          if (r > t1) return false;
+          if (r > t0) t0 = r;
+        } else {
+          if (r < t0) return false;
+          if (r < t1) t1 = r;
+        }
+      }
+    }
+    return true;
+  }
+
   function draw(now) {
     rafPending = false;
     if (!active) return;
     const dt = lastFrameAt ? now - lastFrameAt : 16;
     lastFrameAt = now;
+
+    // All text is queued and drawn after everything else: labels must never
+    // sit under a wall stroke or a tag, and if a spot is taken the label
+    // steps aside rather than overprints. Obstacles are the wall and tag
+    // strokes of this same frame, in pixels.
+    const labels = [];
+    const obstacles = [];
+    const queueLabel = (text, x, y, color) => labels.push({ text, x, y, color });
+    const LABEL_OFFSETS = [
+      [0, 0], [0, -12], [0, 12], [14, 0], [-14, 0],
+      [14, -12], [-14, -12], [0, -24], [0, 24],
+    ];
+    function flushLabels() {
+      for (const lb of labels) {
+        const half = ctx.measureText(lb.text).width / 2;
+        let x = lb.x;
+        let y = lb.y;
+        for (const [ox, oy] of LABEL_OFFSETS) {
+          const cx = lb.x + ox;
+          const cy = lb.y + oy;
+          const clear = obstacles.every((o) => !segHitsBox(o.x1, o.y1, o.x2, o.y2,
+            cx - half - o.r, cy - 10 - o.r, cx + half + o.r, cy + 2 + o.r));
+          if (clear) {
+            x = cx;
+            y = cy;
+            break;
+          }
+        }
+        ctx.fillStyle = lb.color;
+        ctx.fillText(lb.text, x, y);
+      }
+    }
 
     const w = canvas.clientWidth;
     const h = canvas.clientHeight;
@@ -172,6 +241,23 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
     for (const ph of clients.values()) {
       if (ph.target) grow(...proj(ph.cur.p));
     }
+    // Only while shown — a hidden layer must not keep the view zoomed out to
+    // fit something invisible.
+    if (showWalls) {
+      if (mode === 'top' && floor) {
+        grow(floor.minIx * floor.cellM, floor.minIz * floor.cellM);
+        grow((floor.minIx + floor.w) * floor.cellM, (floor.minIz + floor.h) * floor.cellM);
+      }
+      for (const seg of walls) {
+        if (mode === 'side') {
+          grow(seg.a[0], seg.y0);
+          grow(seg.b[0], seg.y1);
+        } else {
+          grow(seg.a[0], seg.a[1]);
+          grow(seg.b[0], seg.b[1]);
+        }
+      }
+    }
     let spanA = Math.max(maxA - minA, 5);
     let spanB = Math.max(maxB - minB, 5);
     let scale = Math.min((w - 60) / spanA, (h - 60) / spanB);
@@ -191,6 +277,18 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
 
     ctx.fillStyle = '#181818';
     ctx.fillRect(0, 0, w, h);
+
+    // Attested free space, under everything: it is the claim the rest of the
+    // drawing stands on. Only the floor plan can show it — the side view has
+    // no honest projection of an x-z grid. Smoothing off so cells read as
+    // cells, not as a blur pretending to be a measurement gradient.
+    if (showWalls && floor && mode === 'top') {
+      const [fx, fy] = toPx(floor.minIx * floor.cellM, floor.minIz * floor.cellM);
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(floor.canvas, fx, fy,
+        floor.w * floor.cellM * scale, floor.h * floor.cellM * scale);
+      ctx.imageSmoothingEnabled = true;
+    }
 
     // 1 m grid.
     ctx.strokeStyle = '#242424';
@@ -227,11 +325,47 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
       ctx.moveTo(ox, oy);
       ctx.lineTo(ex, ey);
       ctx.stroke();
-      ctx.fillStyle = roomAxisColorCss(k);
       // Pushed a further tenth along its own direction, so the letter sits off
       // the end of the arm rather than on top of the other one's.
       const [lx, ly] = px(end.map((v) => v * 1.25));
-      ctx.fillText(ROOM_AXIS_NAMES[k], lx, ly + 4);
+      queueLabel(ROOM_AXIS_NAMES[k], lx, ly + 4, roomAxisColorCss(k));
+    }
+
+    // Wall segments. Top: the wall seen edge-on, a stroke from end to end.
+    // Side: the wall seen face-on, its attested x extent by its (cosmetic)
+    // height band. Both only as far as the extent the carving attested.
+    if (showWalls) {
+      for (const seg of walls) {
+        if (mode === 'side') {
+          const [x1, yA] = toPx(Math.min(seg.a[0], seg.b[0]), seg.y0);
+          const [x2, yB] = toPx(Math.max(seg.a[0], seg.b[0]), seg.y1);
+          const top = Math.min(yA, yB);
+          const bot = Math.max(yA, yB);
+          ctx.fillStyle = WALL_FILL_CSS;
+          ctx.fillRect(x1, top, x2 - x1, bot - top);
+          ctx.strokeStyle = WALL_STROKE_CSS;
+          ctx.lineWidth = 1;
+          ctx.strokeRect(x1, top, x2 - x1, bot - top);
+          // Labels dodge the rect's border, not its translucent inside.
+          obstacles.push(
+            { x1, y1: top, x2, y2: top, r: 2 },
+            { x1, y1: bot, x2, y2: bot, r: 2 },
+            { x1, y1: top, x2: x1, y2: bot, r: 2 },
+            { x1: x2, y1: top, x2, y2: bot, r: 2 });
+        } else {
+          const [x1, y1] = toPx(seg.a[0], seg.a[1]);
+          const [x2, y2] = toPx(seg.b[0], seg.b[1]);
+          ctx.strokeStyle = WALL_STROKE_CSS;
+          ctx.lineWidth = 4;
+          ctx.lineCap = 'round';
+          ctx.beginPath();
+          ctx.moveTo(x1, y1);
+          ctx.lineTo(x2, y2);
+          ctx.stroke();
+          ctx.lineCap = 'butt';
+          obstacles.push({ x1, y1, x2, y2, r: 4 });
+        }
+      }
     }
 
     // Right-angle distances between neighbouring tags: the two legs of the axis
@@ -257,7 +391,7 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
       ctx.lineTo(cx, cy);
       ctx.lineTo(bx, by);
       ctx.stroke();
-      ctx.fillStyle = kind === 'chain' ? '#a08a5c' : '#6b7789';
+      const legColor = kind === 'chain' ? '#a08a5c' : '#6b7789';
       // Only where there is room for it: at three neighbours a tag these labels
       // outnumber everything else on screen, and a leg a few pixels long says
       // nothing worth crowding the view for.
@@ -266,7 +400,7 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
         if (len < 34) continue;
         // Back through the scale rather than from the world points: the leg is
         // axis-aligned on screen, so its pixel length is its world length.
-        ctx.fillText((len / scale).toFixed(2), (x1 + x2) / 2, (y1 + y2) / 2 - 3);
+        queueLabel((len / scale).toFixed(2), (x1 + x2) / 2, (y1 + y2) / 2 - 3, legColor);
       }
     }
     ctx.setLineDash([]);
@@ -284,9 +418,9 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
       ctx.moveTo(x1, y1);
       ctx.lineTo(x2, y2);
       ctx.stroke();
+      obstacles.push({ x1, y1, x2, y2, r: 3 });
       const [lx, ly] = px(m.pos);
-      ctx.fillStyle = '#eee';
-      ctx.fillText(String(id), lx, ly - 8);
+      queueLabel(String(id), lx, ly - 8, '#eee');
     }
 
     // Clients: dot + heading + label, lines to the tags they see.
@@ -341,9 +475,8 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
             ? (d[0] * m.normal[0] + d[1] * m.normal[1] + d[2] * m.normal[2]) / dist
             : 1;
           const ang = Math.acos(Math.min(1, Math.max(-1, Math.abs(cosA)))) * 180 / Math.PI;
-          ctx.fillStyle = roomAngleColor(ang);
-          ctx.fillText(`${dist.toFixed(2)} m · ${Math.round(ang)}°`,
-            (sx + tx) / 2, (sy + ty) / 2 - 4);
+          queueLabel(`${dist.toFixed(2)} m · ${Math.round(ang)}°`,
+            (sx + tx) / 2, (sy + ty) / 2 - 4, roomAngleColor(ang));
         }
       }
 
@@ -363,11 +496,11 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
         ctx.arc(sx, sy, 6, 0, Math.PI * 2);
         ctx.fill();
       }
-      ctx.fillStyle = color;
       const [pa, pb] = proj(anchorP);
-      ctx.fillText(`C${ph.id} · ${pa.toFixed(2)}, ${pb.toFixed(2)}`, sx, sy - 12);
+      queueLabel(`C${ph.id} · ${pa.toFixed(2)}, ${pb.toFixed(2)}`, sx, sy - 12, color);
     }
 
+    flushLabels();
     schedule();
   }
 
@@ -436,6 +569,75 @@ function createMap2dView(canvas, mode = 'top', { onMarkerDblClick } = {}) {
 
     removeClient(clientId) {
       clients.delete(clientId);
+    },
+
+    // Full snapshot each time ({ cellM, free: [ix,iz,...], occ: [ix,iz,...] });
+    // pre-rendered here once rather than per frame in draw().
+    setFloor(f) {
+      if (!f || (!f.free.length && !f.occ.length)) {
+        floor = null;
+        schedule();
+        return;
+      }
+      let minIx = Infinity;
+      let maxIx = -Infinity;
+      let minIz = Infinity;
+      let maxIz = -Infinity;
+      const scan = (arr) => {
+        for (let i = 0; i < arr.length; i += 2) {
+          minIx = Math.min(minIx, arr[i]); maxIx = Math.max(maxIx, arr[i]);
+          minIz = Math.min(minIz, arr[i + 1]); maxIz = Math.max(maxIz, arr[i + 1]);
+        }
+      };
+      scan(f.free);
+      scan(f.occ);
+      const cw = maxIx - minIx + 1;
+      const ch = maxIz - minIz + 1;
+      const cnv = document.createElement('canvas');
+      cnv.width = cw;
+      cnv.height = ch;
+      const c = cnv.getContext('2d');
+      const paint = (arr, css) => {
+        c.fillStyle = css;
+        for (let i = 0; i < arr.length; i += 2) {
+          c.fillRect(arr[i] - minIx, arr[i + 1] - minIz, 1, 1);
+        }
+      };
+      paint(f.free, FLOOR_FREE_CSS);
+      paint(f.occ, FLOOR_OCC_CSS);
+      // The rim of the carved region — free cells touching unknown — drawn a
+      // shade brighter: it is where a wall *may* be, the tentative counterpart
+      // of the asserted wall segments. Computed here (not per frame) because
+      // it only changes when a snapshot arrives.
+      const known = new Set();
+      // Same ±2048 packing as the server grid — a plain ix*K+iz collides for
+      // negative indices.
+      const keyOf = (ix, iz) => (ix + 2048) * 4096 + (iz + 2048);
+      for (let i = 0; i < f.free.length; i += 2) known.add(keyOf(f.free[i], f.free[i + 1]));
+      for (let i = 0; i < f.occ.length; i += 2) known.add(keyOf(f.occ[i], f.occ[i + 1]));
+      c.fillStyle = FLOOR_EDGE_CSS;
+      for (let i = 0; i < f.free.length; i += 2) {
+        const ix = f.free[i];
+        const iz = f.free[i + 1];
+        if (!known.has(keyOf(ix + 1, iz)) || !known.has(keyOf(ix - 1, iz))
+          || !known.has(keyOf(ix, iz + 1)) || !known.has(keyOf(ix, iz - 1))) {
+          c.fillRect(ix - minIx, iz - minIz, 1, 1);
+        }
+      }
+      floor = { cellM: f.cellM, minIx, minIz, w: cw, h: ch, canvas: cnv };
+      schedule();
+    },
+
+    setWalls(next) {
+      walls = next || [];
+      schedule();
+    },
+
+    setLayer(name, on) {
+      if (name === 'walls') {
+        showWalls = on;
+        schedule();
+      }
     },
 
   };

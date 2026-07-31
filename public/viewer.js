@@ -80,6 +80,16 @@ const signaling = connectSignaling('viewer', {
       roomViewList.forEach((v) => v.setMarkerMap(msg));
       return;
     }
+    // Carved free space and wall segments. Optional chaining because only the
+    // 2D views render them — the 3D scene opts out by not having the setter.
+    if (msg.type === 'floor') {
+      roomViewList.forEach((v) => v.setFloor?.(msg));
+      return;
+    }
+    if (msg.type === 'walls') {
+      roomViewList.forEach((v) => v.setWalls?.(msg.walls));
+      return;
+    }
     if (msg.type === 'offer') {
       await acceptOffer(msg.clientId, msg.description);
     } else if (msg.type === 'ice') {
@@ -302,6 +312,7 @@ const sceneBtn = document.getElementById('sceneBtn');
 const map2dBtn = document.getElementById('map2dBtn');
 const sideBtn = document.getElementById('sideBtn');
 const poseBtn = document.getElementById('poseBtn');
+const wallsBtn = document.getElementById('wallsBtn');
 const sceneCanvas = document.getElementById('scene');
 const map2dCanvas = document.getElementById('map2d');
 const mapSideCanvas = document.getElementById('mapSide');
@@ -552,6 +563,11 @@ let showSide = false;   // side elevation (height)
 // heading anchored on its centre.
 let showPoseMarker = false;
 
+// The carved free-space / walls layer in the room views. On by default: the
+// layer only exists where evidence was accepted, so an empty room draws
+// nothing rather than noise.
+let showWalls = true;
+
 // ---------------------------------------------------------------------------
 // One description of a client, merged from everything that knows part of one:
 // the server's roster (what it is and what it was told to do), the peer
@@ -663,7 +679,9 @@ function refreshViews() {
   sideBtn.classList.toggle('on', showSide);
   clientsBtn.classList.toggle('on', showClients);
   poseBtn.classList.toggle('on', showPoseMarker);
+  wallsBtn.classList.toggle('on', showWalls);
   roomViewList.forEach((v) => v.setShowPose(showPoseMarker));
+  roomViewList.forEach((v) => v.setLayer?.('walls', showWalls));
   clientsPanel.setActive(showClients);
   refreshClientsPanel();
   // The backdrop hides the tile grid behind a full-bleed view. The combined
@@ -704,6 +722,7 @@ const viewToggles = [
   { key: 'top', btn: map2dBtn, get: () => show2d, set: (v) => { show2d = v; } },
   { key: 'side', btn: sideBtn, get: () => showSide, set: (v) => { showSide = v; } },
   { key: 'pose', btn: poseBtn, get: () => showPoseMarker, set: (v) => { showPoseMarker = v; } },
+  { key: 'walls', btn: wallsBtn, get: () => showWalls, set: (v) => { showWalls = v; } },
   { key: 'clients', btn: clientsBtn, get: () => showClients, set: (v) => { showClients = v; } },
 ];
 
