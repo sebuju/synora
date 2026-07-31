@@ -31,6 +31,10 @@ function usage(err) {
   console.error('usage: node replay-walls.js <journal.pose.jsonl> [more ...]\n'
     + '  [--markers markers.json] [--jitter-mm N] [--jitter-soft-mm N] [--min-views N]\n'
     + '  [--tagonly-scale X] [--frustum-scale X] [--cell-m X]\n'
+    + '  [--veto-radius-m X] [--veto-cross-m X]\n'
+    + '  [--neg-scale X] [--neg-jitter-mm N] [--neg-tracked-scale X] [--neg-min-px N]\n'
+    + '  [--neg-max-dist X] [--neg-min-views N] [--l-blocked X] [--ded-on X]\n'
+    + '  [--ded-max-cells N]\n'
     + '  [--out grid.json] [--pgm grid.pgm] [--ascii]');
   process.exit(1);
 }
@@ -82,6 +86,20 @@ if (flags['min-views'] !== undefined) opts.minViews = Number(flags['min-views'])
 if (flags['tagonly-scale'] !== undefined) opts.tagonlyScale = Number(flags['tagonly-scale']);
 if (flags['frustum-scale'] !== undefined) opts.frustumScale = Number(flags['frustum-scale']);
 if (flags['cell-m'] !== undefined) opts.cellM = Number(flags['cell-m']);
+if (flags['veto-radius-m'] !== undefined) opts.vetoRadiusM = Number(flags['veto-radius-m']);
+if (flags['veto-cross-m'] !== undefined) opts.vetoCrossM = Number(flags['veto-cross-m']);
+// The sight-line cut follows minViews unless overridden; a huge value disables
+// the cut alone, which is how the pass is shown to be otherwise inert.
+if (flags['sight-min-views'] !== undefined) opts.sightMinViews = Number(flags['sight-min-views']);
+if (flags['neg-scale'] !== undefined) opts.negScale = Number(flags['neg-scale']);
+if (flags['neg-jitter-mm'] !== undefined) opts.negMaxJitterMm = Number(flags['neg-jitter-mm']);
+if (flags['neg-tracked-scale'] !== undefined) opts.negTrackedScale = Number(flags['neg-tracked-scale']);
+if (flags['neg-min-px'] !== undefined) opts.negMinPx = Number(flags['neg-min-px']);
+if (flags['neg-max-dist'] !== undefined) opts.negMaxDistM = Number(flags['neg-max-dist']);
+if (flags['neg-min-views'] !== undefined) opts.negMinViews = Number(flags['neg-min-views']);
+if (flags['l-blocked'] !== undefined) opts.lBlocked = Number(flags['l-blocked']);
+if (flags['ded-on'] !== undefined) opts.dedOn = Number(flags['ded-on']);
+if (flags['ded-max-cells'] !== undefined) opts.dedMaxCells = Number(flags['ded-max-cells']);
 for (const [k, v] of Object.entries(opts)) {
   if (!Number.isFinite(v)) usage(`bad number for ${k}`);
 }
@@ -135,10 +153,24 @@ console.log(`reports accepted ${s.reports.accepted}/${s.reports.total}`
   + ` — rejected: ${rejLine(s.reports.rej)}`);
 console.log(`rays    accepted ${s.rays.accepted}/${s.rays.total}`
   + ` — rejected: ${rejLine(s.rays.rej)}`);
+console.log(`veto:   ${s.veto.waived}/${s.veto.planes} plane-test(s) waived`
+  + ' (wedge crossed the plane — the sighting outranks the assumed reach)');
 console.log(`grid: ${s.cells} cells touched, ${s.free} free / ${s.occ} occupied`
   + ` (${s.freeM2} m² attested free)`);
 console.log(`leaks: ${leakCount} free cell(s) behind a tag plane`
   + ' (wrong by construction — this is the gate-quality headline)');
+const sb = walls.sightBlocks();
+console.log(`sight: ${sb.blocked}/${sb.total} proven line(s) of sight crossed by an emitted wall`
+  + ` (a wall standing where you looked through — must be 0); ${sb.grazed} grazed`
+  + ' by a wall no viewpoint quorum agreed to cut');
+console.log(`neg reports accepted ${s.neg.reports.accepted}/${s.neg.reports.total}`
+  + ` — rejected: ${rejLine(s.neg.reports.rej)}`);
+console.log(`neg tags    deposited ${s.neg.tags.deposited}/${s.neg.tags.total}`
+  + ` — rejected: ${rejLine(s.neg.tags.rej)}`);
+console.log(`deduced: ${s.deduced} cell(s)`
+  + ` (${Math.round(s.deduced * (opts.cellM ?? DEFAULTS.cellM) ** 2 * 100) / 100} m²);`
+  + ` deduced-leaks: ${walls.deducedLeaks()} behind a tag plane`
+  + ' (the negative-gate headline)');
 // leaks cannot see a wall eaten too *short* — it only looks inside the emitted
 // span. The audit is the other direction: attested extent vs what survived the
 // opening test, and how much of the loss came from behind-evidence too shallow
@@ -173,6 +205,7 @@ function gridBounds(floor) {
   };
   scan(floor.free);
   scan(floor.occ);
+  scan(floor.deduced || []);
   return Number.isFinite(minIx) ? { minIx, maxIx, minIz, maxIz } : null;
 }
 
@@ -194,15 +227,16 @@ if (flags.ascii && bounds) {
     }
   };
   mark(floor.free, '.', true);
+  mark(floor.deduced || [], 'o', false);
   mark(floor.occ, '#', false);
   console.log(`\nascii floor plan (${step} cell(s) per char, `
-    + `x right, z down, '.' free, '#' wall):`);
+    + `x right, z down, '.' free, 'o' deduced obstruction, '#' wall):`);
   for (const row of grid) console.log(row.join(''));
 }
 
 if (flags.out) {
   fs.writeFileSync(flags.out, JSON.stringify({
-    stats: s, leaks: leakCount, walls: segs, floor,
+    stats: s, leaks: leakCount, deducedLeaks: walls.deducedLeaks(), walls: segs, floor,
   }));
   console.log(`grid written to ${flags.out}`);
 }
@@ -218,6 +252,7 @@ if (flags.pgm && bounds) {
     }
   };
   paint(floor.free, 255);
+  paint(floor.deduced || [], 64);
   paint(floor.occ, 0);
   const header = Buffer.from(`P5\n${w} ${h}\n255\n`, 'ascii');
   fs.writeFileSync(flags.pgm, Buffer.concat([header, px]));
