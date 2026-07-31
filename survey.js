@@ -69,6 +69,18 @@ const REFINE_PUSH_MS = 500;
 // PROMOTE_MIN_ESTIMATES sightings instead.
 const RESEED_DISAGREE_M = 0.25;
 const RESEED_STREAK = 12;
+// The orientation and position noise a sighting at 1 m carries, growing with
+// distance. Measured with replay-tagbias.js, which reads the raw rvec/tvec and
+// never touches the map: a tag's own solved orientation scatters 2.4 deg under
+// 1.5 m and 6.1 deg at 4-6 m, i.e. error going as roughly d^0.9, taken as
+// linear. The position figure is the same shape at the scale the map's own
+// cross-session disagreement shows.
+const REFINE_NOISE_DEG_PER_M = 1.3;
+const REFINE_NOISE_M_PER_M = 0.02;
+// A sighting is slowed, never silenced: below this it would take a permanent
+// disagreement to move the tag at all, and a tag nothing can correct is worse
+// than one corrected slowly.
+const REFINE_MIN_ALPHA_SCALE = 0.1;
 // A leave-one-out fix built from a single other tag is not a second opinion:
 // the two tags disagree, and nothing in the comparison says which of them is
 // wrong. Blaming the tag under test deleted whichever of the pair reached the
@@ -163,7 +175,18 @@ function median(values) {
   return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
 }
 
-function createSurvey({ file, markerSizeM, log }) {
+
+// opts overrides the tuning constants a replay needs to sweep; everything else
+// is fixed. Same contract as createWalls — a gate is tuned by measuring it over
+// recorded journals, so it has to be settable from outside without editing the
+// module the replay is supposed to be exercising.
+// `onRefine` is an offline diagnostics tap, not a feature: refinement is the
+// one map-changing path that leaves no trace anywhere — the journal records a
+// single throttled `mapChanged` boolean and markers.json only ever holds the
+// result — so nothing could say how far a tag's stored orientation actually
+// travels in a session, or what the stream it is being averaged from looks
+// like. Null on the live server, wired up by replay-survey.js.
+function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
   let anchorId = null;
   const markers = new Map();      // id -> { pose: {p,q}, nObs }
   const candidates = new Map();   // id -> [{p,q}, ...] ring
@@ -493,6 +516,89 @@ function createSurvey({ file, markerSizeM, log }) {
   // threshold, held for about a second of fixes. In the runaway journal this
   // re-founds ~3 s after ARCore relocalizes and holds still.
   const XR_SLIP_RECOVER_FIXES = 10;
+  // ...and the other way the session frame stops describing the room: ARCore
+  // relocalizes and *steps*. Measured on a real session, the phone sitting
+  // still with two tags in view: xr jumped 1.333 m in one 200 ms report, held
+  // there 1.2 s, then jumped back — flip-flopping between two relocalization
+  // branches. Nothing caught it. The slip detector above wants coherent travel
+  // over 20 fixes and a step is one sample that then holds still; the jump gate
+  // rejected the fix correctly but its only escape is XR_ALIGN_MAX_REJECTS
+  // agreeing rejects, which is exactly the 1.2 s the pose spent 1.3 m wrong;
+  // and with no tag in frame nothing runs at all, so the walls grid could take
+  // permanent evidence from a pose a metre out.
+  //
+  // The step is visible in xr alone — no tag needed, which is the point. Speed
+  // alone does not separate it: a 40 mm step over a 12 ms report is 3.4 m/s of
+  // pure noise, and healthy sessions reach 3 m/s at p99.9. Distance with a
+  // speed allowance does. Over all 72 journals on disk (48736 steps) this trips
+  // in 10 of them, 62 never; loosening to 0.25 + 2.5*dt reaches 13 journals and
+  // 0.20 + 2.0*dt reaches 19, buying 19 fewer reported jumps for twice the
+  // distrusted time — shallow either way, so the gate sits where it stops
+  // touching healthy sessions at all.
+  //
+  // Measured by replay-survey.js over the same 72 journals, before against
+  // after: reported-pose steps over a metre 51 -> 16, over 0.3 m 385 -> 351,
+  // worst step 4.53 -> 3.85 m, and mapSafe reports sitting within 1.5 s of a
+  // jump 3903 -> 3407. The session this was written for went from 11 jumps over
+  // a metre to 1, and from 6 alignment re-acquires to 1. It costs 40 s of
+  // distrusted frames across 2.4 hours of session, and 'good' time went
+  // slightly up rather than down (6184 -> 6190 s), because the re-acquires it
+  // replaces were themselves seconds of wrongness.
+  //
+  // What is left over a metre is not this: it is the /client tag-only path
+  // recovering from dead reckoning, the reject escape correcting an alignment
+  // that was founded wrong (the jump *is* the correction), and tag-fix noise
+  // during the distrust window. Different faults, none of them a teleport.
+  const XR_STEP_M = opts.stepM ?? 0.30;
+  const XR_STEP_M_PER_S = opts.stepMPerS ?? 3.0;
+  // Past this the gap itself hides however much real motion, so there is no
+  // measurement to make — not a clean one. The alignment is stale after a gap
+  // that long anyway (ALIGN_FRESH_MS) and the reject escape still covers it.
+  const XR_STEP_MAX_DT_S = opts.stepMaxDtS ?? 0.6;
+  // ...and the allowance is capped, because at the far end of the dt range it
+  // grows to 2.1 m and stops being a statement about anything a phone can do.
+  // A report is at most XR_STEP_MAX_DT_S apart, so this is 1.7 m/s sustained
+  // over the longest interval the gate looks at and 3 m/s over a typical one.
+  const XR_STEP_CAP_M = opts.stepCapM ?? 1.0;
+  // A stepped frame is usually steady again immediately, so distrust need not
+  // last as long as it does for a frame that is genuinely travelling. Three
+  // fixes still refuses to re-found the alignment on a single PnP solve, and it
+  // bounds how long tag-only reporting and mapSafe=false last.
+  const XR_STEP_RECOVER_FIXES = opts.stepRecoverFixes ?? 3;
+  // Refine step weighting. 0 reproduces the module as it stood before it
+  // existed — the scale becomes 1 for every sighting — which is how the
+  // before/after pair is taken without editing the file under test.
+  //
+  // A *plain* distance weight was tried first and is the wrong shape, which is
+  // worth recording because it looks right and measures well on one metric.
+  // Down-weighting a far sighting by (ref/d)^4 improved worst cross-session
+  // disagreement from 3.43 to 1.76 deg over 84 journals — and destroyed the
+  // one defence the map has against a tag somebody turned, because it throttles
+  // a 30 deg correction exactly as hard as a 3 deg one. Measured by perturbing
+  // a tag 30 deg and replaying: 23 of the 34 journals that see it healed it
+  // under 10 deg before, 7 after. Backing the reference distance off to 4.5 m
+  // restored healing and gave back nearly all of the gain (3.26 deg), i.e. the
+  // knob only ever bought the trade it was tuned to.
+  //
+  // So the step is scaled by the innovation against the noise the sighting is
+  // expected to carry, which is the same self-tuning-gain shape the reported
+  // pose filter already uses: a disagreement large against the noise is signal
+  // and takes a full step whatever the distance, one inside the noise takes
+  // almost none. Distance enters through the noise estimate, where it belongs.
+  //
+  // There is no viewing-angle term. The fuse's sin^2 says head-on is the
+  // degenerate case for the camera *position* a tag implies; for the tag's own
+  // orientation the same measurement found no monotone effect at all
+  // (band-to-band offsets 1.2-4.3 deg, no ordering), and importing it would
+  // down-weight head-on sightings 25x on no evidence. A reprojection-error term
+  // was tried alongside and measured as nothing (under 0.05 deg on every tag).
+  const REFINE_NOISE_SCALE = opts.refineNoiseScale ?? 1;
+  // How close two consecutive implied alignments have to sit to count as
+  // agreeing. est is the alignment, not the camera, so it does not move with
+  // the phone at all — the whole of this budget is fix noise, which runs to
+  // ~50 mm at a fresh sighting (see the jitter note above). Generous against
+  // that, and still a fifth of the smallest step that can trip the detector.
+  const XR_STEP_AGREE_M = 0.25;
   // clientId -> the session id whose camera model was already logged, so the
   // 10 Hz pose path logs it once per session rather than on every report.
   const loggedIntrinsics = new Map();
@@ -506,6 +612,33 @@ function createSurvey({ file, markerSizeM, log }) {
   // How long after a confirming tag sighting the alignment is still good
   // enough to survey new tags against.
   const ALIGN_FRESH_MS = 2000;
+
+  // Is the room frame level? The anchor is stored as se3Identity, so the room
+  // frame *is* the anchor tag's own frame — room +y is whichever way that tag
+  // was mounted. Everything two-dimensional downstream projects onto room xz
+  // and calls the result a floor plan (`walls.js` carves its grid there,
+  // `map2d.js` draws it), which is true only while the anchor hangs upright.
+  // Nothing enforces that, the anchor is picked automatically as the first
+  // clean tag, and the failure is silent: an anchor mounted a quarter turn
+  // round on its own wall makes room y horizontal and turns the floor plan
+  // into a vertical slice through the room, with every wall and every carved
+  // cell wrong and nothing anywhere saying so.
+  //
+  // An aligned XR client can measure it for free. ARCore's session frame is
+  // gravity-aligned, so room-frame up is the alignment applied to the session's
+  // own +y. This only reports — squaring the 2D layers onto measured gravity
+  // rather than onto the anchor is the real fix and a much larger change.
+  //
+  // Averaged before it accuses anyone: measured over 39032 good frames a single
+  // frame's estimate sits 1.8 deg from its session's median at p50 and 5.5 deg
+  // at p90, so one bad frame must not raise this and the threshold sits well
+  // clear of the spread that remains after averaging.
+  const GRAVITY_MIN_SAMPLES = 60;
+  const GRAVITY_TILT_DEG = 10;
+  // Keyed by the anchor because that is what it is a statement about. Every
+  // path that resets the survey drops or replaces the anchor, so this
+  // re-measures after a reset without having to be told about one.
+  const gravity = { forAnchor: undefined, n: 0, sum: [0, 0, 0], logged: false };
 
   // Founding the alignment. With no alignment yet and one known tag in view,
   // pickSolutions has neither another tag nor a reference to resolve that tag's
@@ -543,14 +676,106 @@ function createSurvey({ file, markerSizeM, log }) {
 
   // Path length, not displacement from the last correction: a walk out and back
   // leaves ARCore drifted by roughly what it travelled, not by nothing.
-  function accrueMotion(A, xrT) {
+  // Returns the step distance when the session frame jumped rather than moved
+  // (see XR_STEP_M), else 0. Translation only: a relocalization rotates the
+  // frame too, but a fast pan is ordinary and rolling rotation into the test
+  // would trip on it. A step is not motion and must not be accrued — 1.3 m of
+  // travel that never happened would pin alignAlpha at its maximum for the next
+  // fix, spending the whole gain on chasing a frame that is about to jump back.
+  function accrueMotion(A, xrT, at) {
+    let jumped = null;
     if (A.lastXr) {
-      const d = Math.hypot(
-        xrT.p[0] - A.lastXr.p[0], xrT.p[1] - A.lastXr.p[1], xrT.p[2] - A.lastXr.p[2])
-        + XR_ALIGN_ROT_M_PER_DEG * quatAngleDeg(A.lastXr.q, xrT.q);
-      if (d > XR_ALIGN_MOTION_DEADBAND_M) A.moved += d;
+      const dp = Math.hypot(
+        xrT.p[0] - A.lastXr.p[0], xrT.p[1] - A.lastXr.p[1], xrT.p[2] - A.lastXr.p[2]);
+      const dt = A.lastAt ? (at - A.lastAt) / 1000 : null;
+      if (!(dt > 0)) {
+        // Nothing to compare against yet.
+      } else if (dt > XR_STEP_MAX_DT_S) {
+        // No step can be measured across a gap this long, and "not measurable"
+        // is not "fine": the reports stop on the XR path precisely when ARCore
+        // stops tracking, which is when it relocalizes. Measured over all 72
+        // journals, gaps past XR_STEP_MAX_DT_S number 37 in 48874 reports (26
+        // journals, median 3.1 s) and 20 of them span more than 0.3 m of
+        // session-frame displacement — so distrusting the frame across one is
+        // both rare and usually right. This was the hole that let the worst
+        // remaining jump through: a 1.35 m relocalization arriving on the first
+        // report after a 6.8 s tracking loss, reported as 'tracked' with
+        // mapSafe true because no test could see it.
+        jumped = { why: 'gap', d: dp, dt };
+      } else if (dp > Math.min(XR_STEP_M + XR_STEP_M_PER_S * dt, XR_STEP_CAP_M)) {
+        jumped = { why: 'step', d: dp, dt };
+      }
+      const d = dp + XR_ALIGN_ROT_M_PER_DEG * quatAngleDeg(A.lastXr.q, xrT.q);
+      if (jumped) A.moved = 0;
+      else if (d > XR_ALIGN_MOTION_DEADBAND_M) A.moved += d;
     }
     A.lastXr = xrT;
+    A.lastAt = at;
+    return jumped;
+  }
+
+  // The session frame stepped: stop trusting it now, without waiting for a tag
+  // to prove it. Entering the same state the drift detector uses rather than a
+  // parallel one, because everything downstream of "the frame is not to be
+  // trusted" is already written — report the tag fix alone, dead-reckon when
+  // there is no tag, and keep the frame out of the survey and the walls grid
+  // until it settles. Tagged with why: recovery is much faster for a step,
+  // which is usually steady again on the very next report.
+  function tripStep(clientId, A, jumped) {
+    const s = A.slip || (A.slip = { hist: [], n: 0, stable: 0, on: false });
+    // Already distrusted for travelling: that is the stricter verdict and the
+    // step is part of what it is describing. Leave it to recover its own way.
+    if (s.on && s.why !== 'step') return;
+    // Stepping again mid-recovery restarts it — the fixes that agreed so far
+    // agreed about a frame that has since moved again.
+    const again = s.on;
+    s.on = true;
+    s.why = 'step';
+    s.n = 0;
+    s.stable = 0;
+    s.lastEst = null;
+    if (!again) {
+      log(`Client ${clientId} XR session frame ${jumped.why === 'gap'
+        ? `moved ${jumped.d.toFixed(2)} m across a ${jumped.dt.toFixed(1)} s gap in `
+          + 'reports, which nothing can vouch for'
+        : `stepped ${jumped.d.toFixed(2)} m in one report — ARCore relocalized`}`
+        + '; reporting tag fixes until it settles');
+    }
+  }
+
+  // One gravity sample, from an alignment a tag has just confirmed. Says
+  // nothing until it has enough of them, then says it once — this is a property
+  // of the room, so repeating it every frame would be noise, and saying it only
+  // when it is bad would leave silence meaning both "level" and "never
+  // checked".
+  function checkGravity(A) {
+    if (gravity.forAnchor !== anchorId) {
+      gravity.forAnchor = anchorId;
+      gravity.n = 0;
+      gravity.sum = [0, 0, 0];
+      gravity.logged = false;
+    }
+    if (gravity.logged) return;
+    const up = quatRotate(A.T.q, [0, 1, 0]);
+    for (let k = 0; k < 3; k++) gravity.sum[k] += up[k];
+    if (++gravity.n < GRAVITY_MIN_SAMPLES) return;
+    const len = Math.hypot(gravity.sum[0], gravity.sum[1], gravity.sum[2]);
+    if (!(len > 1e-6)) return;
+    const tilt = Math.acos(Math.max(-1, Math.min(1, gravity.sum[1] / len)))
+      * 180 / Math.PI;
+    gravity.logged = true;
+    if (tilt <= GRAVITY_TILT_DEG) {
+      log(`Room frame is level — gravity sits ${tilt.toFixed(1)} deg off room +y `
+        + `(anchor ${anchorId}, ${gravity.n} fixes)`);
+      return;
+    }
+    log(`Room frame is TILTED ${tilt.toFixed(1)} deg off gravity — anchor `
+      + `${anchorId} is not hanging upright, and the room frame is its frame. `
+      + 'The floor plan and the carved walls grid are the room xz plane, so '
+      + `both are skewed by that angle; at 90 deg they are a vertical slice `
+      + 'through the room rather than a plan of it. Re-anchor on an upright tag '
+      + '(remove the anchor in the viewer) to fix it — nothing downstream can '
+      + 'detect this on its own.');
   }
 
   // Slip detection: is the session frame itself in motion under the alignment?
@@ -563,6 +788,35 @@ function createSurvey({ file, markerSizeM, log }) {
     // No tag this frame: nothing to learn, and the verdict stands.
     if (!est) return s.on ? 'slipping' : 'ok';
     const now = Date.now();
+    // A stepped frame recovers on consecutive agreeing fixes rather than on the
+    // windowed test below. The window needs a reference a full XR_SLIP_WINDOW_MS
+    // old, and every sample older than the step describes the frame the step
+    // left — so a windowed recovery could not return before ~2 s whatever the
+    // frame did, which is longer than the wrongness this was written to cut
+    // short. Consecutive est agreement measures the same thing (has the implied
+    // alignment stopped moving) without waiting for the window to refill.
+    if (s.on && s.why === 'step') {
+      const near = s.lastEst && Math.hypot(
+        est.p[0] - s.lastEst[0], est.p[1] - s.lastEst[1],
+        est.p[2] - s.lastEst[2]) <= XR_STEP_AGREE_M;
+      s.stable = near ? s.stable + 1 : 0;
+      s.lastEst = est.p;
+      if (s.stable < XR_STEP_RECOVER_FIXES) return 'slipping';
+      xrAlign.set(clientId, {
+        T: est, sid: A.sid, nObs: 1, at: now, rej: null, lastXr: xrT, moved: 0,
+        lastAt: A.lastAt,
+        // The est history belongs to the frame that stepped away; against the
+        // one now standing it is not stale, it is meaningless.
+        slip: { hist: [], n: 0, stable: 0, on: false },
+        // Doubt survives here for the same reason it does below: est was picked
+        // against the alignment being replaced, so it inherits its mirror.
+        unresolved: A.unresolved,
+      });
+      forgetJitter(clientId);
+      log(`Client ${clientId} XR alignment re-founded after the frame stepped — `
+        + `${XR_STEP_RECOVER_FIXES} agreeing fixes`);
+      return 'recovered';
+    }
     s.hist.push({ p: est.p, at: now });
     while (s.hist.length && s.hist[0].at < now - 2 * XR_SLIP_WINDOW_MS) s.hist.shift();
     // Newest sample at least a full window old. None (session just started,
@@ -579,6 +833,7 @@ function createSurvey({ file, markerSizeM, log }) {
       s.n = d > XR_SLIP_NET_M ? s.n + 1 : 0;
       if (s.n < XR_SLIP_MIN_FIXES) return 'ok';
       s.on = true;
+      s.why = 'drift';
       s.n = 0;
       s.stable = 0;
       log(`Client ${clientId} XR session frame is slipping — the alignment its `
@@ -590,6 +845,7 @@ function createSurvey({ file, markerSizeM, log }) {
     if (s.stable < XR_SLIP_RECOVER_FIXES) return 'slipping';
     xrAlign.set(clientId, {
       T: est, sid: A.sid, nObs: 1, at: now, rej: null, lastXr: xrT, moved: 0,
+      lastAt: A.lastAt,
       slip: { hist: s.hist, n: 0, stable: 0, on: false },
       // Doubt survives a slip recovery: est was picked against the slipping
       // alignment's own frame, so it inherits its unresolved mirror.
@@ -903,6 +1159,64 @@ function createSurvey({ file, markerSizeM, log }) {
   // at the two call sites because splitting survey maintenance across the
   // /client and XR paths is how the refine half came to be missing on one of
   // them.
+  //
+  // One refine decision, reported to the diagnostics tap. Both terminal points
+  // of the loop below report through here so a harness sees the rejected
+  // sightings as well as the accepted ones — the rejects are half the answer to
+  // "is this tag being pulled around".
+  //
+  // `branches` is the counterfactual: pickSolutions leaves o.sols intact, so
+  // what the *other* mirror branch would have implied for this tag is still
+  // recoverable here, and it is the only place in the pipeline where it is.
+  // Composed only when the tap is present — this runs at 10 Hz per tag per
+  // client on the live server, where it must cost nothing.
+  function reportRefine(verdict, o, m, fix, est, off, dq, others) {
+    if (!onRefine) return;
+    onRefine({
+      id: o.id,
+      verdict,
+      off,
+      dq,
+      dist: o.dist,
+      err: o.err,
+      cos: o.cos,
+      px: o.px,
+      others: others.map((x) => x.id),
+      chosen: o.sols.findIndex((s) => s.camTag === o.camTag),
+      branches: o.sols.map((s) => {
+        const e = se3Compose(fix, s.camTag);
+        return {
+          off: Math.hypot(e.p[0] - m.pose.p[0], e.p[1] - m.pose.p[1],
+            e.p[2] - m.pose.p[2]),
+          dq: quatAngleDeg(m.pose.q, e.q),
+        };
+      }),
+      estQ: [...est.q],
+    });
+  }
+
+  // How much of a refine step a sighting has earned, in
+  // [REFINE_MIN_ALPHA_SCALE, 1]. Every other consumer of an observation weights
+  // it by how well conditioned it is; refinement applied a flat REFINE_ALPHA,
+  // so a 6 m sighting moved the stored pose exactly as hard as a 1 m one while
+  // carrying 2.5x the orientation scatter.
+  //
+  // d^2/(d^2 + sigma^2): a disagreement well outside the noise passes through
+  // whole, one inside it is suppressed in proportion. Clamped at 1 rather than
+  // normalised, so this can only ever slow refinement down — REFINE_ALPHA stays
+  // the ceiling it always was. Position and orientation are asked separately
+  // and the larger wins: a tag that is right where it should be but facing the
+  // wrong way still has something to correct, and vice versa.
+  function refineScale(o, off, dq) {
+    if (!REFINE_NOISE_SCALE) return 1;
+    const sp = REFINE_NOISE_M_PER_M * o.dist * REFINE_NOISE_SCALE;
+    const sq = REFINE_NOISE_DEG_PER_M * o.dist * REFINE_NOISE_SCALE;
+    const gain = Math.max(
+      off * off / (off * off + sp * sp),
+      dq * dq / (dq * dq + sq * sq));
+    return Math.max(REFINE_MIN_ALPHA_SCALE, Math.min(1, gain));
+  }
+
   function maintainSurvey(pose, obs, needKnownTag = true, clientId = undefined,
     modelSource = undefined) {
     if (modelSource === 'guess') return false;
@@ -975,6 +1289,10 @@ function createSurvey({ file, markerSizeM, log }) {
         const m = markers.get(o.id);
         const off = Math.hypot(
           est.p[0] - m.pose.p[0], est.p[1] - m.pose.p[1], est.p[2] - m.pose.p[2]);
+        // Computed here rather than beside the residual EMAs it feeds, because
+        // the disagree gate below reports it too and a rejected sighting's
+        // orientation is exactly as interesting as an accepted one's.
+        const dq = quatAngleDeg(m.pose.q, est.q);
         // Recorded before the disagree gate, not after: a tag whose every
         // check lands too far to refine would otherwise be indistinguishable
         // on the dashboard from one never seen beside a known tag at all —
@@ -1017,6 +1335,7 @@ function createSurvey({ file, markerSizeM, log }) {
           // disagreement grows, and the drop becomes self-fulfilling. Measured
           // as an escalating 0.31 -> 0.39 -> 0.69 -> 1.43 m series on one tag
           // that had not moved at all.
+          reportRefine('disagree', o, m, fix, est, off, dq, others);
           continue;
         }
         clearStreak(clientId, o.id);
@@ -1026,7 +1345,6 @@ function createSurvey({ file, markerSizeM, log }) {
         // whose estimates keep landing 40 mm and 8 degrees away is healing, one
         // whose estimates land on it is done. Smoothed harder than the pose
         // itself so it reads as a trend rather than flickering per sighting.
-        const dq = quatAngleDeg(m.pose.q, est.q);
         m.resid = m.resid === undefined ? off : m.resid + (off - m.resid) * RESID_ALPHA;
         m.residDeg = m.residDeg === undefined ? dq : m.residDeg + (dq - m.residDeg) * RESID_ALPHA;
         m.refinedAtMs = Date.now();
@@ -1038,10 +1356,43 @@ function createSurvey({ file, markerSizeM, log }) {
         // being checked ten times a second.
         m.verified = (m.verified ?? 0) + 1;
 
+        // Before the nudge, not after: every figure reported here — off, dq and
+        // both branches — is measured against the stored pose as it stood when
+        // this sighting was judged, and the next two lines move it.
+        reportRefine('nudge', o, m, fix, est, off, dq, others);
+
+        // Shortened for a poorly conditioned sighting. The bias this is against
+        // is not noise the average removes: measured, a session's whole stream
+        // sits 1.0-3.6 deg (7.5 worst) from where the map started it, and the
+        // direction is different every session, so the map converges on
+        // whatever geometry that session happened to use. Weighting cannot
+        // remove that — it dilutes it, by letting the geometries that scatter
+        // least do most of the moving.
+        const alpha = REFINE_ALPHA * refineScale(o, off, dq);
+
+        // Toward this sighting, and a robust aggregator here was tried and
+        // measured to buy nothing — do not reach for one again without new
+        // evidence. The premise was that a plain EMA is a mean and a mean over
+        // a contaminated stream converges on the contamination's equilibrium,
+        // which is true only when the contamination is *asymmetric*. Measured
+        // over 74 journals (replay-survey.js --refine, the onRefine tap above):
+        // the angle between quatMean and quatMedian of a session's estimate
+        // stream is 0.21-1.16 deg at the median and 5.05 worst, i.e. the
+        // outliers cancel. Nudging toward the median of a 25-sample ring
+        // instead moved per-session drift by nothing (worst tag 12.15 -> 13.05
+        // deg, next 7.05 -> 7.42).
+        //
+        // What the drift actually is: each session's whole stream sits 1.0-3.6
+        // deg (7.5 worst) from the pose the map started that session with, and
+        // refinement converges on it correctly and fast — perturb a tag 30 deg
+        // and it is back within 2.9 deg in 172 nudges, landing where the
+        // unperturbed run lands. So sessions genuinely disagree about where a
+        // tag points, and the fix is upstream in what fuseCameraPose is built
+        // from, not in how these estimates are averaged.
         for (let k = 0; k < 3; k++) {
-          m.pose.p[k] += (est.p[k] - m.pose.p[k]) * REFINE_ALPHA;
+          m.pose.p[k] += (est.p[k] - m.pose.p[k]) * alpha;
         }
-        m.pose.q = quatNudge(m.pose.q, est.q, REFINE_ALPHA);
+        m.pose.q = quatNudge(m.pose.q, est.q, alpha);
         // Re-applied after every nudge, not once at promotion: the nudge is what
         // keeps pushing the tag back off the plane, so a one-time clip would be
         // undone within seconds of the next sighting.
@@ -1461,7 +1812,14 @@ function createSurvey({ file, markerSizeM, log }) {
       // the room seeing nothing and only then sights a tag has to arrive at that
       // sighting with the motion it actually made, or the correction it needs
       // most is the one given the smallest gain.
-      if (prev) accrueMotion(prev, xrT);
+      // Before ref/pickSolutions below, not merely before updateSlip: on a
+      // stepped frame se3Compose(prev.T, xrT) is the stepped pose, and handing
+      // that to pickSolutions as the mirror reference resolves every tag's
+      // ambiguity against a frame that is a metre out.
+      if (prev) {
+        const jumped = accrueMotion(prev, xrT, Date.now());
+        if (jumped) tripStep(clientId, prev, jumped);
+      }
       // The camera model, once per session. Every pose error that is not noise
       // is either this or the tag size, and both were being assumed rather than
       // observed. cx/cy far from the image centre, or fx != fy, means the
@@ -1570,7 +1928,8 @@ function createSurvey({ file, markerSizeM, log }) {
         } else {
           xrAlign.set(clientId, {
             T: found.T, sid: sessionId, nObs: 1, at: Date.now(), rej: null,
-            lastXr: xrT, moved: 0, unresolved: !found.resolved,
+            lastXr: xrT, moved: 0, lastAt: Date.now(),
+            unresolved: !found.resolved,
           });
           log(`Client ${clientId} XR frame aligned to the room — `
             + (known.length
@@ -1625,9 +1984,16 @@ function createSurvey({ file, markerSizeM, log }) {
             log(`Client ${clientId} XR alignment re-acquired — ` +
               `${prev.rej.n} consistent fixes disagreed with it by ` +
               `${jump.toFixed(2)} m`);
+            // The jitter window straddles the swap otherwise: its ARCore half
+            // was measured against the alignment just replaced, so the residual
+            // against the new one reports the distance between two coordinate
+            // systems as steadiness. walls.js gates permanent grid evidence on
+            // that number. The slip recovery has always done this; this branch
+            // replaces the alignment just as completely and did not.
+            forgetJitter(clientId);
             xrAlign.set(clientId, {
               T: est, sid: sessionId, nObs: 1, at: Date.now(), rej: null,
-              lastXr: xrT, moved: 0,
+              lastXr: xrT, moved: 0, lastAt: prev.lastAt,
               // Slip state describes the session frame, not this alignment
               // instance. A diverging frame forces a re-acquire about every
               // XR_ALIGN_MAX_REJECTS fixes, and dropping the history here
@@ -1649,6 +2015,12 @@ function createSurvey({ file, markerSizeM, log }) {
       // under the samples, which is exactly the noise the cluster cannot vote
       // down.
       if (A && A.unresolved && !slipping) watchBranch(clientId, sessionId, known, xrT, A);
+      // Same conditions the survey itself trusts: a tag confirmed the alignment
+      // this frame, its branch is not still in doubt, and the session frame is
+      // not moving under it. A mirrored or slipping alignment reports a
+      // gravity direction as wrong as everything else derived from it, and this
+      // one would accuse the anchor of the alignment's fault.
+      if (A && confirmed && !A.unresolved && !slipping) checkGravity(A);
       const roomPose = A ? se3Compose(A.T, xrT) : null;
       // ARCore's pose is steadier than anything the tags alone produce, so a
       // survey grown from it is better, not worse — but only extend while a
