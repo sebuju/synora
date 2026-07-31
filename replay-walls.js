@@ -139,6 +139,15 @@ console.log(`grid: ${s.cells} cells touched, ${s.free} free / ${s.occ} occupied`
   + ` (${s.freeM2} m² attested free)`);
 console.log(`leaks: ${leakCount} free cell(s) behind a tag plane`
   + ' (wrong by construction — this is the gate-quality headline)');
+// leaks cannot see a wall eaten too *short* — it only looks inside the emitted
+// span. The audit is the other direction: attested extent vs what survived the
+// opening test, and how much of the loss came from behind-evidence too shallow
+// to be a doorway.
+for (const a of walls.extentAudit()) {
+  console.log(`extent [${a.ids.join(' ')}]: ${a.attestedM} m attested, `
+    + `${a.keptM} m kept, ${a.openM} m excised as openings`
+    + (a.shallowM ? ` (${a.shallowM} m of it shallow — kept by the depth gate)` : ''));
+}
 console.log(`walls: ${segs.length} segment(s)`);
 for (const seg of segs) {
   const len = Math.hypot(seg.b[0] - seg.a[0], seg.b[1] - seg.a[1]);

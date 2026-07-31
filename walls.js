@@ -605,15 +605,29 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
         if (!vMin.has(sBin) || v < vMin.get(sBin)) vMin.set(sBin, v);
       }
       for (const [rows, outSign] of [[vMax, 1], [vMin, -1]]) {
-        const sBins = [...rows.keys()].sort((a, b) => a - b);
         const gapBins = C.wallGapM / C.cellM;
         let run = null;
         const flush = () => {
           if (!run) return;
           const len = (run.hi - run.lo) * C.cellM;
           const span = run.hi - run.lo + 1;
-          if (len >= C.inferMinLenM && run.n / span >= C.inferRowFillFrac) {
-            const v = run.vSum / run.n + outSign * C.cellM / 2;
+          // Flatness is a property of the run, not of each row against the
+          // rows before it. The silhouette scatters about a straight wall by
+          // roughly inferVTolM, so a per-row tolerance test rejects about a
+          // third of the rows of a perfectly straight wall and shreds it into
+          // sub-inferMinLenM pieces that are then all discarded. Measured on
+          // one room: a 3.8 m wall gave 62 rows spanning 0.42 m about their
+          // median (MAD 0.09 m) and emitted nothing at all. Median and MAD
+          // rather than mean and spread, for the same reason quatMedian
+          // replaced quatMean — a doorway or an alcove inside the run must
+          // not drag the line, and a few rows of it must not veto the wall.
+          const vs = [...run.vs].sort((a, b) => a - b);
+          const line = vs[vs.length >> 1];
+          const devs = vs.map((x) => Math.abs(x - line)).sort((a, b) => a - b);
+          const mad = devs[devs.length >> 1];
+          if (len >= C.inferMinLenM && vs.length / span >= C.inferRowFillFrac
+            && mad <= C.inferVTolM) {
+            const v = line + outSign * C.cellM / 2;
             const lo = run.lo * C.cellM - C.cellM / 2;
             const hi = run.hi * C.cellM + C.cellM / 2;
             const mid = [
@@ -646,21 +660,116 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
           }
           run = null;
         };
-        for (const sBin of sBins) {
-          const v = rows.get(sBin);
-          if (run && sBin - run.hi <= gapBins && Math.abs(v - run.vSum / run.n) <= C.inferVTolM) {
-            run.hi = sBin;
-            run.n++;
-            run.vSum += v;
-          } else {
-            flush();
-            run = { lo: sBin, hi: sBin, n: 1, vSum: v };
-          }
+        // Segment in v before segmenting along the wall. One wall's silhouette
+        // is a tight cluster of extremes; a different wall, or the room simply
+        // opening out, sits far away in v. Walk order cannot make this split —
+        // the scatter about a single straight wall routinely steps further
+        // than any tolerance small enough to also separate two walls, so an
+        // excursion-breaking rule either shreds the wall (measured: 0.18 m
+        // steps against a 0.10 m tolerance) or swallows the room (measured:
+        // one run over corridor and far end together, MAD 0.12 vs 0.09 for
+        // the corridor alone). Single-link at inferMaxParallelDistM — the
+        // module's existing statement of "two parallel edges this close are
+        // one wall", used here for the same judgement.
+        const byV = [...rows.entries()].sort((a, b) => a[1] - b[1]);
+        const clusters = [];
+        for (const e of byV) {
+          const last = clusters[clusters.length - 1];
+          if (last && e[1] - last[last.length - 1][1] <= C.inferMaxParallelDistM) last.push(e);
+          else clusters.push([e]);
         }
-        flush();
+        for (const cluster of clusters) {
+          const vOf = new Map(cluster);
+          // Along-wall contiguity only. A row whose extreme falls short is
+          // missing coverage, not disagreement — the walk did not get close
+          // there — and the run's own dispersion, above, is what tells short
+          // coverage from a genuinely uneven edge.
+          for (const sBin of [...vOf.keys()].sort((a, b) => a - b)) {
+            if (run && sBin - run.hi <= gapBins) {
+              run.hi = sBin;
+              run.vs.push(vOf.get(sBin));
+            } else {
+              flush();
+              run = { lo: sBin, hi: sBin, vs: [vOf.get(sBin)] };
+            }
+          }
+          flush();
+        }
       }
     }
     return out;
+  }
+
+  // What the carve says about one plane: which along-wall bins are attested by
+  // free space in front of it, and which are contradicted by free space behind
+  // it. Shared by the wall extents and by the extent audit, so the metric can
+  // never be measuring a different rule than the one that ran.
+  //
+  // Free space in front of the plane attests the wall — unless there is also
+  // free space *behind* the plane at the same along-wall position. Front and
+  // behind both walkable is not a wall, it is an opening somebody walked
+  // through (a doorway, or where the room simply continues), and chaining the
+  // extent across it is how a wall got drawn across a doorway and clean
+  // through the far side of an L-shaped room. Front attestation reads the
+  // island-filtered set; behind evidence reads raw cells — the
+  // through-a-doorway blob is small by nature and must not be filtered out of
+  // the one place it is the signal.
+  function planeEvidence(frame, freeSet) {
+    const { sOf, frontOf } = frame;
+    const frontBins = new Set();
+    const behind = new Map();
+    for (const [key, c] of cells) {
+      if (c.state !== 1) continue;
+      const ix = Math.floor(key / GRID_SIDE) - GRID_HALF;
+      const iz = (key % GRID_SIDE) - GRID_HALF;
+      const cx = (ix + 0.5) * C.cellM;
+      const cz = (iz + 0.5) * C.cellM;
+      const front = frontOf(cx, cz);
+      const bin = Math.round(sOf(cx, cz) / C.cellM);
+      if (front >= C.wallNearM && front <= C.wallFarM) {
+        if (freeSet.has(key)) frontBins.add(bin);
+      } else if (front <= -C.wallNearM && front >= -C.wallFarM) {
+        const e = behind.get(bin) || { n: 0, depth: 0 };
+        e.n++;
+        e.depth = Math.max(e.depth, -front);
+        behind.set(bin, e);
+      }
+    }
+    // Behind-cells are sparse — few rays reach through an opening — so testing
+    // front bins against them one-for-one leaves pinholes that stitch the wall
+    // back across the doorway. Cluster the behind bins into opening intervals
+    // first (same gap rule as the extents), then excise every front bin inside
+    // one. A cluster below openingMinCells is noise, not an opening — that is
+    // this reader's own island gate.
+    const clusters = [];
+    const gapBins = C.wallGapM / C.cellM;
+    for (const bin of [...behind.keys()].sort((a, b) => a - b)) {
+      const e = behind.get(bin);
+      const last = clusters[clusters.length - 1];
+      if (last && bin - last.hi <= gapBins) {
+        last.hi = bin;
+        last.n += e.n;
+        last.depth = Math.max(last.depth, e.depth);
+      } else {
+        clusters.push({ lo: bin, hi: bin, n: e.n, depth: e.depth });
+      }
+    }
+    // Depth, not just cell count. A doorway is space you can walk *through*,
+    // so its evidence reaches the far end of the band; pose noise bleeding a
+    // few centimetres across the very wall the rays were carved up to is a
+    // sliver hugging the plane. Counting cells cannot tell them apart — a
+    // sliver one row deep spanning 0.72 m still has 27 cells and excised half
+    // a wall, while the genuine openings beside it reached 0.594 m and
+    // 0.596 m of the 0.60 m band against that sliver's 0.215 m. The threshold
+    // is half the band rather than a constant of its own, so it stays tied to
+    // the depth actually looked at.
+    const minDepth = (C.wallNearM + C.wallFarM) / 2;
+    const enough = clusters.filter((o) => o.n >= C.openingMinCells);
+    return {
+      frontBins,
+      openings: enough.filter((o) => o.depth >= minDepth),
+      shallow: enough.filter((o) => o.depth < minDepth),
+    };
   }
 
   // Wall segments: one plane per coplanar tag group, extent grown exactly as
@@ -673,61 +782,19 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
     for (const group of planeGroups) {
       const frame = planeFrameOf(group);
       if (!frame) continue;
-      const { px, pz, d2, sOf, frontOf } = frame;
+      const { px, pz, d2, sOf } = frame;
       const intervals = [];
       const half = tagSizeM / 2;
       for (const m of group) {
         const s = sOf(m.p[0], m.p[2]);
         intervals.push({ lo: s - half, hi: s + half, tag: m.id });
       }
-      // Free space in front of the plane attests the wall — unless there is
-      // also free space *behind* the plane at the same along-wall position.
-      // Front and behind both walkable is not a wall, it is an opening
-      // somebody walked through (a doorway, or where the room simply
-      // continues), and chaining the extent across it is how a wall got drawn
-      // across a doorway and clean through the far side of an L-shaped room.
-      // Front attestation reads the island-filtered set; behind evidence
-      // reads raw cells — the through-a-doorway blob is small by nature and
-      // must not be filtered out of the one place it is the signal.
-      const frontBins = new Set();
-      const behindCount = new Map();
-      for (const [key, c] of cells) {
-        if (c.state !== 1) continue;
-        const ix = Math.floor(key / GRID_SIDE) - GRID_HALF;
-        const iz = (key % GRID_SIDE) - GRID_HALF;
-        const cx = (ix + 0.5) * C.cellM;
-        const cz = (iz + 0.5) * C.cellM;
-        const front = frontOf(cx, cz);
-        const bin = Math.round(sOf(cx, cz) / C.cellM);
-        if (front >= C.wallNearM && front <= C.wallFarM) {
-          if (freeSet.has(key)) frontBins.add(bin);
-        } else if (front <= -C.wallNearM && front >= -C.wallFarM) {
-          behindCount.set(bin, (behindCount.get(bin) || 0) + 1);
-        }
-      }
-      // Behind-cells are sparse — few rays reach through an opening — so
-      // testing front bins against them one-for-one leaves pinholes that
-      // stitch the wall back across the doorway. Cluster the behind bins into
-      // opening intervals first (same gap rule as the extents), then excise
-      // every front bin inside one. A cluster below openingMinCells is noise,
-      // not an opening — that is this reader's own island gate.
-      const openings = [];
-      const gapBins = C.wallGapM / C.cellM;
-      for (const bin of [...behindCount.keys()].sort((a, b) => a - b)) {
-        const last = openings[openings.length - 1];
-        if (last && bin - last[1] <= gapBins) {
-          last[1] = bin;
-          last[2] += behindCount.get(bin);
-        } else {
-          openings.push([bin, bin, behindCount.get(bin)]);
-        }
-      }
-      const realOpenings = openings.filter(([, , n]) => n >= C.openingMinCells);
+      const { frontBins, openings: realOpenings } = planeEvidence(frame, freeSet);
       for (const bin of frontBins) {
         // ±1 tolerance: at a doorframe the behind-cells stop one cell short of
         // where the wall starts, and a one-cell sliver of phantom wall in the
         // opening is worse than one cell shaved off the frame.
-        if (realOpenings.some(([lo, hi]) => bin >= lo - 1 && bin <= hi + 1)) continue;
+        if (realOpenings.some((o) => bin >= o.lo - 1 && bin <= o.hi + 1)) continue;
         const s = bin * C.cellM;
         intervals.push({ lo: s - C.cellM / 2, hi: s + C.cellM / 2, tag: null });
       }
@@ -852,7 +919,11 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
             const t = (ex * od[1] - ez * od[0]) / cross;
             // Below tol is no progress — the end already sits on this line;
             // the on-line case below handles that by growing the other wall.
-            if (t < tol || t > 20) continue;
+            // Above the wall's own length, the close would be more inference
+            // than wall — same bound as closeCorners, and for the same reason:
+            // pathFreeM below objects to carved space, and a runaway close
+            // travels where nothing was ever carved, so it sails through.
+            if (t < tol || t > Math.min(20, attestedLen(seg))) continue;
             const P = [p[0] + t * dir[0], p[1] + t * dir[1]];
             // Never through carved space — a wall drawn across more than a
             // doorway of provably-free cells is the one guess worse than an
@@ -867,8 +938,7 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
           }
           if (best) {
             seg[end] = best.p;
-            seg.ext = { ...(seg.ext || {}), [end]: Math.round(
-              Math.hypot(best.p[0] - p[0], best.p[1] - p[1]) * 100) / 100 };
+            addExt(seg, end, Math.hypot(best.p[0] - p[0], best.p[1] - p[1]));
             changed = true;
             continue;
           }
@@ -886,9 +956,18 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
               p[0] - (other.a[0] + od[0] * t), p[1] - (other.a[1] + od[1] * t));
             if (perp > tol * 2) continue;
             if (t >= -tol && t <= ol + tol) continue;   // already covered
+            if (Math.max(-t, t - ol) > attestedLen(other)) continue;   // same bound
             const P = [other.a[0] + od[0] * t, other.a[1] + od[1] * t];
-            if (t < 0) other.a = P;
-            else other.b = P;
+            // Recorded like any other extension — a wall grown to meet someone
+            // else's dangling end is just as much inference as one that went
+            // looking, and it was the one mover that reported nothing at all.
+            if (t < 0) {
+              addExt(other, 'a', -t);
+              other.a = P;
+            } else {
+              addExt(other, 'b', t - ol);
+              other.b = P;
+            }
             grown = true;
             break;
           }
@@ -986,6 +1065,26 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
 
   function segLen(w) {
     return Math.hypot(w.b[0] - w.a[0], w.b[1] - w.a[1]);
+  }
+
+  // How much of an end is inference rather than attested extent. Accumulated,
+  // not overwritten: three passes may move the same end (corner close, then
+  // forced close, then a T-junction grow), and a plain assignment reported
+  // only the last of them — a wall extended 1.22 m in total announced 0.10 m.
+  // The audit exists to make over-extension visible, so it must not itself
+  // under-report it.
+  function addExt(seg, end, metres) {
+    if (!(metres > 0)) return;
+    const prev = (seg.ext && seg.ext[end]) || 0;
+    seg.ext = { ...(seg.ext || {}), [end]: Math.round((prev + metres) * 100) / 100 };
+  }
+
+  // The part of a segment the carve actually attests. This, not the current
+  // length, is what bounds every extension: closing runs in repeated passes,
+  // so a bound against the live length ratchets — each extension enlarges the
+  // budget for the next one and a stub can walk across the room in steps.
+  function attestedLen(seg) {
+    return segLen(seg) - ((seg.ext && seg.ext.a) || 0) - ((seg.ext && seg.ext.b) || 0);
   }
 
   // Intersection of two segments in fractional units of each: t1/t2 in [0,1]
@@ -1205,6 +1304,15 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
         };
         for (const [idx, seg, n] of [[i, walls[i], n1], [k, walls[k], n2]]) {
           if (!n.end || pathBlocked(seg, n)) continue;
+          // Inference may not exceed the evidence it is built on. cornerMaxExtendM
+          // is an absolute ceiling and says nothing about whether *this* wall has
+          // earned a 3 m extension; a 1 m stub reaching 2.8 m into space nobody
+          // observed is a guess about a wall that was never seen to be there.
+          // pathFreeM cannot catch it either — it counts carved-free cells, and
+          // a runaway extension goes precisely where nothing was ever carved, so
+          // absence of evidence reads to it as absence of objection. Measured: a
+          // wall attested over 0.96 m was extended 2.83 m to span the room.
+          if (n.ext > attestedLen(seg)) continue;
           if (!best[idx][n.end] || n.ext < best[idx][n.end].ext) {
             best[idx][n.end] = { ext: n.ext, p: P };
           }
@@ -1217,11 +1325,11 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
       // attested extent — the replay prints it, the renderer need not care.
       if (best[i].a) {
         w.a = best[i].a.p;
-        w.ext = { ...(w.ext || {}), a: Math.round(best[i].a.ext * 100) / 100 };
+        addExt(w, 'a', best[i].a.ext);
       }
       if (best[i].b) {
         w.b = best[i].b.p;
-        w.ext = { ...(w.ext || {}), b: Math.round(best[i].b.ext * 100) / 100 };
+        addExt(w, 'b', best[i].b.ext);
       }
     }
   }
@@ -1259,6 +1367,37 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
       }
     }
     return count;
+  }
+
+  // The converse of leaks, and the reason it needed one: leaks only counts
+  // behind-cells inside a wall's *emitted* span, so a wall eaten too short is
+  // invisible to it — the span shrank precisely to exclude the evidence. This
+  // reports, per plane, how much front-attested wall the openings removed, and
+  // how much of that was removed by behind-evidence too shallow to be a
+  // doorway. Measured before the depth gate: one wall attested over 6.96 m
+  // emitted 2.28 m, 0.72 m of it excised by a sliver 0.215 m deep.
+  function extentAudit() {
+    if (!planeGroups) planeGroups = groupPlanes();
+    const freeSet = liveFree();
+    const out = [];
+    for (const group of planeGroups) {
+      const frame = planeFrameOf(group);
+      if (!frame) continue;
+      const { frontBins, openings, shallow } = planeEvidence(frame, freeSet);
+      if (!frontBins.size) continue;
+      const bins = [...frontBins].sort((a, b) => a - b);
+      const inAny = (list, bin) => list.some((o) => bin >= o.lo - 1 && bin <= o.hi + 1);
+      const kept = bins.filter((b) => !inAny(openings, b));
+      out.push({
+        ids: group.map((m) => m.id).sort((a, b) => a - b),
+        attestedM: Math.round((bins[bins.length - 1] - bins[0] + 1) * C.cellM * 100) / 100,
+        keptM: Math.round(kept.length * C.cellM * 100) / 100,
+        openM: Math.round((bins.length - kept.length) * C.cellM * 100) / 100,
+        shallowM: Math.round(
+          bins.filter((b) => inAny(shallow, b)).length * C.cellM * 100) / 100,
+      });
+    }
+    return out;
   }
 
   function getFloor() {
@@ -1380,6 +1519,7 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
     getFloor,
     getWalls,
     leaks,
+    extentAudit,
     stats: statsOf,
     reset,
     setMarkerSize(m) {
