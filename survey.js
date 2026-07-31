@@ -1108,7 +1108,9 @@ function createSurvey({ file, markerSizeM, log }) {
       // unknown-chain tags are both Infinity, so they leave each other alone.
       if (otherId === id || datumDepth(otherId, other) >= depth) continue;
       const { cos, d, on } = tagPlaneAgreement(m.pose, other.pose);
-      if (cos < CLIP_PARALLEL_COS) continue;
+      // Parallel either way — a back-to-back pair is still one plane claim
+      // for the clip's purposes.
+      if (Math.abs(cos) < CLIP_PARALLEL_COS) continue;
       if (Math.abs(d) > CLIP_PLANE_M) continue;
       const od = datumDepth(otherId, other);
       if (!best || od < best.depth || (od === best.depth && Math.abs(d) < Math.abs(best.d))) {

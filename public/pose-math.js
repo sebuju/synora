@@ -275,16 +275,20 @@ function se3Identity() {
 // that drifted between them would let a tag be "on the wall" for one and not
 // the other.
 //
-// Returns { cos, d, on }: |normal agreement| (absolute — a tag mounted upside
-// down is still on the wall), the signed out-of-plane offset of `a` from `b`'s
-// plane measured along `b`'s normal, and that normal `on` itself so the caller
-// can move a point onto the plane without recomputing it.
+// Returns { cos, d, on }: the SIGNED normal agreement, the signed out-of-plane
+// offset of `a` from `b`'s plane measured along `b`'s normal, and that normal
+// `on` itself so the caller can move a point onto the plane without
+// recomputing it. cos is signed because the sign is information: negative
+// means the tags face opposite ways — the two sides of a partition, never one
+// wall. Callers that genuinely do not care (the survey clip treats a
+// back-to-back pair as one plane assertion) take the absolute value
+// themselves.
 const CLIP_PLANE_M = 0.05;
 const CLIP_PARALLEL_COS = Math.cos(10 * Math.PI / 180);
 function tagPlaneAgreement(a, b) {
   const n = quatRotate(a.q, [0, 0, 1]);
   const on = quatRotate(b.q, [0, 0, 1]);
-  const cos = Math.abs(n[0] * on[0] + n[1] * on[1] + n[2] * on[2]);
+  const cos = n[0] * on[0] + n[1] * on[1] + n[2] * on[2];
   const d = (a.p[0] - b.p[0]) * on[0]
     + (a.p[1] - b.p[1]) * on[1]
     + (a.p[2] - b.p[2]) * on[2];
