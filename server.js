@@ -822,6 +822,27 @@ function handleSignal(ws, msg) {
     }
     return;
   }
+  if (msg.type === 'survey-clear') {
+    if (ws.role === 'viewer') {
+      // Removing the anchor IS the survey reset — same path as double-click
+      // removing it, one wipe semantic, not two.
+      const anchor = survey.getMarkerMap().anchorId;
+      if (anchor != null) survey.removeMarker(anchor);
+      const map = survey.getMarkerMap();
+      send(ws, { type: 'marker-map', ...map });
+      walls.reset();
+      walls.setMarkerMap(map);
+      sendWalls(ws);
+    }
+    return;
+  }
+  if (msg.type === 'walls-clear') {
+    if (ws.role === 'viewer') {
+      walls.reset();
+      sendWalls(ws);
+    }
+    return;
+  }
   if (msg.type === 'marker-remove') {
     if (ws.role === 'viewer' && Number.isInteger(msg.id)) {
       survey.removeMarker(msg.id);

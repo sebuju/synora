@@ -145,7 +145,7 @@ for (const seg of segs) {
   const ext = seg.ext
     ? ` (corner-extended${seg.ext.a ? ` a+${seg.ext.a}m` : ''}${seg.ext.b ? ` b+${seg.ext.b}m` : ''})`
     : '';
-  console.log(`  tags [${seg.ids.join(' ')}] `
+  console.log(`  ${seg.inferred ? 'inferred' : `tags [${seg.ids.join(' ')}]`} `
     + `(${seg.a[0].toFixed(2)}, ${seg.a[1].toFixed(2)}) -> `
     + `(${seg.b[0].toFixed(2)}, ${seg.b[1].toFixed(2)}), ${len.toFixed(2)} m${ext}`);
 }
