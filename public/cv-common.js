@@ -19,6 +19,17 @@ const ROOM_TAG_COUNT = 16;
 // tag, visible nowhere.
 const ROOM_TAG_MM = 150;
 
+// A tag's four corners in its own frame, ArUco order TL,TR,BR,BL; marker frame
+// x right, y up, z out of the wall. One definition, because two sides solve
+// against it: the client's PnP object points (detect-core.js) and the server's
+// joint multi-tag solve (survey.js, which require()s this file — hence the
+// module.exports tail below). A layout that drifted between them would not
+// fail, it would bias every joint residual silently.
+function markerCornersM(sizeM) {
+  const s = sizeM / 2;
+  return [[-s, s, 0], [s, s, 0], [s, -s, 0], [-s, -s, 0]];
+}
+
 const BOARD_DICT = 'DICT_5X5_100';
 const BOARD_SQUARES_X = 7;
 const BOARD_SQUARES_Y = 10;
@@ -653,4 +664,10 @@ function createVideoFrameLumaSource(cv) {
       key = '';
     },
   };
+}
+
+// Everything else in this file is browser-only; the corner layout is the one
+// definition the server needs (see markerCornersM).
+if (typeof module !== 'undefined') {
+  module.exports = { markerCornersM };
 }

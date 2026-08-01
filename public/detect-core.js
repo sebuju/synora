@@ -107,12 +107,10 @@ function createDetectCore() {
 
 
   function buildObjPoints() {
-    const s = markerSizeM / 2;
     objPts?.delete();
-    // ArUco corner order TL,TR,BR,BL; marker frame x right, y up, z out.
-    objPts = cv.matFromArray(4, 3, cv.CV_32F, [
-      -s, s, 0, s, s, 0, s, -s, 0, -s, -s, 0,
-    ]);
+    // The corner layout is shared with the server's joint solve — see
+    // markerCornersM in cv-common.js.
+    objPts = cv.matFromArray(4, 3, cv.CV_32F, markerCornersM(markerSizeM).flat());
     builtSize = markerSizeM;
   }
 
