@@ -8,7 +8,7 @@
 //   node replay-survey.js recordings/<stamp>_clientN.pose.jsonl [more ...]
 //     [--markers markers.json] [--step-m 0.30] [--step-m-per-s 3.0]
 //     [--step-max-dt 0.6] [--step-cap-m 1.0] [--step-recover 3]
-//     [--refine-noise-scale 1]
+//     [--refine-noise-scale 1] [--joint-pnp 1] [--joint-min-offplane-m 0.03]
 //     [--perturb id:deg[:m]] [--log] [--per-journal] [--refine]
 //
 // The journal lines are fed to survey.alignXr / survey.handlePose with the
@@ -48,7 +48,7 @@ function usage(err) {
   console.error('usage: node replay-survey.js <journal.pose.jsonl> [more ...]\n'
     + '  [--markers markers.json] [--step-m X] [--step-m-per-s X]\n'
     + '  [--step-max-dt X] [--step-cap-m X] [--step-recover N]\n'
-    + '  [--refine-noise-scale X]\n'
+    + '  [--refine-noise-scale X] [--joint-pnp 0|1] [--joint-min-offplane-m X]\n'
     + '  [--perturb id:deg[:m]] [--log] [--per-journal] [--refine]');
   process.exit(1);
 }
@@ -92,6 +92,12 @@ if (flags['step-recover'] !== undefined) opts.stepRecoverFixes = Number(flags['s
 // becomes 1 for everything. Same trick as the --step-m triple above.
 if (flags['refine-noise-scale'] !== undefined) {
   opts.refineNoiseScale = Number(flags['refine-noise-scale']);
+}
+// `--joint-pnp 0` reproduces the module as it stood before the joint multi-tag
+// solve: every call falls straight through to fuseCameraPose.
+if (flags['joint-pnp'] !== undefined) opts.jointPnp = Number(flags['joint-pnp']);
+if (flags['joint-min-offplane-m'] !== undefined) {
+  opts.jointMinOffplaneM = Number(flags['joint-min-offplane-m']);
 }
 for (const [k, v] of Object.entries(opts)) {
   if (!Number.isFinite(v)) usage(`bad number for ${k}`);
@@ -311,6 +317,10 @@ const total = {
   reports: 0, steps: [], unsafe: 0, safeN: 0,
   trips: 0, slips: 0, reacq: 0, refound: 0, quality: {}, journals: 0, changed: [],
   refine: new Map(),
+  joint: {
+    joint: 0, fewTags: 0, noCorners: 0, noIntr: 0, coplanar: 0,
+    noConverge: 0, rms: 0, ms: 0,
+  },
 };
 
 for (const file of journals) {
@@ -477,6 +487,9 @@ for (const file of journals) {
     t.finals.push(...s.finals);
   }
 
+  const js = survey.jointStats();
+  for (const k of Object.keys(total.joint)) total.joint[k] += js[k];
+
   total.journals++;
   total.reports += j.reports;
   total.steps.push(...j.steps);
@@ -506,6 +519,23 @@ console.log('quality  ' + Object.entries(total.quality)
   .sort((a, b) => b[1] - a[1])
   .map(([k, v]) => `${k} ${v.toFixed(0)}s`).join('  '));
 console.log(`journals with any alignment event: ${total.changed.length}`);
+
+// Coverage of the joint multi-tag solve — the number the whole change stands
+// or falls on. `tried` is the calls that saw two or more mapped tags; if the
+// joint share of those is small the feature is moot, and this line is what
+// says so instead of leaving it assumed.
+{
+  const jn = total.joint;
+  const tried = jn.joint + jn.coplanar + jn.noCorners + jn.noIntr
+    + jn.noConverge + jn.rms;
+  if (tried || jn.fewTags) {
+    console.log(`joint PnP  taken ${jn.joint}/${tried} multi-tag calls`
+      + (tried ? ` (${(100 * jn.joint / tried).toFixed(0)}%)` : '')
+      + `  fallback: coplanar ${jn.coplanar}, no-corners ${jn.noCorners}, `
+      + `no-intr ${jn.noIntr}, no-converge ${jn.noConverge}, rms ${jn.rms}`
+      + `  under-2-tag calls ${jn.fewTags}  solver ${(jn.ms / 1000).toFixed(1)} s`);
+  }
+}
 
 if (flags.refine) {
   console.log('\nrefine — per tag, pooled over journals'

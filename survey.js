@@ -15,7 +15,9 @@ const {
   quatAngleDeg, quatMean, quatMedian, quatNudge, se3FromRvecTvec, se3Compose, se3Invert,
   se3Identity, quatFromRvec, quatRotate, quatMul, quatConj, transformPoint,
   quatNormalize, quatFromTo, tagPlaneAgreement, CLIP_PLANE_M, CLIP_PARALLEL_COS,
+  solvePose,
 } = require('./public/pose-math.js');
+const { markerCornersM } = require('./public/cv-common.js');
 
 // Observation gates. err is mean corner reprojection error in px — the best
 // single-number proxy for a bad detection (blur, oblique view, tiny tag).
@@ -173,6 +175,24 @@ function median(values) {
   const s = [...values].sort((a, b) => a - b);
   const mid = Math.floor(s.length / 2);
   return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+}
+
+// Smallest eigenvalue of a symmetric 3x3 matrix given as [xx,xy,xz,yy,yz,zz]
+// (the trigonometric closed form for symmetric 3x3). Used on the covariance of
+// pooled tag corners: its square root is the RMS spread along the flattest
+// axis, i.e. how far the point set is from being one plane.
+function minEig3([a, b, c, d, e, f]) {
+  const p1 = b * b + c * c + e * e;
+  const q = (a + d + f) / 3;
+  const p2 = (a - q) ** 2 + (d - q) ** 2 + (f - q) ** 2 + 2 * p1;
+  if (p2 < 1e-30) return q;
+  const p = Math.sqrt(p2 / 6);
+  const B = [(a - q) / p, b / p, c / p, (d - q) / p, e / p, (f - q) / p];
+  const det = B[0] * (B[3] * B[5] - B[4] * B[4])
+    - B[1] * (B[1] * B[5] - B[4] * B[2])
+    + B[2] * (B[1] * B[4] - B[3] * B[2]);
+  const phi = Math.acos(Math.min(1, Math.max(-1, det / 2))) / 3;
+  return q + 2 * p * Math.cos(phi + 2 * Math.PI / 3);
 }
 
 
@@ -431,6 +451,146 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
       for (let k = 0; k < 3; k++) p[k] += poses[i].p[k] * (weights[i] / wsum);
     }
     return { p, q: quatMean(poses.map((x) => x.q), weights) };
+  }
+
+  // Joint multi-tag PnP: one solve over every visible mapped tag's corners at
+  // once, replacing the fuse of per-tag poses when the geometry supports it.
+  //
+  // Why: measured over 84 journals, 10.6% of tag sightings are the wrong branch
+  // of the planar two-fold ambiguity, they fit their own corners to under
+  // 0.3 px (no reprojection gate can see them), and they come in runs (no
+  // temporal filter can either). Every dilution was tried and measured short —
+  // robust estimators are a no-op because the contamination is symmetric,
+  // conditioning weights buy 9%. But the ambiguity is a property of a
+  // *coplanar* point set: tags on different walls jointly have no mirror at
+  // all, so a solve over all of them removes the degree of freedom rather than
+  // averaging over it. `0` reproduces the module exactly as it stood.
+  const JOINT_PNP = opts.jointPnp ?? 1;
+  // Mean per-point reprojection distance the accepted solve must beat, and the
+  // gate doing most of the protecting — measured, not guessed. At this tag size
+  // even two tags on perpendicular walls are only ~5 cm from one plane, so the
+  // wrong joint basin still fits their corners to 1.5-3 px; the true basin fits
+  // under 1. Replayed over the three worst journals, joint-vs-fuse disagreement
+  // by rms band: under 1 px, 227 solves, none past 0.5 m (mean 5 cm — the
+  // honest difference between the two estimators); 1.5-3 px, 508 solves, 96%
+  // past 0.5 m at a 1.6 m mean, i.e. the mirror wearing a plausible residual.
+  // At 3 px this gate admitted every one of those, and the map-teleport showed
+  // up as reported-pose jumps and alignment re-acquires (7 -> 46 across 109
+  // journals). A solve past the gate falls back to the fuse, which is never
+  // worse than today.
+  const JOINT_MAX_RMS_PX = opts.jointMaxRmsPx ?? 1;
+  // The load-bearing guard. RMS spread of the pooled room-frame corners along
+  // the flattest axis: below this the set is effectively one plane, the joint
+  // solve is *still* two-fold ambiguous, and accepting it would put the same
+  // ambiguity in a new place with more confidence attached. Sized against the
+  // two cases it must separate: tags taped to one wall sit ~1 cm off a common
+  // plane (solve noise), while a 150 mm tag on a wall ~86 deg from another
+  // wall's plane puts its corners ~5 cm out. An absolute figure, not the
+  // smallest/largest spread ratio, because the ratio *shrinks* as tags on
+  // different walls get further apart — the direction in which the geometry
+  // actually gets stronger.
+  const JOINT_MIN_OFFPLANE_M = opts.jointMinOffplaneM ?? 0.03;
+  // Seeds are every visible tag's implied camera pose, for both of its PnP
+  // branches — a single seed would stay in whichever basin it started in,
+  // which is the whole failure this replaces. Bounded because this runs at
+  // 10 Hz per client.
+  const JOINT_MAX_SEEDS = 12;
+  // Coverage accounting. If the joint path rarely runs the whole feature is
+  // moot, and that has to be visible rather than assumed — every fallback
+  // reason is counted and the split is logged (and read by replay-survey.js).
+  const jointStats = {
+    joint: 0, fewTags: 0, noCorners: 0, noIntr: 0, coplanar: 0,
+    noConverge: 0, rms: 0, ms: 0,
+  };
+  let jointLogAt = 0;
+
+  function maybeLogJoint() {
+    const now = Date.now();
+    if (now - jointLogAt < 60000) return;
+    const tried = jointStats.joint + jointStats.coplanar + jointStats.noCorners
+      + jointStats.noIntr + jointStats.noConverge + jointStats.rms;
+    if (!tried) return;
+    jointLogAt = now;
+    log(`Joint PnP: ${jointStats.joint}/${tried} multi-tag solves took the joint `
+      + `path (coplanar ${jointStats.coplanar}, no corners ${jointStats.noCorners}, `
+      + `no camera model ${jointStats.noIntr}, no convergence ${jointStats.noConverge}, `
+      + `rms ${jointStats.rms}); ${jointStats.fewTags} calls saw under two tags; `
+      + `solver ${jointStats.ms.toFixed(0)} ms total`);
+  }
+
+  function jointSolve(known, K) {
+    if (known.length < 2) {
+      jointStats.fewTags++;
+      return null;
+    }
+    if (!K || !Number.isFinite(K.fx)) {
+      jointStats.noIntr++;
+      return null;
+    }
+    const usable = known.filter((o) => o.corners);
+    if (usable.length < 2) {
+      jointStats.noCorners++;
+      return null;
+    }
+    const cs = markerCornersM(markerSizeM);
+    const obj = [];
+    const img = [];
+    for (const o of usable) {
+      const mp = markers.get(o.id).pose;
+      for (let i = 0; i < 4; i++) {
+        obj.push(transformPoint(mp, cs[i]));
+        img.push([o.corners[i * 2], o.corners[i * 2 + 1]]);
+      }
+    }
+    const mean = [0, 1, 2].map((k) => obj.reduce((a, p) => a + p[k], 0) / obj.length);
+    let xx = 0, xy = 0, xz = 0, yy = 0, yz = 0, zz = 0;
+    for (const pt of obj) {
+      const dx = pt[0] - mean[0];
+      const dy = pt[1] - mean[1];
+      const dz = pt[2] - mean[2];
+      xx += dx * dx; xy += dx * dy; xz += dx * dz;
+      yy += dy * dy; yz += dy * dz; zz += dz * dz;
+    }
+    const n = obj.length;
+    const offPlane = Math.sqrt(Math.max(0,
+      minEig3([xx / n, xy / n, xz / n, yy / n, yz / n, zz / n])));
+    if (offPlane < JOINT_MIN_OFFPLANE_M) {
+      jointStats.coplanar++;
+      return null;
+    }
+    let best = null;
+    let seeds = 0;
+    for (const o of usable) {
+      const mp = markers.get(o.id).pose;
+      for (const s of o.sols) {
+        if (seeds >= JOINT_MAX_SEEDS) break;
+        seeds++;
+        const sol = solvePose(obj, img, K, se3Compose(mp, se3Invert(s.camTag)));
+        if (sol && (!best || sol.rms < best.rms)) best = sol;
+      }
+    }
+    if (!best) {
+      jointStats.noConverge++;
+      return null;
+    }
+    if (best.rms > JOINT_MAX_RMS_PX) {
+      jointStats.rms++;
+      return null;
+    }
+    jointStats.joint++;
+    return { p: best.p, q: best.q };
+  }
+
+  // Null whenever the joint solve is not available or not trustworthy, so
+  // every caller keeps fuseCameraPose as the fallback:
+  //   jointCameraPose(known, K) ?? fuseCameraPose(known, ...)
+  function jointCameraPose(known, K) {
+    if (!JOINT_PNP) return null;
+    const t0 = performance.now();
+    const out = jointSolve(known, K);
+    jointStats.ms += performance.now() - t0;
+    maybeLogJoint();
+    return out;
   }
 
   // ARCore tracks the camera in its own session frame, whose origin is
@@ -1218,7 +1378,7 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
   }
 
   function maintainSurvey(pose, obs, needKnownTag = true, clientId = undefined,
-    modelSource = undefined) {
+    modelSource = undefined, K = null) {
     if (modelSource === 'guess') return false;
     const known = obs.filter((o) => markers.has(o.id));
     if (needKnownTag) {
@@ -1283,7 +1443,12 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
         if (!surveyGrade(o)) continue;
         const others = known.filter((x) =>
           x.id !== o.id && markers.has(x.id) && surveyGrade(x) && !descendsFrom(x.id, o.id));
-        const fix = others.length ? fuseCameraPose(others) : null;
+        // This fix is what the map itself is refined against, which is where
+        // the per-session orientation bias was traced — the joint solve
+        // matters most here.
+        const fix = others.length
+          ? (jointCameraPose(others, K) ?? fuseCameraPose(others))
+          : null;
         if (!fix) continue;
         const est = se3Compose(fix, o.camTag);
         const m = markers.get(o.id);
@@ -1554,7 +1719,13 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
         dropped.push(`${t.id} at ${d.toFixed(1)} m, ${t.err.toFixed(1)} px`);
         continue;
       }
-      out.push({ id: t.id, sols, ...sols[0] });
+      // The raw corner measurement rides along for the joint multi-tag solve.
+      // Both PnP branches are interpretations of these same eight numbers, so
+      // they belong to the observation, not to a solution.
+      const corners = Array.isArray(t.corners) && t.corners.length === 8
+        ? t.corners
+        : null;
+      out.push({ id: t.id, sols, corners, ...sols[0] });
     }
     if (!out.length && dropped.length) {
       const now = Date.now();
@@ -1760,6 +1931,13 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
     load,
     predictPose,
 
+    // Coverage of the joint multi-tag solve, for the replay harness — if the
+    // joint path rarely runs, the whole feature is moot and that must be a
+    // number, not an assumption.
+    jointStats() {
+      return { ...jointStats };
+    },
+
     markerSize() {
       return markerSizeM;
     },
@@ -1902,7 +2080,12 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
         ref = se3Compose(prev.T, xrT);
       }
       pickSolutions(known, ref);
-      const camRoom = known.length ? fuseCameraPose(known, ref) : null;
+      // The joint solve first: with two or more mapped tags off one plane it
+      // has no mirror ambiguity at all, where the fuse can only average over
+      // whichever branches pickSolutions kept.
+      const camRoom = known.length
+        ? (jointCameraPose(known, intrinsics) ?? fuseCameraPose(known, ref))
+        : null;
 
       // A tag in this frame only counts as confirming the alignment if its fix
       // was actually folded in. One thrown away by the jump gate says the
@@ -2077,7 +2260,8 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
       const extPose = founding || (A && A.unresolved) ? null
         : slipping ? (slipReport && !slipReport.held ? camRoom : null)
           : (camRoom || (alignFresh ? roomPose : null));
-      if (extPose && maintainSurvey(extPose, obs, false, clientId, modelSource)) mapChanged = true;
+      if (extPose && maintainSurvey(extPose, obs, false, clientId, modelSource,
+        intrinsics)) mapChanged = true;
       // Whether this report may become *permanent* state elsewhere (the walls
       // grid is as durable as markers.json). The survey's own quarantine —
       // founding, unresolved mirror, slip — is invisible outside this closure,
@@ -2133,7 +2317,9 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
       const prev = clientId !== undefined ? lastFix.get(clientId) : undefined;
       const prevFresh = prev && Date.now() - prev.at < JUMP_HISTORY_TTL_MS;
       pickSolutions(known, prevFresh ? prev.pose : null);
-      let pose = fuseCameraPose(known);
+      // msg.intr ships only while landmarks are on (pose.js), so the joint
+      // path is conditional on this side — see the availability note there.
+      let pose = jointCameraPose(known, msg.intr) ?? fuseCameraPose(known);
       let smoothed = pose;
 
       // Ambiguity-flip gate: hold the previous fix instead of teleporting,
@@ -2161,7 +2347,9 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
       if (pose) {
         const strong = known.filter(
           (o) => o.err <= GOOD_MAX_ERR_PX && o.dist <= GOOD_MAX_DIST_M);
-        if (maintainSurvey(pose, obs, true, clientId, msg.source)) mapChanged = true;
+        if (maintainSurvey(pose, obs, true, clientId, msg.source, msg.intr)) {
+          mapChanged = true;
+        }
 
         const quality = strong.length ? 'good' : 'weak';
         return {
