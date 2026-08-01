@@ -300,11 +300,189 @@ function transformPoint(t, v) {
   return [r[0] + t.p[0], r[1] + t.p[1], r[2] + t.p[2]];
 }
 
+// Camera pose from 3D-2D correspondences: Levenberg-damped Gauss-Newton over
+// six parameters, minimising reprojection error in pixels. This exists because
+// the server has no OpenCV and needs to solve PnP against the corners of
+// *several* tags at once — a single planar tag has a two-fold pose ambiguity,
+// but tags on different walls jointly do not, so one solve over all of them
+// removes the degree of freedom instead of averaging over it.
+//
+// `objPts` are [x,y,z] points in the target frame (the room), `imgPts` the
+// matching [u,v] pixels, `K` a camera model ({fx,fy,cx,cy,dist}), `seed` the
+// {p,q} camera pose to start from. Returns { p, q, rms } — rms is the mean
+// per-point reprojection distance in px — or null when the seed is unusable
+// (a point behind the camera; that basin has no answer in it). Convergence is
+// local by design: the caller escapes the wrong basin by seeding from every
+// candidate pose it has, not by trusting one seed.
+//
+// Plain unweighted least squares: reprojection residuals are already in the
+// units the corner noise lives in. Deliberately not fuseCameraPose's
+// inverse-variance weights — those weight a tag's implied camera *position*,
+// a different quantity.
+function solvePose(objPts, imgPts, K, seed, { maxIter = 60 } = {}) {
+  const n = objPts.length;
+  if (n < 3 || imgPts.length !== n) return null;
+  const kd = K.dist || [0, 0, 0, 0, 0];
+  const hasDist = kd.some((v) => v);
+
+  // Residuals of the pose (pp, qq): project each object point through the
+  // inverse camera pose and the camera model, subtract the measured pixel.
+  function residuals(pp, qq) {
+    const r = new Float64Array(2 * n);
+    const qi = quatConj(qq);
+    for (let i = 0; i < n; i++) {
+      const X = objPts[i];
+      const c = quatRotate(qi, [X[0] - pp[0], X[1] - pp[1], X[2] - pp[2]]);
+      if (!(c[2] > 1e-6)) return null;
+      let x = c[0] / c[2];
+      let y = c[1] / c[2];
+      if (hasDist) {
+        // Brown-Conrady forward model, same convention the corners were
+        // measured under (the client detects on the distorted image).
+        const [k1, k2, p1, p2, k3] = kd;
+        const r2 = x * x + y * y;
+        const rad = 1 + r2 * (k1 + r2 * (k2 + r2 * k3));
+        const xd = x * rad + 2 * p1 * x * y + p2 * (r2 + 2 * x * x);
+        const yd = y * rad + p1 * (r2 + 2 * y * y) + 2 * p2 * x * y;
+        x = xd;
+        y = yd;
+      }
+      r[2 * i] = K.fx * x + K.cx - imgPts[i][0];
+      r[2 * i + 1] = K.fy * y + K.cy - imgPts[i][1];
+    }
+    return r;
+  }
+
+  function costOf(r) {
+    let s = 0;
+    for (const v of r) s += v * v;
+    return s;
+  }
+
+  // Gaussian elimination with partial pivoting, sized for the 6x6 normal
+  // equations. Destroys its copies, returns null on a singular system.
+  function solveLin(A, b) {
+    const m = b.length;
+    const M = A.map((row, i) => [...row, b[i]]);
+    for (let c = 0; c < m; c++) {
+      let piv = c;
+      for (let r = c + 1; r < m; r++) {
+        if (Math.abs(M[r][c]) > Math.abs(M[piv][c])) piv = r;
+      }
+      if (Math.abs(M[piv][c]) < 1e-12) return null;
+      [M[c], M[piv]] = [M[piv], M[c]];
+      for (let r = 0; r < m; r++) {
+        if (r === c) continue;
+        const f = M[r][c] / M[c][c];
+        for (let k = c; k <= m; k++) M[r][k] -= f * M[c][k];
+      }
+    }
+    return M.map((row, i) => row[m] / row[i]);
+  }
+
+  let p = [...seed.p];
+  let q = quatNormalize([...seed.q]);
+  let r0 = residuals(p, q);
+  if (!r0) return null;
+  let cost = costOf(r0);
+  let lambda = 1e-3;
+  // Finite-difference steps for the numeric Jacobian: a tenth of a millimetre
+  // and ~0.006 deg — far below the solution's own noise, far above fp error.
+  const EPS = 1e-4;
+
+  for (let iter = 0; iter < maxIter; iter++) {
+    // Jacobian of the residual against a local 6-dof perturbation: three of
+    // translation, three of a rotation vector pre-multiplied onto q.
+    const J = [];
+    let dead = false;
+    for (let k = 0; k < 6; k++) {
+      let pp = p;
+      let qq = q;
+      if (k < 3) {
+        pp = [...p];
+        pp[k] += EPS;
+      } else {
+        const dr = [0, 0, 0];
+        dr[k - 3] = EPS;
+        qq = quatNormalize(quatMul(quatFromRvec(dr), q));
+      }
+      const rk = residuals(pp, qq);
+      if (!rk) {
+        dead = true;
+        break;
+      }
+      const col = new Float64Array(2 * n);
+      for (let i = 0; i < 2 * n; i++) col[i] = (rk[i] - r0[i]) / EPS;
+      J.push(col);
+    }
+    if (dead) break;
+
+    const A = [];
+    const g = [];
+    for (let a = 0; a < 6; a++) {
+      A.push(new Array(6).fill(0));
+      let s = 0;
+      for (let i = 0; i < 2 * n; i++) s += J[a][i] * r0[i];
+      g.push(s);
+    }
+    for (let a = 0; a < 6; a++) {
+      for (let b = a; b < 6; b++) {
+        let s = 0;
+        for (let i = 0; i < 2 * n; i++) s += J[a][i] * J[b][i];
+        A[a][b] = s;
+        A[b][a] = s;
+      }
+    }
+
+    // Marquardt damping on the diagonal (scale-free across the mixed
+    // metre/radian units), raised until a step actually reduces the cost. The
+    // ceiling has to be generous: a seed far from the answer with a tag close
+    // to the camera gives a Gauss-Newton step that throws points behind the
+    // camera, and only a heavily damped (near gradient-descent) step gets out
+    // — measured, a cap of 8 doublings left such a seed exactly where it
+    // started.
+    let took = false;
+    for (let t = 0; t < 24 && lambda < 1e12; t++) {
+      const M = A.map((row, i) => {
+        const out = [...row];
+        out[i] += lambda * Math.max(row[i], 1e-9);
+        return out;
+      });
+      const d = solveLin(M, g);
+      if (!d) {
+        lambda *= 4;
+        continue;
+      }
+      const np = [p[0] - d[0], p[1] - d[1], p[2] - d[2]];
+      const nq = quatNormalize(quatMul(quatFromRvec([-d[3], -d[4], -d[5]]), q));
+      const nr = residuals(np, nq);
+      const nc = nr ? costOf(nr) : Infinity;
+      if (nc < cost) {
+        const rel = (cost - nc) / (cost || 1);
+        p = np;
+        q = nq;
+        r0 = nr;
+        cost = nc;
+        lambda = Math.max(lambda * 0.5, 1e-9);
+        took = true;
+        // Converged: the accepted step stopped buying anything.
+        if (rel < 1e-9 || Math.hypot(d[0], d[1], d[2], d[3], d[4], d[5]) < 1e-8) {
+          iter = maxIter;
+        }
+        break;
+      }
+      lambda *= 4;
+    }
+    if (!took) break;   // damping maxed out with no downhill step left
+  }
+  return { p, q, rms: Math.sqrt(cost / n) };
+}
+
 if (typeof module !== 'undefined') {
   module.exports = {
     quatFromRvec, rvecFromQuat, quatMul, quatConj, quatNormalize, quatRotate,
     quatAngleDeg, quatMean, quatMedian, quatNudge, se3FromRvecTvec, se3Compose,
-    se3Invert, se3Identity, transformPoint, quatFromTo,
+    se3Invert, se3Identity, transformPoint, quatFromTo, solvePose,
     matFromRvec, rvecFromMat, matMul3, mirrorRvecGuesses,
     tagPlaneAgreement, CLIP_PLANE_M, CLIP_PARALLEL_COS,
   };
