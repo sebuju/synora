@@ -721,11 +721,11 @@ const ROOM_POSE_STALE_MS = 2000;
 // overlay's landmark line and the maps' candidate shading read it, and a
 // candidate that looked nearly ready on one and barely started on the other
 // would be worse than showing neither.
-const ROOM_LANDMARK_ARC_DEG = 40;
+const ROOM_LANDMARK_ARC_DEG = 20;
 
 // Candidates get a colour of their own rather than a dimmer version of the
 // client's. A client colour is an *identity* — the same hue carries that
-// client's dot, its anchors and its drawer cards — and using it for tracks that
+// client's dot, its landmarks and its drawer cards — and using it for tracks that
 // may never become anything says "this client has these landmarks" when the
 // truth is "this client is working on these". A neutral grey belongs to nobody
 // and reads as provisional, which is exactly what a candidate is.
@@ -738,6 +738,26 @@ const ROOM_CANDIDATE_COLOR = 0x9aa4ad;
 function roomCandidateColorCss(alpha = null) {
   if (alpha === null) return `#${ROOM_CANDIDATE_COLOR.toString(16).padStart(6, '0')}`;
   const c = ROOM_CANDIDATE_COLOR;
+  return `rgba(${(c >> 16) & 255}, ${(c >> 8) & 255}, ${c & 255}, ${alpha})`;
+}
+
+// One shared colour for all landmarks, like the candidates' grey: the
+// landmark cloud used to borrow the owning client's colour, which put dots
+// the exact colour of the pose marker all over the map — the two mean
+// entirely different things and were being read as one. Teal: not any client
+// hue, not the candidates' grey, not the anchor's gold, not the amber that
+// means "inferred, act on it". Ownership is still readable where it matters
+// — the drawer's region cards carry the client tint and hovering lights the
+// owner's cloud.
+const ROOM_LANDMARK_COLOR = 0x2dd4bf;
+
+function roomLandmarkColor() {
+  return ROOM_LANDMARK_COLOR;
+}
+
+function roomLandmarkColorCss(alpha = null) {
+  if (alpha === null) return `#${ROOM_LANDMARK_COLOR.toString(16).padStart(6, '0')}`;
+  const c = ROOM_LANDMARK_COLOR;
   return `rgba(${(c >> 16) & 255}, ${(c >> 8) & 255}, ${c & 255}, ${alpha})`;
 }
 

@@ -22,6 +22,7 @@ const startBtn = document.getElementById('startBtn');
 const overlay = document.getElementById('overlay');
 const overlayText = document.getElementById('overlayText');
 const blankBtn = document.getElementById('blankBtn');
+const lmBtn = document.getElementById('lmBtn');
 const mapCanvas = document.getElementById('mapCanvas');
 const camCanvas = document.getElementById('camCanvas');
 const overlayRot = document.getElementById('overlayRot');
@@ -40,7 +41,11 @@ window.addEventListener('error', (ev) => {
     `error: ${ev.message} (${(ev.filename || '').split('/').pop()}:${ev.lineno})`;
 });
 
-const POSE_INTERVAL_MS = 100;      // how often detection is *attempted*
+// How often detection is *attempted*. The server's, not this page's: it is a
+// room-wide setting (see settings.js) and every client has to be paced by the
+// same one, or a survey's convergence depends on which phone walked it. The
+// value here is only what stands until the first pose-config arrives.
+let poseRateMs = 100;
 // How often this client reports where it is, which is no longer the same thing.
 //
 // Detection costs 300 ms a frame on this phone (tag scan plus feature tracking),
@@ -103,6 +108,17 @@ let lastTrack = null;
 // Set when the worker reports the tracker shut itself off. Sticky for the
 // session: it does not get a second chance, so neither should the message.
 let trackFailed = null;
+// The landmarking feature as a whole, user-switchable. Off is the state that
+// matters: the feature tracker costs 178-206 ms a frame on this page, and it
+// is the single biggest thing between a 10 Hz detection request and the ~4/s
+// actually delivered. Off, no points ride the reports and the server's
+// maintainLandmarks is a structural no-op for this client. Session-scoped on
+// purpose — the XR page never persists settings to the device registry.
+let landmarksOn = true;
+// WebXR features the session actually granted (session.enabledFeatures),
+// reported in client-state as reconnaissance: 'plane-detection' or 'anchors'
+// being available would hand chunks of the custom CV over to ARCore.
+let xrFeatures = null;
 let roomPose = null;
 // The last room fix that actually was one. `roomPose` is whatever the last
 // report said, null pose included; this is what the map is turned and centred
@@ -169,6 +185,9 @@ const signaling = connectSignaling('client', {
       // answers to.
       if (msg.action === 'blank') blank.set(!!msg.value);
       else if (msg.action === 'map') setMapMode(msg.value);
+      // Wanted state, never a toggle — the dashboard's view is up to a second
+      // old, and a toggle raced against a stale view lands inverted.
+      else if (msg.action === 'landmarks') setLandmarks(!!msg.value);
     } else if (msg.type === 'pose-config') {
       // Remembered, not just forwarded. pose-config arrives on connect; the
       // detector does not exist until the user starts the XR session, so
@@ -177,8 +196,9 @@ const signaling = connectSignaling('client', {
       // every distance 5.6% long, and nothing anywhere says so — the room is
       // just uniformly too big.
       if (msg.markerSizeM > 0) markerSizeM = msg.markerSizeM;
+      if (msg.poseRateMs > 0) poseRateMs = msg.poseRateMs;
       core?.setMarkerSize(markerSizeM);
-      detectWorker?.postMessage({ type: 'config', markerSizeM });
+      detectWorker?.postMessage({ type: 'config', markerSizeM, poseRateMs });
     }
   },
 }, device.then((d) => d.id));
@@ -218,7 +238,7 @@ const MAP_FRAME_MS = 16;
 const CHIP_INTERVAL_MS = 200;
 let chipAt = 0;
 
-// `track N pts` is this phone's own tracker; `anchors`/`arc` are the server's
+// `track N pts` is this phone's own tracker; `landmarks`/`arc` are the server's
 // map, which arrives on room-pose. Either half can be missing — the tracker
 // before the first frame, the server state before the first report — and the
 // line says only what it actually knows.
@@ -227,6 +247,9 @@ function landmarkLine() {
   // must never be: a tracker that shut itself off and a tracker that was never
   // asked to run look identical when the answer is silence.
   if (trackFailed) return `landmarks OFF — ${trackFailed}\n`;
+  // Switched off by the user (or the dashboard) — distinct from failed, and
+  // said in the button's own words so the state has one name.
+  if (!landmarksOn) return 'landmarks off\n';
   if (!lastTrack && !roomPose?.landmarks) return 'landmarks — no tracker output yet\n';
   const lm = roomPose?.landmarks;
   // Two lines, because this is a phone: what the tracker is doing, then what
@@ -254,10 +277,24 @@ function landmarkLine() {
   // more than the total.
   if (c?.in) second.push(`drop lk${c.status} edge${c.edge} fb${c.fb}`);
   if (lm) {
-    second.push(`${lm.anchors} anchor${lm.anchors === 1 ? '' : 's'}`);
+    // solid = solve-grade (what a fix can actually use); the rest is the
+    // coarse consensus backlog still waiting to be looked at and refined.
+    second.push(lm.solid !== undefined && lm.solid !== lm.landmarks
+      ? `${lm.solid}✓ of ${lm.landmarks} landmarks`
+      : `${lm.landmarks} landmark${lm.landmarks === 1 ? '' : 's'}`);
     // Against the threshold while it matters, on its own once it does not: a
     // target already met is not information.
-    second.push(lm.anchors ? `arc ${lm.arc}°` : `arc ${lm.arc}/${ROOM_LANDMARK_ARC_DEG}°`);
+    second.push(lm.landmarks ? `arc ${lm.arc}°` : `arc ${lm.arc}/${ROOM_LANDMARK_ARC_DEG}°`);
+    // The depth verdict: trusted means landmarks qualify from a glance and a
+    // step; off means the orbit rules are back in force. Warming is the first
+    // few tag sightings of a session.
+    const dp = lm.depth;
+    if (dp) {
+      second.push(!dp.n ? 'depth —'
+        : dp.residPct === null ? `depth warming ${dp.n}/10`
+          : dp.trusted ? `depth ±${dp.residPct}%`
+            : `depth OFF ±${dp.residPct}%`);
+    }
   }
   return [first.join(' · '), second.join(' · '), guideLine()]
     .filter(Boolean).join('\n') + '\n';
@@ -333,12 +370,13 @@ const mapRaf = (cb) => {
 const MAP_MAX_PX = 1.2e6;
 const mapView = createMap2dView(mapCanvas, 'top', { raf: mapRaf, maxPixels: MAP_MAX_PX });
 const roomFeed = createRoomFeed([mapView]);
-// On here where the dashboard has it off by default. This is the page being
-// carried around the room, and the candidates are the only thing that says
-// *where* to orbit next — on the dashboard they are a diagnostic, here they are
-// the instruction. No button: the phone's overlay is already at its limit, and
-// there is nothing to decide.
-mapView.setLayer('candidates', true);
+// Candidates stay off here (dashboard default): they were the phone's orbit
+// instruction back when founding needed the split-arc walk, and with trusted
+// depth that whole premise is gone — on this screen they were three hundred
+// rings of noise over the map being walked. Coarse consensus landmarks are
+// off for the same reason: a dot on the phone map means "a point that can
+// localize you", nothing weaker — the dashboard keeps the full picture.
+mapView.setLayer('coarse', false);
 
 // off -> the AR passthrough alone, as before; split -> map over the lower half;
 // full -> map over the passthrough entirely. One button cycles them.
@@ -527,6 +565,15 @@ function setTransparent(on) {
   updateCamInset();
 }
 
+// The landmark toggle's one setter — the button and the dashboard control both
+// land here, so there is no second implementation to drift. Reported so the
+// roster shows the state and the (non-optimistic) dashboard button can follow.
+function setLandmarks(on) {
+  landmarksOn = on;
+  lmBtn.classList.toggle('active', on);
+  sendClientState();
+}
+
 // The dashboard's roster is built from what each client reports about itself.
 // This page has far fewer knobs than /client and says so, rather than reporting
 // defaults for controls it does not have.
@@ -544,6 +591,8 @@ function sendClientState() {
     // preference that outlives a session, and the server should not be sending
     // the room to a page with no overlay to draw it in.
     map: session ? mapMode : 'off',
+    landmarks: landmarksOn,
+    xrFeatures,
   });
 }
 
@@ -672,13 +721,28 @@ async function start() {
   gl = canvas.getContext('webgl', { xrCompatible: true, alpha: true });
   try {
     session = await navigator.xr.requestSession('immersive-ar', {
-      optionalFeatures: ['camera-access', 'anchors', 'dom-overlay', 'hit-test'],
+      // 'plane-detection' and 'depth-sensing' ride along as reconnaissance:
+      // everything here is optional, so asking costs nothing on a device
+      // without them. Depth is *measurement-only* — the depth pipeline is
+      // banned until a measurement shows the source good enough (CLAUDE.md),
+      // and sampling it at the tags, whose distance the solver already knows,
+      // is exactly that measurement.
+      optionalFeatures: ['camera-access', 'anchors', 'dom-overlay', 'hit-test',
+        'plane-detection', 'depth-sensing'],
+      depthSensing: {
+        usagePreference: ['cpu-optimized'],
+        dataFormatPreference: ['luminance-alpha', 'float32'],
+      },
       domOverlay: { root: overlay },
     });
   } catch (err) {
     report.textContent = `session refused: ${err.message}`;
     return;
   }
+  // What was actually granted, not what was asked for. The accessor is newish;
+  // null means "this browser cannot say", which is itself worth reporting.
+  xrFeatures = session.enabledFeatures ? [...session.enabledFeatures] : null;
+  console.log('XR session features:', xrFeatures ?? 'unreported');
   sessionId = crypto.randomUUID();
   trackReset = true;
   await gl.makeXRCompatible();
@@ -758,12 +822,12 @@ function onFrame(t, frame) {
     }
     const blind = viewerSpace && frame.getViewerPose(viewerSpace);
     const blindView = blind && blind.views[0];
-    if (blindView && !busy && now - lastPose >= POSE_INTERVAL_MS) {
+    if (blindView && !busy && now - lastPose >= poseRateMs) {
       lastPose = now;
       busy = true;
       // No second argument: no world pose exists, and that is what switches the
       // report to the tag-only message.
-      detectAndReport(blindView, null, viewportOf(layer, blindView))
+      detectAndReport(frame, blindView, null, viewportOf(layer, blindView))
         .finally(() => { busy = false; });
     }
     // Two lines: how long, and whether anything can still be read. `no cam`
@@ -787,12 +851,13 @@ function onFrame(t, frame) {
   updateScreenRotation(pose.transform.orientation);
   // Detection is far too expensive for every frame, and is a re-entrant
   // hazard — one at a time, on its own schedule.
-  if (!busy && now - lastPose >= POSE_INTERVAL_MS) {
+  if (!busy && now - lastPose >= poseRateMs) {
     lastPose = now;
     busy = true;
     // The viewport is the display the projection matrix was built for; it only
     // matters as the thing the camera image's aspect gets compared against.
-    detectAndReport(view, pose, viewportOf(layer, view)).finally(() => { busy = false; });
+    detectAndReport(frame, view, pose, viewportOf(layer, view))
+      .finally(() => { busy = false; });
   }
   // Between detections: where ARCore says the camera is, and nothing else.
   sendCarry(pose, now);
@@ -960,20 +1025,71 @@ function ensureDetectWorker() {
     type: 'init',
     timeOrigin: performance.timeOrigin,
     markerSizeM,
-    poseRateMs: POSE_INTERVAL_MS,
+    poseRateMs,
   });
   return detectWorker;
+}
+
+// A copy of this frame's CPU depth map, taken while the XRFrame is still
+// valid — the XRDepthInformation object dies with the frame callback, but the
+// points it will be sampled for come back from the worker long after. Inert
+// bytes survive; ~38 KB at ARCore's usual 160x120, copied only while a
+// detection is being dispatched (~4/s). Measurement-only: nothing consumes
+// these numbers except the journal and replay-depth.js — the depth pipeline
+// stays banned until that replay says the source is good enough.
+function grabDepth(frame, view) {
+  if (!frame.getDepthInformation) return null;
+  let di;
+  try {
+    di = frame.getDepthInformation(view);
+  } catch {
+    return null;
+  }
+  if (!di?.data) return null;
+  const fmt = session?.depthDataFormat === 'float32' ? 'f32' : 'la';
+  return {
+    w: di.width,
+    h: di.height,
+    scale: di.rawValueToMeters,
+    m: [...di.normDepthBufferFromNormView.matrix],
+    data: fmt === 'f32' ? new Float32Array(di.data.slice(0)) : new Uint16Array(di.data.slice(0)),
+  };
+}
+
+// Depth at a camera-image pixel, metres along the view z, or null. The pixel
+// is normalized against the camera frame (the camera shares the view
+// frustum), pushed through normDepthBufferFromNormView, and read from the
+// copied buffer — the lookup getDepthInMeters performs, done by hand because
+// the frame is gone by sampling time. Convention risk worth naming: the
+// normalized coordinates are taken top-left-origin like the image's own; if
+// ARCore means the other Y, replay-depth.js will show it instantly as errors
+// that mirror with screen height, which is precisely what the measurement is
+// for.
+function depthAt(d, u, v, w, h) {
+  if (!d) return null;
+  const nx = u / w;
+  const ny = v / h;
+  const bx = d.m[0] * nx + d.m[4] * ny + d.m[12];
+  const by = d.m[1] * nx + d.m[5] * ny + d.m[13];
+  if (!(bx >= 0 && bx < 1 && by >= 0 && by < 1)) return null;
+  const ix = Math.min(d.w - 1, Math.floor(bx * d.w));
+  const iy = Math.min(d.h - 1, Math.floor(by * d.h));
+  const metres = d.data[iy * d.w + ix] * d.scale;
+  return Number.isFinite(metres) && metres > 0 ? Math.round(metres * 1000) / 1000 : null;
 }
 
 // `pose` is the camera's pose in the XR session frame, or null when ARCore has
 // no world track. Null is not an error: it selects the tag-only report, the
 // same message /client sends, which the server localizes from the marker map
 // with no XR frame involved.
-async function detectAndReport(view, pose, viewport) {
+async function detectAndReport(frame, view, pose, viewport) {
   const camera = view.camera;
   if (!camera) return;
   const tex = binding.getCameraImage?.(camera);
   if (!tex) return;
+  // Before the first await: the XRFrame is only valid inside the frame
+  // callback, and everything below this line may yield.
+  const depthSnap = grabDepth(frame, view);
   if (!readCameraPixels(tex, camera.width, camera.height)) return;
 
   const intr = intrinsicsFromProjection(
@@ -986,7 +1102,7 @@ async function detectAndReport(view, pose, viewport) {
   // Everything the report needs that the detector does not: kept here while the
   // frame is away, because only one is ever in flight (`busy`).
   const meta = {
-    pose, intr, w: camera.width, h: camera.height,
+    pose, intr, w: camera.width, h: camera.height, depthSnap,
     t: clockSync.synced ? clockSync.at(performance.now()) : null,
   };
   // The camera's orientation this frame, for the feature tracker's flow seed.
@@ -1012,6 +1128,9 @@ async function detectAndReport(view, pose, viewport) {
     worker.postMessage({
       type: 'xr-frame', seq: meta.seq, buf,
       w: meta.w, h: meta.h, flipY: true, intr, view: camView, reset: trackReset,
+      // Off skips the feature tracker in the worker — the single most
+      // expensive thing this page pays for — while tag detection continues.
+      track: landmarksOn,
     }, [buf]);
     trackReset = false;
     // The caller's `busy` guard is what keeps one frame in flight at a time, and
@@ -1030,7 +1149,7 @@ async function detectAndReport(view, pose, viewport) {
   const image = pixelsToCanvas(meta.w, meta.h);
   const res = await core.detect(lumaSource, image, meta.w, meta.h, performance.now());
   if (!res) return;
-  if (pageTracker) {
+  if (pageTracker && landmarksOn) {
     if (trackReset) {
       pageTracker.reset();
       trackReset = false;
@@ -1069,6 +1188,7 @@ async function detectAndReport(view, pose, viewport) {
 // The rest of the pipeline needs no changes and gets none: the survey already
 // treats a tag-less `xr-pose` as ARCore carrying the fix (`quality: 'tracked'`),
 // and `maintainLandmarks` returns immediately on a report with no points.
+
 function sendCarry(pose, now) {
   // Nothing has described this camera yet, so there is nothing to report it as.
   if (!lastIntr || !camInfo) return;
@@ -1094,6 +1214,27 @@ function sendCarry(pose, now) {
 // frame was taken. One report, one place, whichever thread did the work.
 function reportDetection(meta, res) {
   if (!res) return;
+  // Depth samples ride the report where the geometry to check them against
+  // already is: a tag's centre depth lands beside the tvec whose z is the
+  // solved truth, a tracked point's beside the pixel it was tracked at.
+  // Sampled here rather than at grab time because only the detector knows
+  // where the tags and points are.
+  if (meta.depthSnap) {
+    for (const t of res.tags || []) {
+      const cs = t.corners;
+      if (cs?.length !== 8) continue;
+      const d = depthAt(meta.depthSnap,
+        (cs[0] + cs[2] + cs[4] + cs[6]) / 4,
+        (cs[1] + cs[3] + cs[5] + cs[7]) / 4,
+        meta.w, meta.h);
+      if (d !== null) t.d = d;
+    }
+    for (const p of res.points || []) {
+      const d = depthAt(meta.depthSnap, p.u, p.v, meta.w, meta.h);
+      if (d !== null) p.d = d;
+    }
+    meta.depthSnap = null;
+  }
   // A detection report covers this tick, so no carry follows it — the two
   // together are what make the rate steady rather than lumpy.
   lastReport = performance.now();
@@ -1162,6 +1303,8 @@ exitBtn.addEventListener('pointerup', (ev) => {
   if (over === exitBtn) session?.end();
 });
 blankBtn.onclick = () => blank.toggle();
+lmBtn.onclick = () => setLandmarks(!landmarksOn);
+lmBtn.classList.add('active');
 mapBtn.onclick = () =>
   setMapMode(MAP_MODES[(MAP_MODES.indexOf(mapMode) + 1) % MAP_MODES.length]);
 transparentBtn.onclick = () => setTransparent(!transparent);

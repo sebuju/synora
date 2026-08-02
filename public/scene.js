@@ -48,6 +48,13 @@ function createSceneView(canvas) {
   const GREY = new THREE.Color(0x555555);
   const TAG_COLOR = new THREE.Color(0xcccccc);
   const ANCHOR_COLOR = new THREE.Color(0xd4b34c);
+  const HOVER_COLOR = new THREE.Color(0xffffff);
+  // Pointer feedback, quicker than the other fades — matches map2d's HOVER_MS.
+  const HOVER_MS = 120;
+  // What the dashboard says the pointer is on ({ kind, id } | null).
+  // Receive-only: there is no raycaster here and OrbitControls owns both drag
+  // buttons, so this view lights up what it is told and reports nothing.
+  let hovered = null;
 
   // Billboard text that can be rewritten cheaply; set() no-ops on unchanged
   // text so it is safe to call every frame.
@@ -129,17 +136,17 @@ function createSceneView(canvas) {
     const markerGroup = new THREE.Group();
     scene.add(markerGroup);
 
-    // Landmark anchors. One THREE.Points per client rather than a mesh each:
+    // Landmarks. One THREE.Points per client rather than a mesh each:
     // there are hundreds of them, they are position-only, and they are replaced
-    // wholesale on every push — a scene graph node per anchor would cost more
+    // wholesale on every push — a scene graph node per landmark would cost more
     // to maintain than the points cost to draw.
     const landmarkGroup = new THREE.Group();
     landmarkGroup.visible = showLandmarks;
     scene.add(landmarkGroup);
 
     // The tracks that have not qualified. Its own group and its own toggle:
-    // there are far more of them than anchors, and the two answer different
-    // questions — the anchors are what the room has, the candidates are what it
+    // there are far more of them than landmarks, and the two answer different
+    // questions — the landmarks are what the room has, the candidates are what it
     // is working on.
     const candidateGroup = new THREE.Group();
     candidateGroup.visible = showCandidates;
@@ -227,17 +234,17 @@ function createSceneView(canvas) {
     const group = three.landmarkGroup;
     clearPoints(group);
     for (const c of landmarkData) {
-      if (!c.anchors?.length) continue;
-      const pos = new Float32Array(c.anchors.length * 3);
-      for (let i = 0; i < c.anchors.length; i++) {
-        pos[i * 3] = c.anchors[i][0];
-        pos[i * 3 + 1] = c.anchors[i][1];
-        pos[i * 3 + 2] = c.anchors[i][2];
+      if (!c.landmarks?.length) continue;
+      const pos = new Float32Array(c.landmarks.length * 3);
+      for (let i = 0; i < c.landmarks.length; i++) {
+        pos[i * 3] = c.landmarks[i][0];
+        pos[i * 3 + 1] = c.landmarks[i][1];
+        pos[i * 3 + 2] = c.landmarks[i][2];
       }
       const geom = new THREE.BufferGeometry();
       geom.setAttribute('position', new THREE.BufferAttribute(pos, 3));
       group.add(new THREE.Points(geom, new THREE.PointsMaterial({
-        color: roomClientColor(c.clientId),
+        color: roomLandmarkColor(),
         size: 0.035,
         sizeAttenuation: true,
         transparent: true,
@@ -480,7 +487,10 @@ function createSceneView(canvas) {
       info.normal.set(0, 0, 1).applyQuaternion(info.holder.quaternion);
       // The anchor is the datum, and it changing is worth watching happen.
       info.anchorMix = animFade(info.anchorMix, info.anchor, dt);
-      info.quad.material.color.copy(TAG_COLOR).lerp(ANCHOR_COLOR, info.anchorMix);
+      info.hot = animFade(info.hot ?? 0,
+        hovered?.kind === 'tag' && id === hovered.id, dt, HOVER_MS);
+      info.quad.material.color.copy(TAG_COLOR).lerp(ANCHOR_COLOR, info.anchorMix)
+        .lerp(HOVER_COLOR, info.hot * 0.7);
       info.quad.material.opacity = info.fade;
       info.label.sprite.material.opacity = info.fade;
     }
@@ -499,7 +509,10 @@ function createSceneView(canvas) {
       // different colour on one frame two seconds later.
       ph.staleMix = animFade(ph.staleMix,
         performance.now() - ph.at > POSE_STALE_MS, dt);
-      ph.cone.material.color.copy(ph.baseColor).lerp(GREY, ph.staleMix);
+      ph.hot = animFade(ph.hot ?? 0,
+        hovered?.kind === 'client' && ph.id === hovered.id, dt, HOVER_MS);
+      ph.cone.material.color.copy(ph.baseColor).lerp(GREY, ph.staleMix)
+        .lerp(HOVER_COLOR, ph.hot * 0.7);
       ph.cone.material.opacity = ph.fade;
       ph.label.sprite.material.opacity = ph.fade;
       ph.tagLines.material.opacity = ph.fade * 0.5;
@@ -539,7 +552,8 @@ function createSceneView(canvas) {
       if (ph.ring.visible) {
         ph.ring.position.copy(ph.ringAt);
         ph.ring.scale.set(ph.shownRadius, 1, ph.shownRadius);
-        ph.ring.material.color.copy(ph.baseColor).lerp(GREY, ph.staleMix);
+        ph.ring.material.color.copy(ph.baseColor).lerp(GREY, ph.staleMix)
+          .lerp(HOVER_COLOR, ph.hot * 0.7);
         ph.ring.material.opacity = ph.fade * ringAlpha * 0.5;
       }
       updateTagLines(ph);
@@ -566,6 +580,11 @@ function createSceneView(canvas) {
   }
 
   return {
+    // { kind, id } | null — one entity hot across the whole dashboard.
+    setHovered(h) {
+      hovered = h;
+      scheduleDraw();
+    },
     setActive(on) {
       active = on;
       if (on) {

@@ -51,7 +51,7 @@ function createRoomFeed(views) {
         views.forEach((v) => v.setWalls?.(msg.walls));
         return true;
       }
-      // The per-client anchor cloud. Sent whole, so a client whose anchors were
+      // The per-client landmark cloud. Sent whole, so a client whose landmarks were
       // dropped says so by appearing with fewer — the renderers replace rather
       // than merge.
       if (msg.type === 'landmarks') {
@@ -75,8 +75,11 @@ function createRoomFeed(views) {
       // detection said, so that is what stands.
       if (!msg.carry) seenTags.set(clientId, (msg.tags || []).map((t) => t.id));
       const seen = seenTags.get(clientId) || [];
+      // The whole room verdict rides along: a view that wants to say "this
+      // pose is dead reckoning, not a fix" needs mapSafe/quality, and deriving
+      // that here would be a second copy of a decision the survey already made.
       views.forEach((v) =>
-        v.updateClient(clientId, msg.room.pose, seen, poseUncertainty(msg)));
+        v.updateClient(clientId, msg.room.pose, seen, poseUncertainty(msg), msg.room));
     },
 
     removeClient(clientId) {

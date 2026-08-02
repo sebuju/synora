@@ -42,7 +42,7 @@ const AXIS_GIZMO_TEXT_PX = 7;
 const AXIS_GIZMO_PAD = 12;
 
 function createMap2dView(canvas, mode = 'top', {
-  onMarkerHover, raf, maxPixels, pairsFocusOnly,
+  onHover, raf, maxPixels, pairsFocusOnly,
 } = {}) {
   const ctx = canvas.getContext('2d');
   const nextFrame = raf || ((cb) => requestAnimationFrame(cb));
@@ -98,15 +98,19 @@ function createMap2dView(canvas, mode = 'top', {
   // fixed dot marks the circle's centre — the heading line has to visibly
   // start from somewhere. Screen-space: it is a marker, not a measurement.
   const RING_DOT_PX = 3;
+  // The heading arrow's floor, in screen pixels: its 0.2 m world length
+  // disappears at the zoom a whole room fits a phone screen at, and a heading
+  // is a direction, so its drawn length may be floored without lying.
+  const HEADING_MIN_PX = 26;
   // Smaller than anything else on the map that means something, on purpose.
   const LANDMARK_DOT_PX = 1.4;
   // A candidate is not a landmark: it is one track's current guess at where a
   // feature is, and most of them never become anything. Drawn as an open ring
   // rather than a dot so the two never read as the same class of thing at a
-  // glance, and dimmer again than the anchors are.
+  // glance, and dimmer again than the landmarks are.
   const CANDIDATE_DOT_PX = 2.2;
   // How far a candidate's arc has to have come before it is drawn at full
-  // strength. Faint means barely seen, solid means nearly an anchor — which is
+  // strength. Faint means barely seen, solid means nearly a landmark — which is
   // the whole reason to draw candidates at all, since the number of them says
   // nothing and their progress says everything.
   const CANDIDATE_MIN_ALPHA = 0.18;
@@ -131,10 +135,16 @@ function createMap2dView(canvas, mode = 'top', {
   // text -> half its width in pixels, for the label dodge. Lives across frames:
   // the font never changes, so a string measured once is measured for good.
   const textHalfWidths = new Map();
-  // Which tag is highlighted. Set from outside only: the drawer and both map
-  // views highlight the same tag at once, so the one place that can know is the
-  // viewer, and every renderer here is told rather than deciding for itself.
-  let hoverId = null;
+  // What is highlighted — { kind: 'tag' | 'client' | 'region', id } or null.
+  // Set from outside only: the drawer and every room view highlight the same
+  // entity at once, so the one place that can know is the viewer, and every
+  // renderer here is told rather than deciding for itself. One value, not one
+  // per kind — two hovers can never both be lit.
+  let hovered = null;
+  // Client dots as drawn this frame, for the hit test — same convention as
+  // lastGlyphs: the shape the pointer is tested against is the shape on
+  // screen, recorded in the same (turned) space.
+  let lastClientDots = [];
   // Which tag the reader has opened, told from outside for the same reason the
   // hover is. With `pairsFocusOnly` the legs are the opened tag's own: a room of
   // a dozen tags draws a leg and two labels for every one of them, which is
@@ -170,15 +180,21 @@ function createMap2dView(canvas, mode = 'top', {
   let nextWallKey = 1;
   let showWalls = true;
   let wallsAlpha = 1;
-  // Per-client landmark anchors: clientId -> [[x,y,z], ...]. Points only, and
+  // Per-client landmarks: clientId -> [[x,y,z], ...]. Points only, and
   // drawn as such — a landmark has no orientation, no extent and no identity
   // worth a label, and it is a great deal less trustworthy than a surveyed tag.
   // The whole point of the styling below is that the two can never be confused.
   let landmarks = [];
   let showLandmarks = true;
   let landmarksAlpha = 1;
+  // Whether coarse (not yet solve-grade) consensus landmarks are drawn at
+  // all. The phone map turns this off: there a dot must mean "can localize
+  // you", and five hundred depth-grade guesses drowned the hundred points
+  // that can. The dashboard keeps them — watching the coarse cloud refine
+  // into solid dots is how the feature's progress is read.
+  let showCoarse = true;
   // Candidates ride the same message but a separate toggle: there are an order
-  // of magnitude more of them than anchors and they move as they are refined, so
+  // of magnitude more of them than landmarks and they move as they are refined, so
   // a reader who wants to see the map the survey has settled on wants them off,
   // and one asking why nothing is qualifying wants only them.
   let showCandidates = false;
@@ -390,18 +406,32 @@ function createMap2dView(canvas, mode = 'top', {
 
   // What the pointer was last reported to be over, so a move across one tag
   // does not repaint the drawer four hundred times.
-  let reportedHover = null;
-  function reportHover(id) {
-    if (id === reportedHover) return;
-    reportedHover = id;
-    onMarkerHover?.(id);
+  let reportedHover = '';
+  function reportHover(h) {
+    const key = h ? `${h.kind}:${h.id}` : '';
+    if (key === reportedHover) return;
+    reportedHover = key;
+    onHover?.(h);
+  }
+
+  // The client dot under the pointer, when no tag glyph claimed it first — a
+  // tag bar crossing a client dot goes to the tag, matching draw order.
+  const CLIENT_HIT_PX = 10;
+  function clientAt(x, y) {
+    for (const c of lastClientDots) {
+      if (Math.hypot(x - c.x, y - c.y) <= CLIENT_HIT_PX) return c.id;
+    }
+    return null;
   }
 
   canvas.addEventListener('pointermove', (ev) => {
     if (!drag) {
-      const id = markerAt(ev.offsetX, ev.offsetY);
-      canvas.style.cursor = id === null ? '' : 'pointer';
-      reportHover(id);
+      const tagId = markerAt(ev.offsetX, ev.offsetY);
+      const clientId = tagId === null ? clientAt(ev.offsetX, ev.offsetY) : null;
+      const h = tagId !== null ? { kind: 'tag', id: tagId }
+        : clientId !== null ? { kind: 'client', id: clientId } : null;
+      canvas.style.cursor = h ? 'pointer' : '';
+      reportHover(h);
       return;
     }
     if (drag.id !== ev.pointerId || !view) return;
@@ -496,13 +526,12 @@ function createMap2dView(canvas, mode = 'top', {
     ctx.arc(tx, ty, ringPx, 0, Math.PI * 2);
     ctx.stroke();
 
-    if (g.mode === 'arc') {
-      // From where they stand to where the arc becomes wide enough, swept the
-      // way the server said — `dir` is not recoverable from the endpoints,
-      // since either way round joins them and one of the two re-walks ground
-      // the track already has.
-      let delta = ((g.to - g.from) % 360 + 360) % 360;
-      if (g.dir < 0) delta -= 360;
+    if (g.mode === 'arc' && Number.isFinite(g.sweep)) {
+      // From where they stand, through the signed sweep the server sent. The
+      // magnitude travels the wire on purpose: reconstructing it here from two
+      // wrapped endpoints was mod-360 ambiguous, and a stale −3° drew as 357°
+      // — a full circle around the target.
+      const delta = g.sweep;
       const steps = Math.max(8, Math.ceil(Math.abs(delta) / 6));
       ctx.beginPath();
       for (let i = 0; i <= steps; i++) {
@@ -732,6 +761,12 @@ function createMap2dView(canvas, mode = 'top', {
       // second is the only part of it the eye actually catches.
       ph.staleMix = animFade(ph.staleMix,
         performance.now() - ph.at > ROOM_POSE_STALE_MS, dt);
+      // Same quick clock as the tag hover — pointer feedback, not smoothing.
+      ph.hot = animFade(ph.hot ?? 0,
+        hovered?.kind === 'client' && ph.id === hovered.id, dt, HOVER_MS);
+      // Dead reckoning is a state the reader acts on (walk back toward a
+      // tag), so it fades like staleness does rather than snapping.
+      ph.drMix = animFade(ph.drMix ?? 0, !!ph.dr, dt);
       ph.shownRadius = animApproach(ph.shownRadius,
         ph.uncertaintyM * UNCERTAINTY_SIGMA, dt, RADIUS_TAU_MS);
       // The circle's centre is a measurement in its own right and moves on the
@@ -762,7 +797,7 @@ function createMap2dView(canvas, mode = 'top', {
       // Hover is pointer feedback, so it is quicker than the other fades — a
       // highlight that takes a third of a second to appear reads as lag, not
       // as smoothing.
-      m.hot = animFade(m.hot, id === hoverId, dt, HOVER_MS);
+      m.hot = animFade(m.hot, hovered?.kind === 'tag' && id === hovered.id, dt, HOVER_MS);
       m.anchorMix = animFade(m.anchorMix, id === markerMap?.anchorId, dt);
     }
 
@@ -1163,7 +1198,7 @@ function createMap2dView(canvas, mode = 'top', {
     ctx.globalAlpha = 1;
     ctx.setLineDash([]);
 
-    // Landmark anchors, under the tags and everything else that carries a
+    // Landmarks, under the tags and everything else that carries a
     // claim: a small dot in the owning client's colour, no label, no ring, no
     // extent. They are per-session, are thrown away whenever the tracker
     // resets, and are a good deal less trustworthy than a surveyed tag — so
@@ -1171,10 +1206,10 @@ function createMap2dView(canvas, mode = 'top', {
     // and nothing about them reads as a measurement.
     // The instruction, under everything that describes the room: it is the one
     // thing here that is not a measurement, and it must never be mistaken for
-    // one. Drawn before the tags and the anchors so it sits behind them.
+    // one. Drawn before the tags and the landmarks so it sits behind them.
     if (guideAlpha > 0.01 && guide) drawGuide(px, guide, guideAlpha);
 
-    // Candidates first, so an anchor sitting on one is drawn over its own ring
+    // Candidates first, so a landmark sitting on one is drawn over its own ring
     // rather than under it — that is the moment the reader is looking for.
     if (candidatesAlpha > 0.01 && landmarks.length) {
       ctx.lineWidth = 1;
@@ -1200,13 +1235,32 @@ function createMap2dView(canvas, mode = 'top', {
 
     if (landmarksAlpha > 0.01 && landmarks.length) {
       for (const c of landmarks) {
-        if (!c.anchors?.length) continue;
-        ctx.fillStyle = roomClientColorCss(c.clientId);
-        ctx.globalAlpha = landmarksAlpha * 0.45;
-        for (const p of c.anchors) {
+        if (!c.landmarks?.length) continue;
+        // A hovered region card lights that region's own points. p[4] is the
+        // region each point belongs to, carried for exactly this: lighting the
+        // client's whole cloud instead was the coarsest answer available, and
+        // with several regions to a client it lit nearly every dot on screen
+        // whichever card was pointed at. A point from before the field existed
+        // carries no region and simply never lights. Instant rather than
+        // eased: the data is replaced wholesale every push and carries nowhere
+        // to keep a fade.
+        const hotRegion = hovered?.kind === 'region' && c.clientId === hovered.clientId
+          ? hovered.regionId
+          : null;
+        ctx.fillStyle = roomLandmarkColorCss();
+        for (const p of c.landmarks) {
+          // p[3] is the grade: solve-grade landmarks draw bright and a size
+          // up, coarse consensus ones as faint specks (or, on the phone, not
+          // at all — see showCoarse). A guess the solve may not count yet
+          // must not read as the thing it is a guess about.
+          const solid = p[3] !== 0;
+          if (!solid && !showCoarse) continue;
+          const lit = hotRegion !== null && p[4] === hotRegion;
           const [x, y] = px(p);
+          ctx.globalAlpha = landmarksAlpha * (lit ? 0.95 : solid ? 0.85 : 0.3);
           ctx.beginPath();
-          ctx.arc(x, y, LANDMARK_DOT_PX, 0, Math.PI * 2);
+          ctx.arc(x, y, (solid ? LANDMARK_DOT_PX + 1 : LANDMARK_DOT_PX)
+            + (lit ? 0.8 : 0), 0, Math.PI * 2);
           ctx.fill();
         }
       }
@@ -1291,6 +1345,14 @@ function createMap2dView(canvas, mode = 'top', {
       ctx.fillRect(-chipHalf, side * 9 - 7, chipHalf * 2, 14);
       ctx.fillStyle = '#fff';
       ctx.fillText(idText, 0, side * 9 + 4);
+      // Underlined, because the chip turns with the bar: a heading-up map spins
+      // the whole room under a reader who has no horizon to read the digits
+      // against, and the flip that keeps the chip from ever being upside down
+      // means the number's own up is not the map's. One digit gives no clue at
+      // all on its own, and 6 and 9 are the same glyph turned over. The rule is
+      // the baseline made visible, so it is the width of the number rather than
+      // of the chip.
+      ctx.fillRect(-(chipHalf - 4), side * 9 + 5, (chipHalf - 4) * 2, 1.5);
       ctx.restore();
       ctx.globalAlpha = 1;
 
@@ -1317,6 +1379,7 @@ function createMap2dView(canvas, mode = 'top', {
     }
 
     // Clients: dot + heading + label, lines to the tags they see.
+    lastClientDots = [];
     for (const ph of clients.values()) {
       if (!ph.target) continue;
       const fade = ph.fade;
@@ -1329,6 +1392,19 @@ function createMap2dView(canvas, mode = 'top', {
       const ringP = ph.ringAt || ph.cur.p;
       const anchorP = ringP.map((v, i) => v + (ph.cur.p[i] - v) * poseMix);
       const [sx, sy] = px(anchorP);
+      if (!ph.dead) lastClientDots.push({ id: ph.id, x: sx, y: sy });
+      // Under everything of this client's, the same neutral white the tag
+      // hover uses — the client's own colour is its identity and stays.
+      const hot = ph.hot || 0;
+      if (hot > 0.01) {
+        ctx.globalAlpha = fade * hot;
+        ctx.strokeStyle = HOVER_HALO_CSS;
+        ctx.lineWidth = 3 * hot;
+        ctx.beginPath();
+        ctx.arc(sx, sy, CLIENT_HIT_PX, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.globalAlpha = fade;
+      }
 
       // Uncertainty first, so the dot and heading draw on top of it. The circle
       // fades in over the width it takes to be worth drawing rather than
@@ -1347,6 +1423,13 @@ function createMap2dView(canvas, mode = 'top', {
         ctx.globalAlpha = fade * ringAlpha * 0.5;
         ctx.lineWidth = 1;
         ctx.stroke();
+        // Big enough to be a shape of its own, the circle has to say what it
+        // is — unlabelled, it read as some mysterious zone rather than as
+        // "your position, give or take this much".
+        if (rPx > 28) {
+          queueLabel(`unc:${ph.id}`, `±${ph.shownRadius.toFixed(1)} m`,
+            ux, uy - rPx - 4, color, null, fade * ringAlpha * 0.8);
+        }
       }
       if (ringAlpha < 0.99 && poseMix < 0.99) {
         ctx.globalAlpha = fade * (1 - ringAlpha) * (1 - poseMix);
@@ -1386,26 +1469,67 @@ function createMap2dView(canvas, mode = 'top', {
         }
       }
 
-      // Heading: a 0.2 m world-space arrow through the projection, so it
-      // means the same thing in every view.
+      // Heading: a 0.2 m world-space arrow through the projection — but
+      // floored in screen pixels, because a heading is a direction, not a
+      // measurement, and at the phone map's zoom 0.2 m shrank to a nub the
+      // dot swallowed. Direction stays world-true; only the length is drawn.
       const tip = anchorP.map((v, i) => v + ph.cur.fwd[i] * 0.2);
       const [hx, hy] = px(tip);
+      let dxh = hx - sx;
+      let dyh = hy - sy;
+      const hlen = Math.hypot(dxh, dyh);
+      if (hlen > 1e-6 && hlen < HEADING_MIN_PX) {
+        dxh *= HEADING_MIN_PX / hlen;
+        dyh *= HEADING_MIN_PX / hlen;
+      }
+      // Dead reckoning draws the heading dashed and the dot hollow: the
+      // survey is not standing behind this pose, and the map must not present
+      // an inertial guess with the same weight as a fix. Cross-faded on
+      // drMix, so the state change is watchable rather than a blink.
+      const dr = ph.drMix ?? 0;
       ctx.strokeStyle = color;
       ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.moveTo(sx, sy);
-      ctx.lineTo(hx, hy);
-      ctx.stroke();
+      if (dr < 0.99) {
+        ctx.globalAlpha = fade * (1 - dr);
+        ctx.beginPath();
+        ctx.moveTo(sx, sy);
+        ctx.lineTo(sx + dxh, sy + dyh);
+        ctx.stroke();
+      }
+      if (dr > 0.01) {
+        ctx.globalAlpha = fade * dr;
+        ctx.setLineDash([4, 3]);
+        ctx.beginPath();
+        ctx.moveTo(sx, sy);
+        ctx.lineTo(sx + dxh, sy + dyh);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+      ctx.globalAlpha = fade;
       if (poseMix > 0.01) {
         // Grown rather than switched on, so the dot and the centre marker it
-        // replaces read as one thing changing.
+        // replaces read as one thing changing. The fill hollows out as dead
+        // reckoning takes over; the outline stays, so the client never loses
+        // its place on the map — only its claim to certainty.
         ctx.fillStyle = color;
-        ctx.beginPath();
-        ctx.arc(sx, sy, 6 * poseMix, 0, Math.PI * 2);
-        ctx.fill();
+        if (dr < 0.99) {
+          ctx.globalAlpha = fade * (1 - dr);
+          ctx.beginPath();
+          ctx.arc(sx, sy, 6 * poseMix, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        if (dr > 0.01) {
+          ctx.globalAlpha = fade * dr;
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.arc(sx, sy, 5 * poseMix, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+        ctx.globalAlpha = fade;
       }
       const [pa, pb] = proj(anchorP);
-      queueLabel(`client:${ph.id}`, `C${ph.id} · ${pa.toFixed(2)}, ${pb.toFixed(2)}`,
+      queueLabel(`client:${ph.id}`,
+        `C${ph.id} · ${pa.toFixed(2)}, ${pb.toFixed(2)}${dr > 0.5 ? ' · DR' : ''}`,
         sx, sy - 12, color, null, fade);
       ctx.globalAlpha = 1;
     }
@@ -1444,9 +1568,11 @@ function createMap2dView(canvas, mode = 'top', {
       schedule();
     },
 
-    setHoveredMarker(id) {
-      if (id === hoverId) return;
-      hoverId = id;
+    // { kind, id } or null — one entity hot across the whole dashboard.
+    setHovered(h) {
+      const key = h ? `${h.kind}:${h.id}` : '';
+      if (key === (hovered ? `${hovered.kind}:${hovered.id}` : '')) return;
+      hovered = h;
       schedule();
     },
 
@@ -1506,7 +1632,7 @@ function createMap2dView(canvas, mode = 'top', {
     // pose — the pose is the newest single reading, the circle is the spread
     // the readings scattered over, so the circle moves far less than the dot.
     // A null p (non-XR client, or no window yet) falls back to the pose.
-    updateClient(clientId, pose, seenTagIds = [], uncertainty = null) {
+    updateClient(clientId, pose, seenTagIds = [], uncertainty = null, room = null) {
       let ph = clients.get(clientId);
       if (!ph) {
         ph = {
@@ -1516,7 +1642,7 @@ function createMap2dView(canvas, mode = 'top', {
           target: null, seen: [], at: 0,
           uncertaintyM: 0, shownRadius: 0,
           ringTarget: null, ringAt: null, ringSeeded: false,
-          fade: 0, dead: false, staleMix: 0,
+          fade: 0, dead: false, staleMix: 0, drMix: 0,
         };
         clients.set(clientId, ph);
       }
@@ -1527,6 +1653,15 @@ function createMap2dView(canvas, mode = 'top', {
       ph.seen = seenTagIds;
       ph.uncertaintyM = uncertainty?.r ?? 0;
       ph.ringTarget = uncertainty?.p ?? pose.p;
+      // Dead reckoning, by the survey's own verdict: mapSafe is true exactly
+      // when it stands behind this pose (a fresh tag fix, the alignFresh
+      // carry, or a landmark confirmation), so the flag holds steady across
+      // the detection/carry interleave instead of flickering per report.
+      // A landmark takeover (`lmFix`) is optically anchored too — the pose
+      // being drawn is the solve's, not the drift — so it is not DR, even
+      // though it earns no carve trust. A message with no room verdict
+      // (older server) keeps the last state.
+      if (room) ph.dr = room.mapSafe !== true && room.lmFix !== true;
       ph.at = performance.now();
     },
 
@@ -1735,6 +1870,9 @@ function createMap2dView(canvas, mode = 'top', {
         schedule();
       } else if (name === 'candidates') {
         showCandidates = on;
+        schedule();
+      } else if (name === 'coarse') {
+        showCoarse = on;
         schedule();
       } else if (name === 'backdrop') {
         showBackdrop = on;

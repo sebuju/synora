@@ -105,6 +105,15 @@ const signaling = connectSignaling('viewer', {
       if (!msg.lost) trackingLost.delete(msg.clientId);
       return;
     }
+    // The whole settings state, every time: the server sends it on connect, on
+    // any change from anywhere (the /markers page sets the same tag size), and
+    // as the answer to this dashboard's own attempt. One message shape rather
+    // than a push and a separate reply, or the form would have two ways to
+    // learn the same thing and could show a different one from each.
+    if (msg.type === 'settings') {
+      updateSettings(msg);
+      return;
+    }
     if (msg.type === 'client-list') {
       roster.clear();
       for (const c of msg.clients) roster.set(c.clientId, c);
@@ -353,17 +362,23 @@ const sceneView = createSceneView(sceneCanvas);
 // gesture with the view reset on a target a few pixels across.
 // Forgetting the anchor resets the whole survey.
 const forgetMarker = (id) => signaling.send({ type: 'marker-remove', id });
-// Which tag the pointer is on, wherever it is: a card in the drawer, a bar in
-// the top view, the same tag's bar in the elevation. Held here because it is
-// the one thing every one of those has to agree about — each of them reports
-// what its own pointer is over and is told what to draw, so there is no way for
-// two of them to end up highlighting different tags.
-let hoveredTag = null;
-function setHoveredTag(id) {
-  if (id === hoveredTag) return;
-  hoveredTag = id;
-  roomViewList.forEach((v) => v.setHoveredMarker?.(id));
-  clientsPanel.setHoveredTag(id);
+// What the pointer is on, wherever it is: a card in the drawer, a bar or a
+// client dot in the top view, the same entity in the elevation. One value of
+// shape { kind: 'tag' | 'client' | 'region', id } — not one per kind, or two
+// hovers could be lit at once. `id` identifies exactly one thing on screen; a
+// region also carries `clientId`, for the views whose grain is coarser than the
+// card's (the map holds one merged cloud per client, not one per region).
+// Held here because it is the one thing every
+// surface has to agree about — each of them reports what its own pointer is
+// over and is told what to draw, so there is no way for two of them to end up
+// highlighting different things.
+let hovered = null;
+function setHovered(h) {
+  const key = h ? `${h.kind}:${h.id}` : '';
+  if (key === (hovered ? `${hovered.kind}:${hovered.id}` : '')) return;
+  hovered = h;
+  roomViewList.forEach((v) => v.setHovered?.(h));
+  clientsPanel.setHovered(h);
 }
 // Which tag's card is open in the drawer, for the same reason the hover is held
 // here: the three map views all draw that tag's distances and none of them can
@@ -375,7 +390,7 @@ function setOpenedTag(id) {
 // neighbour at once is a leg and two labels per tag across the room, which
 // buries the map — and a distance is looked at when a particular tag is the
 // question.
-const mapOpts = { onMarkerHover: setHoveredTag, pairsFocusOnly: true };
+const mapOpts = { onHover: setHovered, pairsFocusOnly: true };
 const map2dView = createMap2dView(map2dCanvas, 'top', mapOpts);
 // The two elevations are the same view from a quarter turn apart: 'side' keeps
 // x across the screen, 'front' keeps z. A tag seen edge-on in one is seen
@@ -626,7 +641,7 @@ let showPoseMarker = false;
 // nothing rather than noise.
 let showWalls = true;
 let showLandmarks = true;
-// Off by default, unlike the anchors: candidates are numerous, transient and
+// Off by default, unlike the landmarks: candidates are numerous, transient and
 // mostly never become anything, so they are a diagnostic someone asks for
 // ("why is nothing qualifying?") rather than part of the room.
 let showCandidates = false;
@@ -673,8 +688,11 @@ function clientInfo(id) {
 // toward the room from the anchor wall), pitch positive looking up.
 const roomStats = document.getElementById('roomStats');
 setInterval(() => {
+  // Ten times a second, so the rows are reused rather than rebuilt: a line torn
+  // out and replaced under the pointer can never be selected, and the overlay
+  // is exactly the readout someone copies a position out of.
   if (!show3d && !show2d && !showSide && !showFront) {
-    roomStats.textContent = '';
+    syncTextRows(roomStats, []);
     return;
   }
   const infos = clientIds().map(clientInfo);
@@ -684,11 +702,11 @@ setInterval(() => {
   // position, rather than no client.
   for (const info of infos) {
     if (info.lostMs === null) continue;
-    const row = document.createElement('div');
-    row.style.color = '#e0603a';
-    row.textContent = `P${info.id}  NO ARCORE TRACK ${(info.lostMs / 1000).toFixed(0)}s  `
-      + '— position from tags only, nothing carried between sightings';
-    rows.push(row);
+    rows.push({
+      color: '#e0603a',
+      text: `P${info.id}  NO ARCORE TRACK ${(info.lostMs / 1000).toFixed(0)}s  `
+        + '— position from tags only, nothing carried between sightings',
+    });
   }
   for (const info of infos) {
     const room = info.poseMsg?.room;
@@ -699,15 +717,14 @@ setInterval(() => {
     const f = quatRotate(room.pose.q, [0, 0, 1]);
     const yaw = Math.atan2(f[0], f[2]) * 180 / Math.PI;
     const pitch = Math.asin(Math.max(-1, Math.min(1, f[1]))) * 180 / Math.PI;
-    const row = document.createElement('div');
-    row.style.color = info.poseAge > POSE_STALE_MS ? '#777' : roomClientColorCss(info.id);
-    row.textContent =
-      `P${info.id}  ${p.map((v) => v.toFixed(2)).join(', ')}` +
-      `  yaw ${Math.round(yaw)}°  pitch ${Math.round(pitch)}°` +
-      `  ${(info.poseMsg.tags || []).length} tags  ${fmtAge(info.poseAge)}`;
-    rows.push(row);
+    rows.push({
+      color: info.poseAge > POSE_STALE_MS ? '#777' : roomClientColorCss(info.id),
+      text: `P${info.id}  ${p.map((v) => v.toFixed(2)).join(', ')}`
+        + `  yaw ${Math.round(yaw)}°  pitch ${Math.round(pitch)}°`
+        + `  ${(info.poseMsg.tags || []).length} tags  ${fmtAge(info.poseAge)}`,
+    });
   }
-  roomStats.replaceChildren(...rows);
+  syncTextRows(roomStats, rows);
 }, 100);
 
 // ---------------------------------------------------------------------------
@@ -720,7 +737,7 @@ const clientsPanel = createClientsPanel(drawerEl, {
     signaling.send({ type: 'control', clientId, action, value }),
   onVcam: (clientId, on) => setVcam(on ? clientId : null),
   onRename: (clientId, name) => signaling.send({ type: 'device-rename', clientId, name }),
-  onTagHover: setHoveredTag,
+  onHover: setHovered,
   onTagOpen: setOpenedTag,
   onTagRemove: forgetMarker,
   // What a tag has been doing, asked for by the card that is open. The panel
@@ -846,6 +863,156 @@ for (const t of viewToggles) {
 
 loadViewState();
 
+// ---------------------------------------------------------------------------
+// Server settings. The form is generated from the schema the server sends, so
+// nothing on this page names a setting: adding one to settings.js puts it in
+// the drawer, with its label, bounds, units and help text, unaided.
+//
+// Nothing here is optimistic — a control renders what the server last said,
+// never what it was asked for, the same rule every remote control in the panel
+// below follows. A number field is the one exception the rule has to allow: it
+// is being typed into, so it is left alone while it holds the focus.
+const settingsCard = document.getElementById('settingsCard');
+const settingsRows = document.getElementById('settingsRows');
+const settingsStatus = document.getElementById('settingsStatus');
+const tagSizeLabel = document.getElementById('tagSizeLabel');
+const SETTING_STATUS_MS = 5000;
+let settingsSpec = [];
+let settingsValues = {};
+let settingsStatusTimer = null;
+
+// The wire and the settings file are always in the stored unit; only this page
+// says millimetres. Rounded back through toPrecision on the way out because the
+// scaling is binary floating point — 0.15 m renders as 150.00000000000003 mm
+// otherwise, in the one field whose whole purpose is a measured number.
+const settingShown = (spec, v) => Number((spec.scale ? v * spec.scale : v).toPrecision(12));
+const settingStored = (spec, v) => (spec.scale ? v / spec.scale : v);
+
+function sendSetting(key, value) {
+  signaling.send({ type: 'settings-set', values: { [key]: value } });
+}
+
+function setSettingsStatus(text, bad = false) {
+  clearTimeout(settingsStatusTimer);
+  settingsStatus.textContent = text;
+  settingsStatus.classList.toggle('bad', bad);
+  // An outcome, not a state: left up it reads as a condition of the panel, and
+  // "applied" still sitting there ten minutes later says nothing true.
+  if (text) settingsStatusTimer = setTimeout(() => setSettingsStatus(''), SETTING_STATUS_MS);
+}
+
+function makeSettingRow(spec) {
+  const root = document.createElement('div');
+  root.className = 'setting';
+  if (spec.help) root.title = spec.help;
+  const label = document.createElement('span');
+  label.className = 'label';
+  label.textContent = spec.label;
+  root.append(label);
+  const handle = { root, spec };
+
+  if (spec.type === 'bool') {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'toggle';
+    // The dot is the whole of the button, so the name has to come from
+    // somewhere — the row's label is beside it on screen but not in the
+    // accessibility tree of the control itself.
+    btn.setAttribute('aria-label', spec.label);
+    // The wanted state, never a flip of what is drawn: this button shows what
+    // the server last reported, which a click of its own may already have
+    // overtaken.
+    btn.onclick = () => sendSetting(spec.key, !btn.classList.contains('on'));
+    root.append(btn);
+    handle.btn = btn;
+    return handle;
+  }
+
+  const input = document.createElement('input');
+  input.type = 'number';
+  input.min = settingShown(spec, spec.min);
+  input.max = settingShown(spec, spec.max);
+  input.step = spec.step ?? 'any';
+  const unit = document.createElement('span');
+  unit.className = 'unit';
+  unit.textContent = spec.unit || '';
+  const apply = document.createElement('button');
+  apply.type = 'button';
+  apply.textContent = 'Set';
+  const commit = () => sendSetting(spec.key, settingStored(spec, Number(input.value)));
+  // A setting that throws work away arms on the first click and acts on the
+  // second — the same two-click gesture as the wipes in the tool row above and
+  // the per-tag remove below, from the same primitive. One gesture for "this
+  // one is not undoable", wherever it turns up.
+  if (spec.danger) {
+    apply.classList.add('danger');
+    confirmButton(apply, commit, { armedTitle: `Click again — ${spec.danger}` });
+  } else {
+    apply.onclick = commit;
+  }
+  // A number field is typed into and left. Without this the value sits in the
+  // box looking every bit as applied as one that was.
+  input.onkeydown = (ev) => {
+    if (ev.key === 'Enter') apply.click();
+  };
+  root.append(input, unit, apply);
+  handle.input = input;
+  return handle;
+}
+
+function paintSettingRow(handle, spec) {
+  const v = settingsValues[spec.key];
+  if (v === undefined) return;
+  if (handle.btn) {
+    handle.btn.classList.toggle('on', !!v);
+    // No wording: a text toggle carries its state in the dot, and the row's
+    // own label already says what is being switched. The dot plus an "on"
+    // beside it is the same fact twice, and it is what pushed the dot off the
+    // centre of the button.
+    handle.btn.setAttribute('aria-pressed', v ? 'true' : 'false');
+    return;
+  }
+  if (document.activeElement === handle.input) return;
+  const shown = String(settingShown(spec, v));
+  if (handle.input.value !== shown) handle.input.value = shown;
+}
+
+// The tag size in the header, because every distance this dashboard draws
+// scales by it and a wrong one is invisible in all of them — the room simply
+// comes out uniformly too big. Click to open the drawer it is set in.
+function updateTagSizeLabel() {
+  const spec = settingsSpec.find((s) => s.key === 'markerSizeM');
+  const v = settingsValues.markerSizeM;
+  tagSizeLabel.textContent = spec && v !== undefined
+    ? `tag ${settingShown(spec, v)} ${spec.unit}`
+    : '';
+}
+
+function updateSettings(msg) {
+  if (msg.spec) settingsSpec = msg.spec;
+  settingsValues = msg.values || {};
+  syncKeyed(settingsRows, settingsSpec, {
+    key: (spec) => spec.key,
+    make: makeSettingRow,
+    paint: paintSettingRow,
+  });
+  updateTagSizeLabel();
+  if (msg.error) setSettingsStatus(msg.error, true);
+  else if (msg.changed?.length) {
+    setSettingsStatus(`applied: ${msg.changed
+      .map((k) => settingsSpec.find((s) => s.key === k)?.label ?? k).join(', ')}`);
+  }
+}
+
+const drawerToggle = viewToggles.find((t) => t.key === 'clients');
+tagSizeLabel.onclick = () => {
+  if (!drawerToggle.get()) {
+    drawerToggle.set(true);
+    saveViewState();
+    refreshViews();
+  }
+  settingsCard.scrollIntoView({ block: 'nearest' });
+};
 
 muteBtn.onclick = () => {
   soundOn = !soundOn;

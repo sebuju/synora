@@ -10,6 +10,12 @@
   <header class="tight">
     <a class="home" href="/" title="Back to start">Dashboard</a>
     <span id="status" class="grow">connecting…</span>
+    <!-- The room's only metric datum, in the header rather than behind a click:
+         every distance on this page scales by it, a wrong one is invisible in
+         everything downstream (the room just comes out uniformly too big), and
+         the number itself is the printed tag someone is holding. Click to open
+         the drawer where it is set. -->
+    <span id="tagSizeLabel" title="Printed tag edge — click to change"></span>
     <span id="syncLabel"></span>
     <!-- Views | room overlays | the drawer. Nothing here destroys anything —
          the two wipes live in the drawer, beside the tag list they empty. -->
@@ -22,7 +28,7 @@
     <span class="sep"></span>
     <button id="poseBtn" class="toggle">Pose</button>
     <button id="wallsBtn" class="toggle">Walls</button>
-    <button id="landmarksBtn" class="toggle" title="Landmark anchors">Anchors</button>
+    <button id="landmarksBtn" class="toggle" title="Qualified landmarks">Landmarks</button>
     <button id="candidatesBtn" class="toggle"
       title="Tracked features that have not qualified yet, shaded by how much of the qualifying viewing arc each has been seen through">Candidates</button>
     <span class="sep"></span>
@@ -102,6 +108,17 @@
         </button>
       </div>
       <canvas id="combined" width="1920" height="1080"></canvas>
+      <!-- Server settings. Static here, above whatever the panel appends, and
+           built from the schema the server sends rather than from a list of
+           fields written out twice — a new setting in settings.js turns up here
+           on its own. -->
+      <div id="settingsCard" class="drawer-card settings">
+        <div class="head">
+          <span class="name">Server settings</span>
+          <span id="settingsStatus" class="at"></span>
+        </div>
+        <div id="settingsRows"></div>
+      </div>
     </div>
   </main>
   <script src="/vendor/three.min.js"></script>
