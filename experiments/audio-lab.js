@@ -43,9 +43,33 @@ const sweepCfg = {
   perStep: 5,
 };
 
-let mode = 'listen';          // 'chirp' | 'listen'
+let mode = 'listen';          // 'chirp' | 'listen' | 'range' | 'beacon'
 let running = false;
 let sweepRun = null;          // abort flag object while a sweep is running
+
+// Beacon (a device with speakers but no usable mic — a TV): emits the up-chirp
+// from the LEFT speaker and the down-chirp from the RIGHT, offset by an exact
+// sample count inside one stereo buffer. Same DAC clock, so the emission
+// offset is perfect by construction — a listener subtracts it from the arrival
+// difference and gets d_right − d_left with no clock sync and no mic on the
+// beacon at all. With the speaker baseline known, that difference is a bearing.
+const beaconCfg = {
+  offsetMs: 250,              // L→R stagger; must dwarf the template length or
+                              // the listener's cross-suppression eats one side
+  baselineM: 1.0,             // speaker separation, entered per beacon device
+};
+
+// Listener side of a beacon: the last announcement and the pending up arrival.
+const beacon = {
+  params: null,               // {offsetMs, baselineM} as announced
+  at: 0,                      // performance.now() of the announcement
+  lastUp: null,               // sample time of the not-yet-paired up arrival
+  results: [],                // {t, ddM, deg}
+};
+
+function beaconFresh() {
+  return beacon.params && performance.now() - beacon.at < 5000;
+}
 
 // Template length is bounded by the matched filter's FFT (half of FFT_N), so
 // the duration control is capped to keep L under it at any sample rate.
@@ -111,6 +135,21 @@ signaling = connectSignaling('audio-lab', {
     if (msg.type === 'range-report' && mode === 'range') {
       range.peer.set(msg.round, msg);
       tryComputeRange(msg.round);
+      return;
+    }
+    if (msg.type === 'beacon-params' && mode === 'listen') {
+      beacon.params = { offsetMs: msg.offsetMs, baselineM: msg.baselineM };
+      beacon.at = performance.now();
+      const changed = msg.f0 !== params.f0 || msg.f1 !== params.f1 || msg.durMs !== params.durMs;
+      if (changed) {
+        params.f0 = msg.f0;
+        params.f1 = msg.f1;
+        params.durMs = msg.durMs;
+        reflectParams();
+        logEv('param-change', { source: 'beacon', ...currentChirpParams() });
+      }
+      followEl.textContent = `following beacon: ${fmtBand(msg.f0, msg.f1)},`
+        + ` L/R offset ${msg.offsetMs} ms, baseline ${msg.baselineM} m`;
     }
   },
   onOpen() {
@@ -137,6 +176,28 @@ let sampleRate = 48000;
 let chirpTimer = null;
 
 async function startAudio() {
+  ctx = new AudioContext({ latencyHint: 'interactive' });
+  await ctx.resume();
+  sampleRate = ctx.sampleRate;
+
+  // A beacon device (a TV) has no usable mic — getUserMedia would throw or
+  // hang there, and a pure emitter needs none of the capture path.
+  if (mode === 'beacon') {
+    logEv('session-start', {
+      ua: navigator.userAgent,
+      sampleRate,
+      baseLatency: ctx.baseLatency ?? null,
+      beacon: true,
+      maxChannels: ctx.destination.maxChannelCount,
+    });
+    // A mono output route collapses L and R into one speaker and the arrival
+    // difference degenerates to the offset — visible here before wondering why.
+    constraintsEl.textContent = `beacon · sampleRate ${sampleRate}`
+      + ` · output channels ${ctx.destination.maxChannelCount}`;
+    constraintsEl.className = ctx.destination.maxChannelCount >= 2 ? 'good' : 'bad';
+    return;
+  }
+
   const requested = {
     echoCancellation: false,
     noiseSuppression: false,
@@ -144,9 +205,6 @@ async function startAudio() {
     channelCount: 1,
   };
   micStream = await navigator.mediaDevices.getUserMedia({ audio: requested });
-  ctx = new AudioContext({ latencyHint: 'interactive' });
-  await ctx.resume();
-  sampleRate = ctx.sampleRate;
   await ctx.audioWorklet.addModule('/experiments/audio-lab-worklet.js');
 
   const src = ctx.createMediaStreamSource(micStream);
@@ -179,6 +237,7 @@ async function startAudio() {
 
 function stopAudio() {
   if (chirpTimer) { clearInterval(chirpTimer); chirpTimer = null; }
+  if (beaconTimer) { clearInterval(beaconTimer); beaconTimer = null; }
   if (sweepRun) sweepRun.abort = true;
   workletNode?.port.close();
   micStream?.getTracks().forEach((t) => t.stop());
@@ -223,6 +282,32 @@ function playChirp(p) {
   g.gain.value = Math.pow(10, params.gainDb / 20);
   src.connect(g).connect(ctx.destination);
   src.start();
+}
+
+// One beacon emission: up-chirp on the left channel at sample 0, down-chirp
+// on the right channel offsetMs later — one stereo buffer, one DAC clock, so
+// the stagger between the two sounds is exact by construction. That stagger
+// is the only "timestamp" the beacon ever provides, and it costs nothing.
+function emitBeaconPair() {
+  if (!ctx) return;
+  const p = currentChirpParams();
+  const up = buildChirp(sampleRate, p);
+  const down = buildChirp(sampleRate, { ...p, f0: p.f1, f1: p.f0 });
+  const off = Math.round((beaconCfg.offsetMs / 1000) * sampleRate);
+  const buf = ctx.createBuffer(2, off + down.length, sampleRate);
+  buf.getChannelData(0).set(up, 0);
+  buf.getChannelData(1).set(down, off);
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  const g = ctx.createGain();
+  g.gain.value = Math.pow(10, params.gainDb / 20);
+  src.connect(g).connect(ctx.destination);
+  src.start();
+  signaling.send({
+    type: 'beacon-params', ...p,
+    offsetMs: beaconCfg.offsetMs, baselineM: beaconCfg.baselineM,
+  });
+  logEv('beacon-emit', { ...p, offsetMs: beaconCfg.offsetMs, baselineM: beaconCfg.baselineM });
 }
 
 function emitChirp() {
@@ -283,7 +368,10 @@ function chirpKey(p) {
 }
 
 function wantedTemplates() {
-  if (mode === 'range') {
+  // Both directions: the ranging exchange is up-answered-by-down, and a
+  // beacon's two speakers carry up (left) and down (right) — a listener that
+  // has heard a beacon announce itself needs both templates too.
+  if (mode === 'range' || (mode === 'listen' && beaconFresh())) {
     const p = currentChirpParams();
     return [
       { label: 'up', p },
@@ -533,6 +621,7 @@ function onDetection(label, absIdx, frac, snrDb, floorDb) {
   });
   if (self) logEv('self-heard', { seq: det.seq, ok: true, snrDb: +snrDb.toFixed(2) });
   if (mode === 'range') rangeOnDetection(label, absIdx + frac, snrDb);
+  if (mode === 'listen' && beaconFresh()) beaconOnDetection(label, absIdx + frac);
   bigSnrEl.textContent = `${snrDb.toFixed(1)} dB`;
   detCountEl.textContent = `${detCount} detection${detCount === 1 ? '' : 's'}`;
 }
@@ -723,6 +812,42 @@ function tryComputeRange(round) {
   distEl.textContent = `${d.toFixed(2)} m`;
   const last = range.results.slice(-10).map((r) => r.m).sort((x, y) => x - y);
   distMedEl.textContent = `median(10): ${last[last.length >> 1].toFixed(2)} m`;
+}
+
+// ---------------------------------------------------------------------------
+// Beacon TDOA on the listener. The up (left speaker) and down (right speaker)
+// arrivals, minus the beacon's exact emission offset, give
+// d_right − d_left on this device's own sample clock — no clock sync, and the
+// beacon never needed a mic. With the baseline B known, the far-field bearing
+// is asin((d_left − d_right)/B), positive toward the beacon's right speaker
+// as it faces the room. Front/back of the baseline is inherently ambiguous.
+function beaconOnDetection(label, absT) {
+  if (label === 'up') {
+    beacon.lastUp = absT;
+    return;
+  }
+  if (label !== 'down' || beacon.lastUp == null) return;
+  const gapS = (absT - beacon.lastUp) / sampleRate - beacon.params.offsetMs / 1000;
+  beacon.lastUp = null;
+  // The residual gap is the acoustic path difference: bounded by the baseline
+  // (~metres → ms). A pairing across different emissions is off by whole
+  // offsets and cannot land in this window.
+  if (Math.abs(gapS) > 0.03) {
+    logEv('tdoa-reject', { gapMs: +(gapS * 1000).toFixed(3) });
+    return;
+  }
+  const ddM = gapS * SOUND_MPS;                  // d_right − d_left
+  const sin = Math.max(-1, Math.min(1, -ddM / beacon.params.baselineM));
+  const deg = (Math.asin(sin) * 180) / Math.PI;
+  beacon.results.push({ t: performance.now(), ddM, deg });
+  if (beacon.results.length > 400) beacon.results.splice(0, 200);
+  distEl.textContent = `${(ddM * 100).toFixed(0)} cm Δ`;
+  distMedEl.textContent = `bearing ${deg.toFixed(0)}°`;
+  logEv('tdoa', {
+    ddM: +ddM.toFixed(4),
+    bearingDeg: +deg.toFixed(2),
+    baselineM: beacon.params.baselineM,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1047,6 +1172,36 @@ function drawRangeChart() {
   label(c, 'distance per round · dashed = median of last 10', 6, 12);
 }
 
+// --- beacon bearing: where the listener sits relative to the beacon's
+// speaker axis, over the last two minutes.
+function drawTdoaChart() {
+  const [c, w, h] = setupCanvas(tdoaCv);
+  const now = performance.now();
+  const SPAN = 120000;
+  const yOf = (deg) => h / 2 - (deg / 90) * (h / 2 - 12);
+  c.strokeStyle = COL.grid;
+  for (const deg of [-45, 45]) {
+    c.beginPath(); c.moveTo(0, yOf(deg)); c.lineTo(w, yOf(deg)); c.stroke();
+  }
+  c.strokeStyle = COL.axis;
+  c.beginPath(); c.moveTo(0, yOf(0)); c.lineTo(w, yOf(0)); c.stroke();
+  c.fillStyle = COL.muted;
+  c.font = '11px system-ui, sans-serif';
+  c.fillText('right +45°', 4, yOf(45) - 3);
+  c.fillText('left −45°', 4, yOf(-45) - 3);
+  const pts = beacon.results.filter((r) => now - r.t <= SPAN);
+  if (!pts.length) {
+    label(c, 'beacon bearing · needs a device in Beacon mode', 6, 12);
+    return;
+  }
+  c.fillStyle = COL.heard;
+  for (const p of pts) {
+    const x = w - ((now - p.t) / SPAN) * w;
+    c.beginPath(); c.arc(x, yOf(p.deg), 3, 0, 2 * Math.PI); c.fill();
+  }
+  label(c, 'bearing to beacon · 0° = on the speakers’ mid-line', 6, 12);
+}
+
 function label(c, text, x, y) {
   c.fillStyle = COL.muted;
   c.font = '11px system-ui, sans-serif';
@@ -1070,6 +1225,7 @@ function frame() {
   drawSnrTimeline();
   drawSweepChart();
   drawRangeChart();
+  drawTdoaChart();
   if (running) liveSnrEl.textContent = `${liveSnrDb.toFixed(1)} dB`;
   requestAnimationFrame(frame);
 }
@@ -1093,8 +1249,10 @@ const sweepBtn = $('sweepBtn');
 const modeChirpBtn = $('modeChirp');
 const modeListenBtn = $('modeListen');
 const modeRangeBtn = $('modeRange');
+const modeBeaconBtn = $('modeBeacon');
 const rangeGoBtn = $('rangeGoBtn');
 const rangeCv = $('rangeCv');
+const tdoaCv = $('tdoaCv');
 const distEl = $('dist');
 const distMedEl = $('distMed');
 
@@ -1120,6 +1278,8 @@ function reflectParams() {
     $(id).value = sweepCfg[key];
   }
   $('rangeBias').value = range.biasM;
+  $('beaconBase').value = beaconCfg.baselineM;
+  $('beaconOff').value = beaconCfg.offsetMs;
 }
 
 for (const [key, id, , fmt] of controls) {
@@ -1138,16 +1298,29 @@ for (const [key, id] of [['startHz', 'swStart'], ['topHz', 'swTop'], ['bandHz', 
 }
 
 function setMode(m) {
+  // A session started in beacon mode never opened the mic; every other mode
+  // is built on the capture path, so the switch needs a fresh Start.
+  if (running && !micStream && m !== 'beacon') {
+    running = false;
+    stopAudio();
+    stopRounds();
+    startBtn.textContent = 'Start';
+    setStatus('mic needed for this mode — press Start again');
+  }
   mode = m;
   modeChirpBtn.classList.toggle('active', m === 'chirp');
   modeListenBtn.classList.toggle('active', m === 'listen');
   modeRangeBtn.classList.toggle('active', m === 'range');
+  modeBeaconBtn.classList.toggle('active', m === 'beacon');
   sweepBtn.disabled = m !== 'chirp' || !running;
   rangeGoBtn.disabled = m !== 'range' || !running;
   followEl.textContent = m === 'listen' ? 'listen mode — follows the chirper’s parameters'
-    : m === 'range' ? 'range mode — responds to rounds automatically' : '';
+    : m === 'range' ? 'range mode — responds to rounds automatically'
+      : m === 'beacon' ? 'beacon mode — emits L/R chirp pairs, no mic' : '';
   if (chirpTimer) { clearInterval(chirpTimer); chirpTimer = null; }
+  if (beaconTimer) { clearInterval(beaconTimer); beaconTimer = null; }
   if (m === 'chirp' && running) armChirpTimer();
+  if (m === 'beacon' && running) armBeaconTimer();
   if (m !== 'range') {
     stopRounds();
     range.initiator = false;
@@ -1163,9 +1336,29 @@ function armChirpTimer() {
   }, params.intervalMs);
 }
 
+let beaconTimer = null;
+
+function armBeaconTimer() {
+  if (beaconTimer) clearInterval(beaconTimer);
+  // The pair spans offsetMs + durMs; the period keeps whole pairs apart so a
+  // listener can never pair one emission's up with the next one's down.
+  const period = Math.max(1000, params.intervalMs, beaconCfg.offsetMs * 3);
+  beaconTimer = setInterval(emitBeaconPair, period);
+}
+
 modeChirpBtn.addEventListener('click', () => setMode('chirp'));
 modeListenBtn.addEventListener('click', () => setMode('listen'));
 modeRangeBtn.addEventListener('click', () => setMode('range'));
+modeBeaconBtn.addEventListener('click', () => setMode('beacon'));
+
+$('beaconBase').addEventListener('input', () => {
+  beaconCfg.baselineM = Number($('beaconBase').value) || 1;
+  logEv('param-change', { source: 'beacon-baseline', baselineM: beaconCfg.baselineM });
+});
+$('beaconOff').addEventListener('input', () => {
+  beaconCfg.offsetMs = Math.max(150, Number($('beaconOff').value) || 250);
+  logEv('param-change', { source: 'beacon-offset', offsetMs: beaconCfg.offsetMs });
+});
 
 // Whoever presses this drives the rounds; every other range-mode device
 // responds. Both sides journal, both sides compute the same distance.
@@ -1203,6 +1396,7 @@ startBtn.addEventListener('click', async () => {
     sweepBtn.disabled = mode !== 'chirp';
     rangeGoBtn.disabled = mode !== 'range';
     if (mode === 'chirp') armChirpTimer();
+    if (mode === 'beacon') armBeaconTimer();
     setStatus(`running · ${sampleRate} Hz`);
   } catch (err) {
     setStatus(`audio failed: ${err.message}`);

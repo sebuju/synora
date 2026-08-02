@@ -46,6 +46,7 @@
     #snrCv { height: 140px; }
     #sweepCv { height: 170px; }
     #rangeCv { height: 170px; }
+    #tdoaCv { height: 150px; }
     #dist { font-size: 40px; font-weight: 600; }
     #distMed { font-size: 13px; color: #9a9a9a; }
     h3 { font-size: 13px; font-weight: 600; color: #9a9a9a; margin: 2px 0 6px; }
@@ -63,6 +64,7 @@
           <button id="modeChirp" type="button">Chirp</button>
           <button id="modeListen" type="button">Listen</button>
           <button id="modeRange" type="button">Range</button>
+          <button id="modeBeacon" type="button">Beacon</button>
         </span>
         <button id="startBtn" type="button">Start</button>
         <button id="sweepBtn" type="button" disabled>Start sweep</button>
@@ -114,6 +116,11 @@
       <div class="sweep-cfg">
         <label>spk↔mic bias m<input id="rangeBias" type="number" step="0.01" min="-1" max="1"></label>
       </div>
+      <h3 style="margin-top:10px">Beacon</h3>
+      <div class="sweep-cfg">
+        <label>speaker baseline m<input id="beaconBase" type="number" step="0.05" min="0.1" max="5"></label>
+        <label>L→R offset ms<input id="beaconOff" type="number" step="50" min="150" max="1000"></label>
+      </div>
     </div>
 
     <div class="panel"><h3>Microphone</h3><canvas id="waveCv"></canvas></div>
@@ -122,6 +129,7 @@
     <div class="panel"><h3>Detection SNR over time</h3><canvas id="snrCv"></canvas></div>
     <div class="panel"><h3>SNR by frequency band</h3><canvas id="sweepCv"></canvas></div>
     <div class="panel"><h3>Distance</h3><canvas id="rangeCv"></canvas></div>
+    <div class="panel"><h3>Beacon bearing</h3><canvas id="tdoaCv"></canvas></div>
   </main>
   <script src="/common.js"></script>
   <script src="/experiments/fft.js"></script>
