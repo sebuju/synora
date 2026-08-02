@@ -104,6 +104,12 @@ let lastTrack = null;
 // session: it does not get a second chance, so neither should the message.
 let trackFailed = null;
 let roomPose = null;
+// The last room fix that actually was one. `roomPose` is whatever the last
+// report said, null pose included; this is what the map is turned and centred
+// by, so a moment without a fix holds the view where it was rather than
+// flinging it back to north-up and to the middle of the room and out again.
+// The dot going stale on the map is what says the fix was lost.
+let lastFix = null;
 let busy = false;
 // What ARCore actually handed over, reported rather than assumed: the camera
 // image size is the device's choice, not this page's, and every range figure
@@ -140,6 +146,7 @@ const signaling = connectSignaling('client', {
     if (roomFeed.handle(msg)) return;
     if (msg.type === 'room-pose') {
       roomPose = msg;
+      if (msg.pose) lastFix = msg.pose;
       // Where to walk next, drawn on the map this page is already carrying
       // around the room. Null clears it — "nothing worth saying" is the common
       // answer and must not leave the last instruction standing.
@@ -487,18 +494,23 @@ function updateScreenRotation(orientation) {
   updateMapInset();
 }
 
-// Heading up: the map turns and the client marker holds still, rather than the
-// marker turning on a map that never moves. The direction is the camera's own
-// forward in the room frame — the same +z convention every camera pose in this
-// project uses — and the renderer works out which way that has to be turned for
-// this projection. Off, the map keeps the room's own orientation, which is the
-// one that matches a floor plan on a wall.
+// Heading up: the map turns *and slides* under the client marker, which holds
+// still, rather than the marker turning and wandering over a map that never
+// moves. Both halves come off the same fix, so the map is centred on the phone
+// and turned about the point the phone is at — the room really does move under
+// it. The direction is the camera's own forward in the room frame — the same +z
+// convention every camera pose in this project uses — and the renderer works out
+// which way that has to be turned for this projection. Off, the map keeps the
+// room's own orientation and its own bounds, which is the view that matches a
+// floor plan on a wall.
 let headingUp = false;
 
 function applyHeading() {
-  mapView.setHeadingUp(headingUp && roomPose?.pose
-    ? quatRotate(roomPose.pose.q, [0, 0, 1])
-    : null);
+  // Null is off, and only off: the hold through a dropout is `lastFix`, kept
+  // here where "the last fix I had" is already known.
+  mapView.setHeadingUp(
+    headingUp && lastFix ? quatRotate(lastFix.q, [0, 0, 1]) : null,
+    headingUp && lastFix ? lastFix.p : null);
 }
 
 function setHeading(on) {

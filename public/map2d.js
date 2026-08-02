@@ -194,7 +194,14 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover, raf, maxPixels }
   // eased like everything else — heading comes off a live pose and a map that
   // tracked it frame for frame would shiver. Only the floor plan can do this;
   // an elevation has no heading to be up.
+  //
+  // The centre goes with it, and is set by the same call: the drawing is turned
+  // about the middle of the canvas, so a map that turned to a pose it was not
+  // also centred on would spin about a point that is nothing in particular
+  // while the marker orbited it. One setter, so the two can never disagree
+  // about which pose the view is built around.
   let headingRad = null;   // null: north up, the room frame's own orientation
+  let headingPos = null;   // null: the fit's own bounds, centred on the room
   let viewRot = 0;
   const HEADING_TAU_MS = 260;
   const FLOOR_FREE_CSS = 'rgba(127,184,164,0.16)';
@@ -747,19 +754,37 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover, raf, maxPixels }
     }
     let spanA = Math.max(maxA - minA, 5);
     let spanB = Math.max(maxB - minB, 5);
-    // Rotating, the fit is taken against the shorter side for *both* spans: a
-    // fit that used the true bounds would change as the room turned, so the map
-    // would breathe in and out while walking a curve. This one is stable at
-    // every angle, at the cost of being a little further out than it must be.
-    const turning = Math.abs(viewRot) > 1e-3
-      || (mode === 'top' && headingRad !== null);
-    lastFit = {
-      ca: (minA + maxA) / 2,
-      cb: (minB + maxB) / 2,
-      scale: turning
-        ? (Math.min(w, h) - 60) / Math.max(spanA, spanB)
-        : Math.min((w - 60) / spanA, (h - 60) / spanB),
-    };
+    // Following: centred on the client, and the fit taken as a disc about it
+    // rather than as a box about the room. A disc is the same at every angle by
+    // construction — which is exactly what the turning branch below has to fake
+    // — and its radius is the distance from where the client is standing to the
+    // farthest corner of what there is to see, so nothing surveyed slides off
+    // the edge as it walks into a corner of the room. The floor is half the 5 m
+    // span floor below, being a radius where that is a width.
+    const follow = mode === 'top' && headingRad !== null && headingPos
+      ? proj(headingPos) : null;
+    if (follow) {
+      const [fa, fb] = follow;
+      const rad = Math.max(2.5, Math.hypot(
+        Math.max(fa - minA, maxA - fa), Math.max(fb - minB, maxB - fb)));
+      lastFit = { ca: fa, cb: fb, scale: (Math.min(w, h) - 60) / 2 / rad };
+    } else {
+      // Rotating, the fit is taken against the shorter side for *both* spans: a
+      // fit that used the true bounds would change as the room turned, so the map
+      // would breathe in and out while walking a curve. This one is stable at
+      // every angle, at the cost of being a little further out than it must be.
+      // Still reached with heading on but no fix behind it yet, and while the
+      // turn eases back out after heading is switched off.
+      const turning = Math.abs(viewRot) > 1e-3
+        || (mode === 'top' && headingRad !== null);
+      lastFit = {
+        ca: (minA + maxA) / 2,
+        cb: (minB + maxB) / 2,
+        scale: turning
+          ? (Math.min(w, h) - 60) / Math.max(spanA, spanB)
+          : Math.min((w - 60) / spanA, (h - 60) / spanB),
+      };
+    }
     // Ease toward whichever view is in force. The scale eases geometrically —
     // a zoom is a ratio, and easing it linearly makes zooming out crawl while
     // zooming in snaps. Seeded on the first frame so opening a view arrives at
@@ -1622,12 +1647,14 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover, raf, maxPixels }
       schedule();
     },
 
-    // Turn the map so this room-frame direction points up the screen, or null
-    // to leave it in the room's own orientation. Given as the direction rather
-    // than as an angle so the caller never has to know which two axes this
-    // projection keeps or which way its second one runs — that convention lives
-    // here and has exactly one definition.
-    setHeadingUp(fwd) {
+    // Turn the map so this room-frame direction points up the screen and centre
+    // it on this room-frame point, or null to leave it in the room's own
+    // orientation and bounds. Both given in the room frame rather than as an
+    // angle and a pair of screen coordinates, so the caller never has to know
+    // which two axes this projection keeps or which way its second one runs —
+    // that convention lives here and has exactly one definition.
+    setHeadingUp(fwd, pos = null) {
+      headingPos = pos;
       if (!fwd) {
         headingRad = null;
       } else {
