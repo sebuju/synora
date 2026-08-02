@@ -299,6 +299,45 @@ function createClientsPanel(el,
       || now - stillAtMs >= SETTLE_WINDOW_MS;
   }
 
+  // Every line on a tag card is one fact, written `label: value` with the
+  // labels down the left edge and the colons in one column: a card is read down
+  // its numbers and compared against the card above it, and a sentence jamming
+  // three facts together has to be parsed before either can happen. The lines
+  // block is monospace and pre-wrapped, so padding the label is the whole of the
+  // alignment.
+  // The colon column is the longest label *on that card*, not the longest one
+  // the panel can print: the anchor's card is a single `in view` row, and padded
+  // to the width of a card carrying `last check` it reads as a column of blank
+  // space with a stray line in it. Which rows a card has changes as it is
+  // repainted — a tag going disputed grows a `last check` — so the label and the
+  // value are kept on each row and the whole block is re-padded together;
+  // padding a row on its own is what would let one card hold two columns.
+  function layoutKv(node) {
+    const root = node.closest('.lines') || node;
+    const rows = [...root.querySelectorAll('[data-kv-label]')];
+    // One space past the longest label, so the colon column stands off every
+    // label including the one that set it — a colon hard against the widest
+    // label reads as belonging to that word rather than to the column.
+    const w = Math.max(0, ...rows.map((r) => r.dataset.kvLabel.length)) + 1;
+    for (const r of rows) {
+      r.textContent = `${r.dataset.kvLabel.padEnd(w)}: ${r.dataset.kvValue}`;
+    }
+  }
+
+  // Records the fact; the padding is decided by the block it ends up in.
+  function kvRow(label, value) {
+    const div = document.createElement('div');
+    div.dataset.kvLabel = label;
+    div.dataset.kvValue = value;
+    return div;
+  }
+
+  function setKv(el, label, value) {
+    el.dataset.kvLabel = label;
+    el.dataset.kvValue = value;
+    layoutKv(el);
+  }
+
   // Whether the tag is still moving, and by how much it wants to. Without this
   // the survey is a black box: a tag healing ten degrees over ten minutes and a
   // tag frozen at the wrong orientation look identical, which is exactly how a
@@ -307,14 +346,17 @@ function createClientsPanel(el,
   // line on a card that goes stale on its own — it carries an age, and the
   // cards are rebuilt only when a new map arrives, which is never once a survey
   // stops moving.
-  function settleLine(tag) {
+  function settleRows(tag) {
     if (tag.refinedAtMs) {
       const mm = Math.round((tag.resid ?? 0) * 1000);
       const deg = (tag.residDeg ?? 0).toFixed(1);
       const settled = settleState(tag);
       return {
-        text: (settled ? 'settled' : 'settling')
-          + ` · off by ${mm} mm · ${deg}° · nudged ${fmtAge(Date.now() - tag.refinedAtMs)}`,
+        rows: [
+          ['state', settled ? 'settled' : 'settling'],
+          ['off by', `${mm} mm / ${deg}°`],
+          ['nudged', `${fmtAge(Date.now() - tag.refinedAtMs)} ago`],
+        ],
         warn: !settled,
       };
     }
@@ -326,15 +368,24 @@ function createClientsPanel(el,
       // the tag is mis-placed, not unobserved.
       const mm = Math.round((tag.checkOff ?? 0) * 1000);
       return {
-        text: `disputed — checks land ${mm} mm away `
-          + `(last ${fmtAge(Date.now() - tag.checkedAtMs)} ago): too far to refine, `
-          + 'will drop and re-survey once enough witnesses agree',
+        rows: [
+          ['state', 'disputed'],
+          ['off by', `${mm} mm`],
+          ['last check', `${fmtAge(Date.now() - tag.checkedAtMs)} ago`],
+          ['note', 'too far to refine, will drop and re-survey once enough witnesses agree'],
+        ],
         warn: true,
       };
     }
     // Refinement needs two known tags in one frame, and a tag that is never
     // seen beside another one is never corrected however long it is watched.
-    return { text: 'never refined — needs another known tag in the same frame', warn: true };
+    return {
+      rows: [
+        ['state', 'never refined'],
+        ['note', 'needs another known tag in the same frame'],
+      ],
+      warn: true,
+    };
   }
 
   // Which tag placed each one, as a tree. `hops` and `from` already say it in
@@ -980,34 +1031,39 @@ function createClientsPanel(el,
     const name = document.createElement('span');
     name.className = 'name';
     name.textContent = `Tag ${tag.id}`;
-    const kind = document.createElement('span');
-    kind.className = 'kind';
+    const isAnchor = tag.id === markerMap.anchorId;
     // nObs because a tag promoted on 8 estimates and one settled over 226 are
     // not the same claim, and that gap is usually what a position that looks
     // wrong turns out to be. The anchor has none — it is the datum, not a
     // measurement, and it is the one tag whose being wrong is undetectable.
-    const isAnchor = tag.id === markerMap.anchorId;
-    kind.textContent = isAnchor ? 'origin' : `${tag.nObs} obs`;
-    head.append(dot, name, kind);
-
-    // Everything below is a measurement, and the anchor is not one: it sits at
-    // the origin facing along the room axes by definition, was measured
-    // against nothing and can never be refined. Printing those as facts about
-    // it read as a survey result and, worse, as a fault.
     if (!isAnchor) {
+      const kind = document.createElement('span');
+      kind.className = 'kind';
+      kind.textContent = `${tag.nObs} obs`;
+      head.append(dot, name, kind);
+    } else {
+      head.append(dot, name);
+    }
+
+    // The right edge is the position column, read down the drawer rather than
+    // within one card — so what stands in place of the anchor's position goes
+    // there too, and the column answers "where is this tag" on every card.
+    const at = document.createElement('span');
+    at.className = 'at';
+    if (isAnchor) {
+      at.textContent = 'origin';
+    } else {
       // Each ordinate in its own axis colour, the same three the 3D helper and
       // the 2D crosses use. Three bare numbers give no clue which is the
       // height, and height is the one that exposes a tilted room frame.
-      const at = document.createElement('span');
-      at.className = 'at';
       tag.p.forEach((v, k) => {
         const span = document.createElement('span');
         span.style.color = roomAxisColorCss(k);
         span.textContent = v.toFixed(2);
         at.append(span, k < 2 ? ', ' : '');
       });
-      head.append(at);
     }
+    head.append(at);
 
     const lines = document.createElement('div');
     lines.className = 'lines';
@@ -1019,14 +1075,16 @@ function createClientsPanel(el,
       const n = quatRotate(tag.q, [0, 0, 1]);
       const yaw = Math.atan2(n[0], n[2]) * 180 / Math.PI;
       const pitch = Math.asin(Math.max(-1, Math.min(1, n[1]))) * 180 / Math.PI;
-      const facing = document.createElement('div');
-      facing.textContent = `yaw ${Math.round(yaw)}° · pitch ${Math.round(pitch)}°`;
+      const facing = [
+        kvRow('yaw', `${Math.round(yaw)}°`),
+        kvRow('pitch', `${Math.round(pitch)}°`),
+      ];
       // What placed this tag and how far that is from the datum. The tree says
       // the depth already, but not *which* parents did the placing nor how well
       // checked the result is, and the deepest-chained tag is usually the one
       // that looks wrong. Parents are ordered by how much of the placing each
       // did — the first is the one the tree hangs this card off.
-      const via = document.createElement('div');
+      const via = [];
       // How many checks this tag has survived: promoting estimates measured
       // against a two-known-tag fix, plus every refinement since — each one
       // compared the stored pose against a fix from *other* tags and could
@@ -1036,46 +1094,53 @@ function createClientsPanel(el,
       // chain to print it beside — that branch used to omit it, so a tag being
       // cross-checked ten times a second still read as the weakest thing in the
       // map.
-      const checked = tag.verified === null || tag.verified === undefined
-        ? 'checks unrecorded'
-        : `${tag.verified} cross-checked`;
-      const depth = (h) => (h === null || h === undefined
-        ? 'depth unrecorded'
+      const checked = kvRow('checked', tag.verified === null || tag.verified === undefined
+        ? 'unrecorded'
+        : `${tag.verified} times`);
+      const depth = (h) => kvRow('depth', h === null || h === undefined
+        ? 'unrecorded'
         : `${h} hop${h === 1 ? '' : 's'} out`);
       if (tag.from?.length) {
-        via.textContent = `via ${tag.from.join(', ')} · ${depth(tag.hops)} · ${checked}`;
+        via.push(kvRow('via', tag.from.join(', ')), depth(tag.hops));
       } else if (tag.from && tag.chainFrom?.length) {
         // Founded with no tag in view, but chained since: the founding fact is
         // permanent and stays first, and what has happened since follows it. A
         // tag that has been corrected against the map for an hour is not the
         // same thing as one that entered on ARCore this minute, and the card
         // said they were identical.
-        via.textContent = 'placed off ARCore alone · '
-          + `since chained via ${tag.chainFrom.join(', ')} · ${depth(tag.chainHops)} · ${checked}`;
+        via.push(
+          kvRow('placed', 'off ARCore alone'),
+          kvRow('chained', tag.chainFrom.join(', ')),
+          depth(tag.chainHops),
+        );
       } else {
         // No tag in view when it was placed and none has checked it since — the
         // fix was ARCore carrying the pose, which is the weakest way into the map.
-        via.textContent = (tag.from ? 'placed off ARCore alone' : 'placed before this was recorded')
-          + ` · ${checked}`;
+        via.push(kvRow('placed',
+          tag.from ? 'off ARCore alone' : 'before this was recorded'));
       }
       // Unchecked is the thing worth colouring, not unchained: a tag founded off
       // ARCore and cross-checked four hundred times since is no longer the
       // suspect entry on the card.
-      if (!tag.verified) via.className = 'warn';
+      if (!tag.verified) checked.className = 'warn';
       paintSettle(settle, dot, tag);
       // Asserted geometry, shown as such. This is the one number on the card
       // that was not measured, so it says which tag it was snapped to and how
       // far it was moved — a silent correction is indistinguishable from a
       // survey that happened to come out clean.
-      const clip = document.createElement('div');
+      const clip = [];
       if (tag.clippedTo !== null && tag.clippedTo !== undefined) {
-        clip.textContent = `clipped ${tag.clippedMm ?? 0} mm and `
-          + `${(tag.clippedDeg ?? 0).toFixed(1)}° onto tag ${tag.clippedTo}'s plane`;
+        clip.push(kvRow('clipped', `${tag.clippedMm ?? 0} mm / `
+          + `${(tag.clippedDeg ?? 0).toFixed(1)}° onto tag ${tag.clippedTo}'s plane`));
       }
-      lines.append(facing, via, settle, clip);
+      lines.append(...facing, ...via, checked, settle, ...clip);
     }
-    const live = document.createElement('div');
+    // Carries its label from the start: the anchor's card is this row and
+    // nothing else, and a row with no label in it would decide that card's
+    // colon column until the first live paint arrived.
+    const live = kvRow('in view', 'no');
     lines.append(live);
+    layoutKv(lines);
     if (isAnchor) {
       // The datum has nothing to be settled about — it is where it is by
       // definition — so its dot says "not a measurement" rather than "fine".
@@ -1150,12 +1215,21 @@ function createClientsPanel(el,
     return root;
   }
 
+  // The settle block is several rows and their number changes with the state, so
+  // it owns a container of its own inside the lines — the rows are plain divs
+  // aligned by their own padding, so nesting them costs nothing.
   function paintSettle(el, dot, tag) {
-    const { text, warn } = settleLine(tag);
-    el.textContent = text;
-    el.className = warn ? 'warn' : '';
+    const { rows, warn } = settleRows(tag);
+    el.replaceChildren(...rows.map(([label, value]) => {
+      const div = kvRow(label, value);
+      if (warn) div.className = 'warn';
+      return div;
+    }));
+    // The state's own rows change with it — a tag going disputed grows a
+    // `last check` — so the card is re-padded as a whole, not just here.
+    layoutKv(el);
     dot.className = warn ? 'dot warn' : 'dot';
-    dot.title = text;
+    dot.title = rows.map(([label, value]) => `${label}: ${value}`).join(' · ');
   }
 
   // The ages on the cards, moved on regardless of survey traffic. A tag that
@@ -1192,7 +1266,7 @@ function createClientsPanel(el,
     }
     for (const [id, card] of tagCards) {
       const seen = bySeen.get(id);
-      card.live.textContent = seen ? `seen by ${seen.join(' · ')}` : 'not in view';
+      setKv(card.live, 'in view', seen ? seen.join(' · ') : 'no');
       card.live.className = seen ? 'room' : '';
       // Also on the card itself, because a collapsed one has no room for the
       // line: which tags are in view right now is what a survey is walked by.
