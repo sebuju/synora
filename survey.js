@@ -322,6 +322,96 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
     }
   }
 
+  // The alignment as *reported*, eased toward the alignment as measured.
+  //
+  // The room pose on this path is ARCore's own pose put through the alignment,
+  // and ARCore is smooth — so every visible step in the reported position is a
+  // step in the alignment, which is corrected in one go each time a tag confirms
+  // it. Measured on a real walk once the report rate was raised: between
+  // corrections the pose moved a median of 18 mm per report, and on the report
+  // that carried a correction it moved 35 mm, p90 129, worst 395. That is a
+  // sawtooth — glide, snap, glide — and it reads worse than the uniform steps it
+  // replaced even though it is the more accurate of the two.
+  //
+  // **Not by easing the alignment**, which was the first attempt and is wrong in
+  // a way worth recording. The reported position is `T.q ⊗ xr.p + T.p`, so the
+  // alignment's *rotation* acts on the camera's offset from the ARCore session
+  // origin — a lever arm metres long by the middle of a walk. A lagging rotation
+  // therefore maps the camera's own translation through a stale frame, and the
+  // reported position pushes back against the direction of travel. It feels
+  // exactly like what it is: motion being resisted.
+  //
+  // Instead the correction is absorbed as an *offset at the camera*, which decays
+  // to nothing. Each report the alignment change is isolated by evaluating the
+  // old and new transforms at the *same* xr pose — the difference is the
+  // correction as it applies here, with no lever arm left in it — and that
+  // difference is subtracted from what is shown and then decayed away. Two
+  // properties matter and neither is optional:
+  //
+  //   - **Motion passes through untouched.** With no alignment change the offset
+  //     simply decays and the shown pose is the raw one; a moving camera moves.
+  //   - **It converges.** The offset always decays to identity, so the display
+  //     ends up at the truth rather than at a filtered version of it.
+  //
+  // **Only what is reported.** Survey extension, refinement, the jitter window
+  // and the gravity check all keep the raw pose — the same rule the tag-only
+  // path follows, and for the same reason: a map maintained from a smoothed pose
+  // agrees with the filter instead of with the room.
+  const REPORT_TAU_MS = 250;
+  // A correction bigger than this is not drift. A re-founding, a slip recovery or
+  // a new session replaces the datum outright, and gliding the client across the
+  // room over a quarter of a second would be a worse lie than the jump.
+  const REPORT_SNAP_M = 0.35;
+  const REPORT_SNAP_DEG = 8;
+  // clientId -> { T, offP, at }
+  const reportAlign = new Map();
+
+  function forgetReportAlign(clientId) {
+    if (clientId === undefined) reportAlign.clear();
+    else reportAlign.delete(clientId);
+  }
+
+  // The pose to show, given the raw one and the transform it came from.
+  function smoothedReport(clientId, T, xrT, raw) {
+    const now = Date.now();
+    const prev = reportAlign.get(clientId);
+    if (!prev) {
+      reportAlign.set(clientId, { T, offP: [0, 0, 0], at: now });
+      return raw;
+    }
+    let { offP } = prev;
+    // The alignment's change, measured where the camera actually is: both
+    // transforms applied to this frame's xr pose, so the difference contains the
+    // correction and nothing of the walk.
+    const wasHere = se3Compose(prev.T, xrT);
+    const dP = [0, 1, 2].map((k) => raw.p[k] - wasHere.p[k]);
+    const moved = Math.hypot(dP[0], dP[1], dP[2]);
+    if (moved > REPORT_SNAP_M || quatAngleDeg(raw.q, wasHere.q) > REPORT_SNAP_DEG) {
+      // A new datum, not drift: show it and drop whatever was still being
+      // absorbed, which belonged to the transform just replaced.
+      reportAlign.set(clientId, { T, offP: [0, 0, 0], at: now });
+      return raw;
+    }
+    // Absorb it, so this report shows what the last one did.
+    offP = [0, 1, 2].map((k) => offP[k] - dP[k]);
+    // Then let it go, on the clock rather than per report — the report rate is
+    // not constant, and a per-report fraction would decay at a speed that
+    // depended on how busy the detector happened to be.
+    const dt = Math.max(0, Math.min(1000, now - prev.at));
+    const keep = Math.exp(-dt / REPORT_TAU_MS);
+    offP = offP.map((v) => v * keep);
+    reportAlign.set(clientId, { T, offP, at: now });
+    // **Position only. The orientation is reported exactly as measured.**
+    //
+    // Heading comes overwhelmingly from ARCore, which is already smooth, and the
+    // alignment's share of it is a fraction of a degree that no one can see. So
+    // there is nothing to gain by filtering it — and a real cost: a filtered
+    // heading lags the phone being turned, which is the one motion a person
+    // makes fast and watches closely. Where the dot points must be the truth,
+    // even while where it sits is still catching up.
+    return { p: [0, 1, 2].map((k) => raw.p[k] + offP[k]), q: raw.q };
+  }
+
   function trackJitter(clientId, xrP, roomP, T, confirmed) {
     const now = Date.now();
     let h = jitterHist.get(clientId);
@@ -973,6 +1063,7 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
         unresolved: A.unresolved,
       });
       forgetJitter(clientId);
+      forgetReportAlign(clientId);
       log(`Client ${clientId} XR alignment re-founded after the frame stepped — `
         + `${XR_STEP_RECOVER_FIXES} agreeing fixes`);
       return 'recovered';
@@ -1014,6 +1105,7 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
     // The jitter window's ARCore half belongs to the frame that just slipped
     // away; against the new alignment it would read as spread.
     forgetJitter(clientId);
+    forgetReportAlign(clientId);
     log(`Client ${clientId} XR alignment re-founded — the slipping frame held `
       + `still for ${XR_SLIP_RECOVER_FIXES} fixes`);
     return 'recovered';
@@ -1958,6 +2050,7 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
       xrAlign.clear();
       xrFound.clear();
       forgetJitter();
+      forgetReportAlign();
       reseedStreak.clear();
       log(`Marker size ${(was * 1000).toFixed(0)} mm -> ${(m * 1000).toFixed(0)} mm `
         + '— survey reset, every tag must be re-observed');
@@ -1967,9 +2060,24 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
 
     // One XR pose report: the camera's pose in the session frame, plus any
     // tags visible in that same frame. Returns the room-frame pose.
+    // `xrNow` is where ARCore says the camera is *at the moment of sending*,
+    // where `xr` is where it was when the frame the tags came from was grabbed.
+    // They differ by however long detection took, which is 300 ms on this phone
+    // — and the difference is not academic: measured against the client's own
+    // carry reports, a detection report's pose matched a carry from 315 ms
+    // earlier (p90 479 ms).
+    //
+    // Everything that reasons about the tags uses `xr`, because that is the
+    // instant they were seen and pairing them with any other pose would be
+    // wrong. Only the *displayed* pose uses `xrNow`. Without that split, each
+    // detection yanked the client's dot back down its own path by a third of a
+    // second of walking and then let it catch up — which reads as motion being
+    // resisted, and no amount of smoothing elsewhere could have fixed it,
+    // because the position being smoothed was genuinely from the past.
     alignXr(clientId, xr, tags, sessionId = null, intrinsics = null,
-      modelSource = undefined) {
+      modelSource = undefined, xrNow = null) {
       const xrT = { p: xr.p, q: xr.q };
+      const showT = xrNow ? { p: xrNow.p, q: xrNow.q } : xrT;
       let prev = xrAlign.get(clientId);
       // An alignment describes one ARCore session's frame, whose origin is
       // wherever that session started. A new session picks a new one, so the
@@ -1983,6 +2091,7 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
         xrAlign.delete(clientId);
         xrFound.delete(clientId);
         forgetJitter(clientId);
+        forgetReportAlign(clientId);
         prev = undefined;
         log(`Client ${clientId} started a new XR session — alignment dropped`);
       }
@@ -2174,6 +2283,7 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
             // that number. The slip recovery has always done this; this branch
             // replaces the alignment just as completely and did not.
             forgetJitter(clientId);
+            forgetReportAlign(clientId);
             xrAlign.set(clientId, {
               T: est, sid: sessionId, nObs: 1, at: Date.now(), rej: null,
               lastXr: xrT, moved: 0, lastAt: prev.lastAt,
@@ -2204,7 +2314,17 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
       // gravity direction as wrong as everything else derived from it, and this
       // one would accuse the anchor of the alignment's fault.
       if (A && confirmed && !A.unresolved && !slipping) checkGravity(A);
-      const roomPose = A ? se3Compose(A.T, xrT) : null;
+      // Two poses from here on, and the difference is the whole point: `rawRoom`
+      // is the alignment as measured and is what the survey, the jitter window
+      // and every permanence decision see; `roomPose` is the same thing through
+      // the eased alignment and is only ever reported. See reportedT.
+      // rawRoom is where the camera was when the tags were seen — the pose the
+      // survey, the walls grid and the landmark map are entitled to. roomPose is
+      // where it is *now*, which is the only honest thing to draw.
+      const rawRoom = A ? se3Compose(A.T, xrT) : null;
+      const roomPose = A
+        ? smoothedReport(clientId, A.T, showT, se3Compose(A.T, showT))
+        : null;
       // ARCore's pose is steadier than anything the tags alone produce, so a
       // survey grown from it is better, not worse — but only extend while a
       // tag actually confirms the alignment this frame.
@@ -2223,8 +2343,10 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
       // two, and the code that would promote a second never ran.
       // While slipping the aligned pose is not a pose, so there is nothing
       // whose steadiness could honestly be measured.
-      const jitter = A && roomPose && !slipping
-        ? trackJitter(clientId, xrT.p, roomPose.p, A.T, confirmed)
+      // The raw pose, not the reported one: this measures how much the *fix*
+      // wanders, and feeding it the eased pose would measure the easing.
+      const jitter = A && rawRoom && !slipping
+        ? trackJitter(clientId, xrT.p, rawRoom.p, A.T, confirmed)
         : null;
       if (jitter && Date.now() - lastJitterLog > 3000) {
         lastJitterLog = Date.now();
@@ -2259,7 +2381,10 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
       // the survey waits for watchBranch.
       const extPose = founding || (A && A.unresolved) ? null
         : slipping ? (slipReport && !slipReport.held ? camRoom : null)
-          : (camRoom || (alignFresh ? roomPose : null));
+          // rawRoom, never the reported pose: the survey is maintained from the
+          // alignment as measured, or the map and the easing agree with each
+          // other instead of with the room.
+          : (camRoom || (alignFresh ? rawRoom : null));
       if (extPose && maintainSurvey(extPose, obs, false, clientId, modelSource,
         intrinsics)) mapChanged = true;
       // Whether this report may become *permanent* state elsewhere (the walls
@@ -2286,6 +2411,12 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
       }
       return {
         pose: roomPose,
+        // The same fix without the display easing. Anything building state that
+        // outlives the frame takes this one — the landmark map and the walls
+        // grid both do — for the reason the tag-only path keeps its raw fix out
+        // of the filter: evidence smoothed by a filter agrees with the filter.
+        // Only what a person looks at gets the eased pose.
+        rawPose: rawRoom,
         mapChanged,
         // 'good' means a tag confirmed this frame; 'tracked' means ARCore is
         // carrying it and the alignment is as old as the last sighting.
@@ -2317,9 +2448,13 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
       const prev = clientId !== undefined ? lastFix.get(clientId) : undefined;
       const prevFresh = prev && Date.now() - prev.at < JUMP_HISTORY_TTL_MS;
       pickSolutions(known, prevFresh ? prev.pose : null);
-      // msg.intr ships only while landmarks are on (pose.js), so the joint
-      // path is conditional on this side — see the availability note there.
-      let pose = jointCameraPose(known, msg.intr) ?? fuseCameraPose(known);
+      // /client sends the camera model as `intr`, the XR page as `intrinsics`;
+      // reading both is what makes the joint path available on either. It was
+      // `msg.intr` alone while that field was still conditional, which left the
+      // joint solve silently never running — jointStats.noIntr is the counter
+      // that says so.
+      let pose = jointCameraPose(known, msg.intr ?? msg.intrinsics)
+        ?? fuseCameraPose(known);
       let smoothed = pose;
 
       // Ambiguity-flip gate: hold the previous fix instead of teleporting,
@@ -2381,6 +2516,7 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
         xrAlign.clear();
         xrFound.clear();
         forgetJitter();
+        forgetReportAlign();
         log('Survey reset (anchor tag removed)');
       } else if (markers.has(id)) {
         markers.delete(id);
