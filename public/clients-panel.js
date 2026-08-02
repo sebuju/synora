@@ -26,7 +26,7 @@ const PANEL_POSE_STALE_MS = 2000;
 const CARD_TINT_ALPHA = 0.13;
 
 function createClientsPanel(el,
-  { onControl, onVcam, onRename, onTagHover, onTagRemove, onTagHistory }) {
+  { onControl, onVcam, onRename, onTagHover, onTagOpen, onTagRemove, onTagHistory }) {
   const cards = new Map();   // clientId -> card DOM
 
   function button(label, title) {
@@ -1007,6 +1007,10 @@ function createClientsPanel(el,
       card.root.classList.toggle('open', tagId === id);
       if (tagId === id) paintHistory(card);
     }
+    // The room views draw the open tag's distances to its neighbours, and this
+    // is the only place that knows which card that is. Reported, never applied —
+    // the same arrangement as the hover.
+    onTagOpen?.(id);
     askHistory();
   }
 

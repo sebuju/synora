@@ -365,7 +365,17 @@ function setHoveredTag(id) {
   roomViewList.forEach((v) => v.setHoveredMarker?.(id));
   clientsPanel.setHoveredTag(id);
 }
-const mapOpts = { onMarkerHover: setHoveredTag };
+// Which tag's card is open in the drawer, for the same reason the hover is held
+// here: the three map views all draw that tag's distances and none of them can
+// see the drawer.
+function setOpenedTag(id) {
+  roomViewList.forEach((v) => v.setFocusMarker?.(id));
+}
+// The tag-to-tag legs are the open card's own. Every tag drawing its nearest
+// neighbour at once is a leg and two labels per tag across the room, which
+// buries the map — and a distance is looked at when a particular tag is the
+// question.
+const mapOpts = { onMarkerHover: setHoveredTag, pairsFocusOnly: true };
 const map2dView = createMap2dView(map2dCanvas, 'top', mapOpts);
 // The two elevations are the same view from a quarter turn apart: 'side' keeps
 // x across the screen, 'front' keeps z. A tag seen edge-on in one is seen
@@ -711,6 +721,7 @@ const clientsPanel = createClientsPanel(drawerEl, {
   onVcam: (clientId, on) => setVcam(on ? clientId : null),
   onRename: (clientId, name) => signaling.send({ type: 'device-rename', clientId, name }),
   onTagHover: setHoveredTag,
+  onTagOpen: setOpenedTag,
   onTagRemove: forgetMarker,
   // What a tag has been doing, asked for by the card that is open. The panel
   // decides when — it is the only thing that knows which card that is — and the

@@ -41,7 +41,9 @@ const AXIS_GIZMO_LABEL_PX = 14;
 const AXIS_GIZMO_TEXT_PX = 7;
 const AXIS_GIZMO_PAD = 12;
 
-function createMap2dView(canvas, mode = 'top', { onMarkerHover, raf, maxPixels } = {}) {
+function createMap2dView(canvas, mode = 'top', {
+  onMarkerHover, raf, maxPixels, pairsFocusOnly,
+} = {}) {
   const ctx = canvas.getContext('2d');
   const nextFrame = raf || ((cb) => requestAnimationFrame(cb));
   // A caller that is paying for every pixel twice — once to draw, once for the
@@ -133,8 +135,20 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover, raf, maxPixels }
   // views highlight the same tag at once, so the one place that can know is the
   // viewer, and every renderer here is told rather than deciding for itself.
   let hoverId = null;
+  // Which tag the reader has opened, told from outside for the same reason the
+  // hover is. With `pairsFocusOnly` the legs are the opened tag's own: a room of
+  // a dozen tags draws a leg and two labels for every one of them, which is
+  // clutter until a particular tag is the question — and then only that tag's
+  // distances are the answer. A page with no way to open a tag (the XR client)
+  // leaves the option off and keeps the whole neighbourhood.
+  let focusId = null;
   // Right-angle legs between neighbouring tags, derived once per map.
   let pairs = [];
+  // Per-pair 0..1, keyed by the pair rather than held on it: the map object is
+  // replaced several times a second while a survey is running and `pairs` is
+  // rebuilt with it, so a fade living on the entry would restart on every
+  // refinement and no leg would ever finish appearing.
+  const pairFades = new Map();
   // Which dodge offset each label settled on last frame, keyed by what the
   // label is about — see flushLabels.
   const labelSpots = new Map();
@@ -281,6 +295,13 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover, raf, maxPixels }
   canvas.addEventListener('contextmenu', (ev) => ev.preventDefault());
   // Distance from a point to a segment, not to its infinite line: a tag bar is
   // 150 mm of wall and the line it lies on runs the length of the room.
+  // Ids in the order the shared helper produced them — it deduplicates a pair
+  // to one entry, so the key is that entry's identity and needs no sorting.
+  const pairKey = (p) => `${p.kind}:${p.a.id}-${p.b.id}`;
+
+  const pairShown = (p) =>
+    !pairsFocusOnly || (focusId !== null && (p.a.id === focusId || p.b.id === focusId));
+
   function distToSeg(x, y, x1, y1, x2, y2) {
     const dx = x2 - x1;
     const dy = y2 - y1;
@@ -686,6 +707,13 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover, raf, maxPixels }
       m.anchorMix = animFade(m.anchorMix, id === markerMap?.anchorId, dt);
     }
 
+    // Which legs are on screen changes with every card opened in the drawer, so
+    // they arrive and leave the way everything else here does.
+    for (const p of pairs) {
+      const key = pairKey(p);
+      pairFades.set(key, animFade(pairFades.get(key) ?? 0, pairShown(p), dt));
+    }
+
     for (let i = walls.length - 1; i >= 0; i--) {
       const seg = walls[i];
       seg.fade = animFade(seg.fade, !seg.dead, dt);
@@ -1023,7 +1051,11 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover, raf, maxPixels }
     // the same decomposition the client drawer lists. Drawn under the tags and
     // the clients, being the static thing.
     ctx.lineWidth = 1;
-    for (const { a, b, kind } of pairsAlpha > 0.01 ? pairs : []) {
+    for (const pair of pairsAlpha > 0.01 ? pairs : []) {
+      const { a, b, kind } = pair;
+      const key = pairKey(pair);
+      const focusFade = pairFades.get(key) ?? 0;
+      if (focusFade <= 0.01) continue;
       // Read off the live tags rather than off the positions the map arrived
       // with: the tags are gliding to those positions, and a leg drawn to
       // where a tag is going to be detaches from the tag it belongs to.
@@ -1031,7 +1063,7 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover, raf, maxPixels }
       const bp = markers.get(b.id)?.pos || b.p;
       // A leg is a statement about two tags, so it is only as present as the
       // less present of them.
-      const legAlpha = pairsAlpha
+      const legAlpha = pairsAlpha * focusFade
         * Math.min(markers.get(a.id)?.fade ?? 1, markers.get(b.id)?.fade ?? 1);
       if (legAlpha <= 0.01) continue;
       ctx.globalAlpha = legAlpha;
@@ -1356,6 +1388,14 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover, raf, maxPixels }
       schedule();
     },
 
+    // The tag whose card is open in the drawer. Only meaningful with
+    // `pairsFocusOnly`, where it is what decides which legs are drawn at all.
+    setFocusMarker(id) {
+      if (id === focusId) return;
+      focusId = id;
+      schedule();
+    },
+
     // Matched against what is already on screen rather than replacing it: a
     // map arrives whole on every survey change, and clearing it would throw
     // away the one thing that says a tag at a new position is the same tag.
@@ -1366,6 +1406,12 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover, raf, maxPixels }
       // legs drawn here and the distances listed in the client drawer can never
       // disagree about which tags are neighbours.
       pairs = markerNeighbourhood(map).pairs;
+      // A pair the new map does not have is gone for good — a leg has no
+      // identity to fade out with, unlike the tags it joins.
+      const livePairs = new Set(pairs.map(pairKey));
+      for (const key of pairFades.keys()) {
+        if (!livePairs.has(key)) pairFades.delete(key);
+      }
       const live = new Set();
       for (const m of map?.markers || []) {
         live.add(m.id);
