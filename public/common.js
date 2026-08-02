@@ -487,7 +487,8 @@ function confirmButton(el, onConfirm, { armedTitle = 'Click again to confirm', o
   // "Away" with slack rather than a pointerleave: these are small buttons (the
   // per-tag one is 18 px), and a hand that wobbles a pixel off one has not
   // changed its mind. The connectedness check is the other way an armed button
-  // leaves — the drawer rebuilds its cards out from under it.
+  // leaves — the card it sits on is dropped from the drawer, which is exactly
+  // what a confirmed removal does to the tag beside it.
   function onPointerMove(ev) {
     if (!el.isConnected) {
       disarm();
@@ -542,6 +543,85 @@ function confirmButton(el, onConfirm, { armedTitle = 'Click again to confirm', o
     }
   });
   return handle;
+}
+
+// --- Reusing the elements already on screen ---------------------------------
+// Every list on the dashboard arrives as a whole new snapshot — a roster, a
+// marker map, a landmark push, a history record — and the obvious rendering of
+// a snapshot is to throw the children away and build new ones. That is wrong
+// here for the same reason it is wrong in the room views (anim.js): what is on
+// screen carries state the snapshot does not. A rebuilt subtree loses the text
+// selection under the pointer, the canvas a chart was drawn on, the two-click
+// confirmation halfway through, the CSS transition halfway through, and the
+// scroll position of the container whose reflow it forced — and this panel
+// repaints four times a second, against a map replaced several times a second
+// while a survey is being walked.
+//
+// So: match the arriving snapshot against what is standing, key by key, and
+// move what is already there. `make` runs once per key, `paint` runs every
+// time. One primitive rather than a loop per list, or the lists drift apart in
+// which of these they each remember to preserve.
+//
+// The handles live in a Map the caller may own (`store`) — the client cards and
+// the tag cards keep theirs so the rest of the panel can reach a card by id —
+// otherwise in one hung off the parent element. A handle is either the element
+// itself or anything carrying it as `.root`.
+function syncKeyed(parent, items, { key, make, paint, store, drop } = {}) {
+  const map = store || (parent.__syncStore || (parent.__syncStore = new Map()));
+  const seen = new Set();
+  const ordered = [];
+  for (const item of items) {
+    const k = key ? key(item) : item;
+    seen.add(k);
+    let handle = map.get(k);
+    if (!handle) {
+      handle = make(item, k);
+      map.set(k, handle);
+    }
+    paint?.(handle, item, k);
+    ordered.push(handle.root || handle);
+  }
+  for (const [k, handle] of map) {
+    if (seen.has(k)) continue;
+    drop?.(handle, k);
+    (handle.root || handle).remove();
+    map.delete(k);
+  }
+  orderChildren(parent, ordered);
+  return map;
+}
+
+// Put `ordered` in that order at the front of `parent`, moving only what is out
+// of place: re-inserting an element that is already where it belongs is not
+// free — it restarts any CSS transition on it and costs a repaint of anything
+// it contains.
+//
+// `trim` drops whatever is left after them, for a container whose children are
+// all managed by this call. Without it a container that empties and is later
+// reused keeps its stale tail behind the new children.
+function orderChildren(parent, ordered, trim = false) {
+  for (let i = 0; i < ordered.length; i++) {
+    if (parent.children[i] === ordered[i]) continue;
+    parent.insertBefore(ordered[i], parent.children[i] || null);
+  }
+  if (!trim) return;
+  while (parent.children.length > ordered.length) parent.lastElementChild.remove();
+}
+
+// A list of plain text lines, the commonest shape of all: a status block, a
+// summary, the roster overlay. Each row is { text, cls, color }; the key is the
+// position, because these lines are read as a paragraph and a line's identity
+// is where it sits in one.
+function syncTextRows(parent, rows) {
+  syncKeyed(parent, rows.map((row, i) => ({ ...row, i })), {
+    key: (row) => row.i,
+    make: () => document.createElement('div'),
+    paint: (el, row) => {
+      if (el.textContent !== row.text) el.textContent = row.text;
+      el.className = row.cls || '';
+      el.style.color = row.color || '';
+    },
+  });
 }
 
 // How a pose message's camera model should be described and how loudly. Both
