@@ -207,8 +207,12 @@ async function onRgbaFrame(msg) {
       // ARCore's orientation for this frame, when the page had one: the flow is
       // seeded from the rotation between frames rather than from "it did not
       // move", which is where a walking phone loses most of its tracks.
-      const tracked = await trackFrame('rgba', image, result.boxes,
-        msg.view ? { q: msg.view.q, K: msg.intr } : null);
+      // `track: false` is the page's landmark toggle — the tracker is the
+      // expensive half of this frame, and off means genuinely not run, not
+      // run-and-discarded. Tags are unaffected.
+      const tracked = msg.track === false ? null
+        : await trackFrame('rgba', image, result.boxes,
+          msg.view ? { q: msg.view.q, K: msg.intr } : null);
       reply.points = wirePoints(tracked);
       reply.gen = tracked?.gen;
       reply.trackMs = tracked?.ms;

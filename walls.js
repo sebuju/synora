@@ -128,6 +128,20 @@ const DEFAULTS = {
   // Tag-only (/client) fixes have no ARCore cross-check and no measured
   // jitter behind them; their evidence counts at half weight.
   tagonlyScale: 0.5,
+  // Landmark rays (room.landmarkRays on a landmark-confirmed 'tracked' frame):
+  // camera → inlier landmark, free space along the line of sight only — the
+  // far end asserts nothing (a landmark may be the corner of a chair), so no
+  // occupancy bump, no wall plane, no sight record, no frustum. Ships at 0 =
+  // inert; turned on by a replay sweep against a kitchen walk, never by
+  // argument (wall evidence is as permanent as markers.json).
+  landmarkScale: 0,
+  // Half-width of a landmark ray's wedge at its far end. A point has no
+  // corners to subtend, so the wedge is the ray widened to one grid cell.
+  landmarkHalfM: 0.06,
+  // Stage-4 scoping of leaks(): a tagged wall whose far side holds at least
+  // this many distinct landmark-ray endpoint cells has a legitimately surveyed
+  // far side, and behind-cells there are no longer wrong by construction.
+  landmarkFarsideMin: 3,
   // Frustum carving: the wedge between two accepted rays of one frame. Not
   // provably empty the way a ray is — a pillar could stand between two tags
   // and occlude neither — so it carries a fraction of ray evidence and only
@@ -274,6 +288,12 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
   // existing viewpoint quantisation (viewCellM): that only bounds how many
   // lines are kept, it never decides whether a wall is cut.
   const sights = new Map();
+  // Distinct cells holding an accepted landmark-ray endpoint. A tagged wall
+  // these fall behind (within its bracket) has a legitimately surveyed far
+  // side, which is what scopes leaks() — behind-cells there stop being wrong
+  // by construction the day the room past the wall is actually walked.
+  // Persisted with the grid: the claim is as durable as the carves it earned.
+  const landmarkEnds = new Set();
   // id -> { id, p, q, hops, clippedTo } from the survey's map; walls never
   // touch a raw tvec — the mapped position is the endpoint, or nothing is.
   const tags = new Map();
@@ -289,6 +309,10 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
   const stats = {
     reports: { total: 0, accepted: 0, rej: {} },
     rays: { total: 0, accepted: 0, rej: {} },
+    // Landmark rays keep their own books — they arrive on frames the report
+    // gates above reject (quality 'tracked'), so folding them into rays would
+    // make both counts unreadable.
+    landmarkRays: { total: 0, accepted: 0, rej: {}, wSum: 0 },
     // Negative evidence keeps its own books: reports = frames considered for
     // the pass, tags = expected-but-missing tag tests within accepted frames.
     neg: {
@@ -600,6 +624,102 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
     carveTriangle(A1[0], A1[1], R, A2, full, repeat, vpKey, touched, clips);
   }
 
+  // The jitter score of an xr-pose report — one implementation for the tag
+  // path and the landmark-ray path, or the two silently drift apart. Null
+  // means rejected outright (a measured-bad pose); null-or-stale jitter is no
+  // measurement, not a clean one, and is scored down instead of thrown away.
+  function jitterWeight(entry) {
+    if (entry.kind !== 'xr-pose') return 1;
+    const j = entry.room.jitter;
+    if (j && !j.stale) {
+      if (j.jitterMm > C.maxJitterMm) return null;
+      return 1 / (1 + (j.jitterMm / C.softJitterMm) ** 2);
+    }
+    return C.noJitterW;
+  }
+
+  // The landmark-ray carve: free space along camera → inlier landmark, and
+  // nothing else. The far end asserts nothing — a landmark may be the corner
+  // of a chair — so unlike a tag ray there is no occupancy bump, no wall
+  // plane, no recorded sight and no frustum; the one thing the endpoint does
+  // is scope leaks() via landmarkEnds. Weight mirrors rayW minus the plane
+  // terms (a point has no normal and no apparent size): the solve's
+  // reprojection residual stands in for the tag's corner error, distance
+  // softens the same way. The wall-plane veto is consumed identically —
+  // that is what lets a doorway ray cross the [2 6] plane outside the tag
+  // bracket while the bracket stays inviolable — but landmark rays never
+  // contribute a plane of their own.
+  function carveLandmarkRays(entry, cam, vpKey, touched) {
+    const w = jitterWeight(entry);
+    if (w === null) return 0;
+    // XR-only by the caller's gate, so no tagonlyScale term.
+    const scale = C.landmarkScale * w;
+    // The pose earned mapSafe, so the camera cell is evidence here too.
+    bump(Math.floor(cam[0] / C.cellM), Math.floor(cam[2] / C.cellM),
+      C.lMiss * scale, C.lMissRepeat * scale, vpKey, touched);
+    const rays = [];
+    for (const l of entry.room.landmarkRays) {
+      stats.landmarkRays.total++;
+      const p = l.p;
+      if (!Array.isArray(p) || p.length !== 3) { reject(stats.landmarkRays, 'shape'); continue; }
+      const v = [cam[0] - p[0], cam[1] - p[1], cam[2] - p[2]];
+      const horiz = Math.hypot(v[0], v[2]);
+      // Same conditioning gates as a tag ray: a near-vertical ray projects to
+      // top-down noise. No cos gates — a point has no plane to face.
+      if (horiz < C.minHorizM || Math.abs(v[1]) > C.maxSlope * horiz) {
+        reject(stats.landmarkRays, 'shape');
+        continue;
+      }
+      const dist = Math.hypot(v[0], v[1], v[2]);
+      const rayW = (1 / (1 + ((l.res ?? 0) / C.errSoftPx) ** 2))
+        * (1 / (1 + (dist / C.distSoftM) ** 2));
+      stats.landmarkRays.accepted++;
+      stats.landmarkRays.wSum += rayW;
+      rays.push({ p, w: rayW });
+    }
+    // Strongest first: the per-report dedupe is first-writer-wins, same as
+    // the tag rays.
+    rays.sort((a, b) => b.w - a.w);
+    const clips = wallPlanes();
+    const camBehind = clips.map((c) => planeFront(c, cam[0], cam[2]) < -C.vetoCrossM);
+    for (const r of rays) {
+      const behind = clips.map((c) => planeFront(c, r.p[0], r.p[2]) < -C.vetoCrossM);
+      const rc = clips.map((c, i) => clipFor(c, camBehind[i], behind[i]));
+      carveLandmarkRay(cam, r.p, scale * r.w, vpKey, touched, rc);
+      const ix = Math.floor(r.p[0] / C.cellM);
+      const iz = Math.floor(r.p[2] / C.cellM);
+      if (ix >= -GRID_HALF && ix < GRID_HALF && iz >= -GRID_HALF && iz < GRID_HALF) {
+        landmarkEnds.add(cellKey(ix, iz));
+      }
+    }
+    return rays.length;
+  }
+
+  // A point has no corners to subtend a wedge, so the ray is widened to a
+  // fixed landmarkHalfM at the far end — pulled the same standoff short of
+  // the point, with the same apex widening, covered by the same generic
+  // carveTriangle pair.
+  function carveLandmarkRay(cam, p, scale, vpKey, touched, clips) {
+    const x0 = cam[0];
+    const z0 = cam[2];
+    if (Math.hypot(p[0] - x0, p[2] - z0) <= C.standoffM) return;
+    const [ex, ez] = pullToCamera(x0, z0, p[0], p[2]);
+    const dx = ex - x0;
+    const dz = ez - z0;
+    const len = Math.hypot(dx, dz);
+    if (!(len > 1e-6)) return;
+    const nx = -dz / len;
+    const nz = dx / len;
+    const L = [ex + nx * C.landmarkHalfM, ez + nz * C.landmarkHalfM];
+    const R = [ex - nx * C.landmarkHalfM, ez - nz * C.landmarkHalfM];
+    const A1 = [x0 + nx * C.apexHalfM, z0 + nz * C.apexHalfM];
+    const A2 = [x0 - nx * C.apexHalfM, z0 - nz * C.apexHalfM];
+    const full = C.lMiss * scale;
+    const repeat = C.lMissRepeat * scale;
+    carveTriangle(A1[0], A1[1], L, R, full, repeat, vpKey, touched, clips);
+    carveTriangle(A1[0], A1[1], R, A2, full, repeat, vpKey, touched, clips);
+  }
+
   // One journal-shaped report: { kind, at, msg, room, mapChanged }. This is
   // the exact object the server writes to *.pose.jsonl, so the replay CLI
   // feeds parsed lines straight through the very code the live path runs.
@@ -630,28 +750,35 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
     const vpKey = vpCell * C.viewSectors + sector;
     if (room.quality !== 'good') {
       reject(stats.reports, 'quality');
+      // One touched set shared between the landmark carve and the negative
+      // pass: a cell a landmark ray just proved clear must not take a
+      // blocked-ray deposit in the same frame — the same rule the wedge carve
+      // applies below.
+      const touched = new Set();
+      let carved = 0;
+      // Landmark rays arrive only on 'tracked' frames — by construction: the
+      // cross-check that produces them runs where no tag confirmed — so their
+      // branch lives inside the quality reject. Gated on the confirmation's
+      // own outcome (safeVia) rather than mapSafe alone, so an alignFresh
+      // 'tracked' frame with stale landmarkRays cannot exist (the server
+      // builds the rays and the flag together).
+      if (C.landmarkScale > 0 && entry.kind === 'xr-pose'
+        && room.mapSafe === true && room.safeVia === 'landmark'
+        && Array.isArray(room.landmarkRays) && room.landmarkRays.length
+        && msg.source !== 'guess') {
+        carved = carveLandmarkRays(entry, cam, vpKey, touched);
+      }
       // A tag-less 'tracked' frame is the one non-'good' report the negative
       // pass wants: the detector provably swept the whole frame and found
       // nothing, exactly the "looking straight at where the tag should be"
       // case. negativePass carries its own, stricter gates.
-      const deposits = negativePass(entry, cam, vpKey, new Set());
-      if (deposits && file) scheduleSave();
-      return deposits > 0;
+      const deposits = negativePass(entry, cam, vpKey, touched);
+      if ((carved || deposits) && file) scheduleSave();
+      return carved > 0 || deposits > 0;
     }
     if (msg.source === 'guess') return reject(stats.reports, 'guess'), false;
-    let weight = 1;
-    if (entry.kind === 'xr-pose') {
-      const j = room.jitter;
-      if (j && !j.stale) {
-        // A measured-bad pose is the one case still rejected outright.
-        if (j.jitterMm > C.maxJitterMm) return reject(stats.reports, 'jitterOver'), false;
-        weight = 1 / (1 + (j.jitterMm / C.softJitterMm) ** 2);
-      } else {
-        // Null or stale: no measurement, not a clean one — scored down, not
-        // thrown away.
-        weight = C.noJitterW;
-      }
-    }
+    const weight = jitterWeight(entry);
+    if (weight === null) return reject(stats.reports, 'jitterOver'), false;
     stats.reports.accepted++;
 
     const scale = (entry.kind === 'pose' ? C.tagonlyScale : 1) * weight;
@@ -1846,7 +1973,7 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
   // extension is legitimate.
   function countBehindPlanes(cellSet) {
     if (!planeGroups) planeGroups = groupPlanes();
-    let count = 0;
+    const out = [];
     for (const group of planeGroups) {
       const frame = planeFrameOf(group);
       if (!frame) continue;
@@ -1859,29 +1986,54 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
         lo = Math.min(lo, s - half);
         hi = Math.max(hi, s + half);
       }
-      for (const key of cellSet) {
+      const behind = (key) => {
         const ix = Math.floor(key / GRID_SIDE) - GRID_HALF;
         const iz = (key % GRID_SIDE) - GRID_HALF;
         const cx = (ix + 0.5) * C.cellM;
         const cz = (iz + 0.5) * C.cellM;
-        if (frontOf(cx, cz) > -C.cellM) continue;
+        if (frontOf(cx, cz) > -C.cellM) return false;
         const s = sOf(cx, cz);
-        if (s >= lo && s <= hi) count++;
-      }
+        return s >= lo && s <= hi;
+      };
+      let count = 0;
+      for (const key of cellSet) if (behind(key)) count++;
+      // "Wrong by construction" assumes the far side of a tagged wall is
+      // never surveyed, and that assumption expires the day it is (CLAUDE.md
+      // called this before landmark rays existed). Enough distinct
+      // landmark-ray endpoints behind this plane, inside the same bracket,
+      // is that day for this group — its count is reported but excluded from
+      // the headline, never silently.
+      let far = 0;
+      for (const key of landmarkEnds) if (behind(key)) far++;
+      out.push({
+        ids: group.map((m) => m.id).sort((a, b) => a - b),
+        count,
+        farSide: far >= C.landmarkFarsideMin,
+      });
     }
-    return count;
+    return out;
+  }
+
+  function leaksDetail() {
+    return countBehindPlanes(liveFree());
   }
 
   function leaks() {
-    return countBehindPlanes(liveFree());
+    return leaksDetail().reduce((n, g) => n + (g.farSide ? 0 : g.count), 0);
   }
 
   // Same wrong-by-construction test over the deduced class: an inferred
   // obstruction behind a tag's wall is a pose error that slipped every
   // negative gate — the headline for whether those gates hold, the way
-  // leaks() is for the positive ones.
-  function deducedLeaks() {
+  // leaks() is for the positive ones. Inherits the far-side scoping through
+  // the shared countBehindPlanes: a deduced blob in a legitimately surveyed
+  // kitchen is equally not "wrong by construction".
+  function deducedLeaksDetail() {
     return countBehindPlanes(new Set(deducedKeys()));
+  }
+
+  function deducedLeaks() {
+    return deducedLeaksDetail().reduce((n, g) => n + (g.farSide ? 0 : g.count), 0);
   }
 
   // The deduced class: blocked-ray accumulations past the promotion bar plus
@@ -1976,6 +2128,13 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
           Math.round(s.bx * 1000) / 1000, Math.round(s.bz * 1000) / 1000,
           s.vp,
         ]),
+        // Landmark-ray endpoint cells, as [ix, iz] like the cells above. An
+        // optional key rather than a version bump: an old build ignores it,
+        // and nothing structural changed for one.
+        landmarkEnds: [...landmarkEnds].map((key) => [
+          Math.floor(key / GRID_SIDE) - GRID_HALF,
+          (key % GRID_SIDE) - GRID_HALF,
+        ]),
       };
       // Atomic replace, same reason as the marker map: a crash mid-write must
       // not eat the grid.
@@ -2019,6 +2178,9 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
     for (const [key, ax, az, bx, bz, vp] of raw.sights || []) {
       sights.set(key, { ax, az, bx, bz, vp });
     }
+    for (const [ix, iz] of raw.landmarkEnds || []) {
+      landmarkEnds.add(cellKey(ix, iz));
+    }
     for (const [ix, iz, L, views, Ln = 0, nviews = 0] of raw.cells || []) {
       // Viewpoint identity does not survive a restart (vp = -1), which only
       // under-counts: an already-promoted cell keeps its state, an unpromoted
@@ -2038,14 +2200,18 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
   function reset() {
     cells.clear();
     sights.clear();
+    landmarkEnds.clear();
     planeGroups = null;
     frustumVps.clear();
     for (const k of Object.keys(stats.reports.rej)) delete stats.reports.rej[k];
     for (const k of Object.keys(stats.rays.rej)) delete stats.rays.rej[k];
+    for (const k of Object.keys(stats.landmarkRays.rej)) delete stats.landmarkRays.rej[k];
     for (const k of Object.keys(stats.neg.reports.rej)) delete stats.neg.reports.rej[k];
     for (const k of Object.keys(stats.neg.tags.rej)) delete stats.neg.tags.rej[k];
     stats.reports.total = stats.reports.accepted = 0;
     stats.rays.total = stats.rays.accepted = 0;
+    stats.landmarkRays.total = stats.landmarkRays.accepted = 0;
+    stats.landmarkRays.wSum = 0;
     stats.neg.reports.total = stats.neg.reports.accepted = 0;
     stats.neg.tags.total = stats.neg.tags.deposited = 0;
     stats.neg.tags.wSum = 0;
@@ -2063,6 +2229,13 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
         rej: { ...stats.rays.rej },
         meanW: stats.rays.accepted
           ? Math.round((stats.rays.wSum || 0) / stats.rays.accepted * 100) / 100
+          : null,
+      },
+      landmarkRays: {
+        ...stats.landmarkRays,
+        rej: { ...stats.landmarkRays.rej },
+        meanW: stats.landmarkRays.accepted
+          ? Math.round(stats.landmarkRays.wSum / stats.landmarkRays.accepted * 100) / 100
           : null,
       },
       neg: {
@@ -2121,7 +2294,9 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
       return { blocked, grazed, total: sights.size };
     },
     leaks,
+    leaksDetail,
     deducedLeaks,
+    deducedLeaksDetail,
     extentAudit,
     stats: statsOf,
     reset,

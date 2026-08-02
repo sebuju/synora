@@ -2485,11 +2485,18 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
       // and quality alone cannot stand in for it: 'good' is reported while an
       // unresolved alignment is still being tested.
       const mapSafe = !!extPose;
-      if (!A) return { pose: null, quality: 'unaligned', mapChanged, mapSafe };
+      // The quarantine on its own, distinct from mapSafe: on a tag-less
+      // 'tracked' frame mapSafe:false conflates "alignment stale" — which an
+      // agreeing landmark solve may rescue — with "the room frame itself is in
+      // doubt", which no number of landmarks can fix (they were founded against
+      // this very frame and would confirm its flip). The rescue in server.js
+      // needs the two told apart, and a replay needs it journalled.
+      const quarantined = founding || !!(A && A.unresolved) || slipping;
+      if (!A) return { pose: null, quality: 'unaligned', mapChanged, mapSafe, quarantined };
       if (slipping) {
         if (slipReport) {
           return {
-            pose: slipReport.pose, quality: 'slipping', mapChanged, mapSafe,
+            pose: slipReport.pose, quality: 'slipping', mapChanged, mapSafe, quarantined,
             alignedObs: A.nObs, jitter: null,
           };
         }
@@ -2497,7 +2504,7 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
         // the tag path — ARCore is the one thing that must not carry it here.
         const guess = predictPose(clientId);
         return {
-          pose: guess, quality: guess ? 'dead' : 'slipping', mapChanged, mapSafe,
+          pose: guess, quality: guess ? 'dead' : 'slipping', mapChanged, mapSafe, quarantined,
           alignedObs: A.nObs, jitter: null,
         };
       }
@@ -2516,6 +2523,7 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
         alignedObs: A.nObs,
         jitter,
         mapSafe,
+        quarantined,
       };
     },
 

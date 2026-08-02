@@ -7,12 +7,12 @@
 //
 //   - **Within one tracking session only.** Correspondence comes from optical
 //     flow on the client, which is free and reliable while a feature stays in
-//     frame and means nothing once it does not. Re-identifying an anchor in a
+//     frame and means nothing once it does not. Re-identifying an landmark in a
 //     *later* session was measured and failed outright: 0 usable fixes, with
-//     ORB matching a median of 4 descriptors even when all 12 map anchors were
+//     ORB matching a median of 4 descriptors even when all 12 map landmarks were
 //     geometrically in shot. Nothing here is written to disk, restored, or
 //     expected to survive a tracker reset. Do not build toward it.
-//   - **Not a replacement for tags.** An anchor can only be *created* where a
+//   - **Not a replacement for tags.** An landmark can only be *created* where a
 //     tag supplied the camera pose. Tags remain the datum and the only metric
 //     source, and information flows tags -> landmarks, one way, always.
 //   - **Not object detection.** There is no model and no class list. The
@@ -27,9 +27,10 @@
 // one PnP implementation and no 10 MB wasm dependency.
 
 const {
-  undistort, reproject, qualifyTrack, clusterAnchors, solveLandmarkPose,
+  undistort, reproject, qualifyTrack, clusterLandmarks, solveLandmarkPose,
   azimuthOf, dist3, MIN_OBS, MAX_RMS_PX, MIN_ARC_DEG,
 } = require('./public/landmark-math.js');
+const { quatAngleDeg, transformPoint } = require('./public/pose-math.js');
 
 // Observations kept per track. The split-arc test wants the arc, not every
 // sighting along it, and an unbounded ring would grow without limit on a track
@@ -41,7 +42,7 @@ const {
 // whatever the camera covered in the last N reports and nothing more. Measured
 // on a 90-report orbit sweeping 72 deg: the ring held the most recent 60 of
 // them, capping the visible span at 48 deg against a 60 deg gate, and 24
-// genuinely fixed features produced 2 anchors. Thinning keeps the whole arc at
+// genuinely fixed features produced 2 landmarks. Thinning keeps the whole arc at
 // half the density, which is what the test actually reads.
 const OBS_RING = 60;
 // Re-running qualification on every single sighting is pure waste — a track
@@ -51,7 +52,7 @@ const QUALIFY_EVERY = 4;
 
 // The sharp cliff, and the single most important number here. Measured:
 //
-//   anchors   median position   median orientation
+//   landmarks   median position   median orientation
 //   4-5       1781 mm           56.63 deg
 //   15-24       17 mm            0.34 deg
 //   25+         36 mm            0.82 deg
@@ -67,15 +68,15 @@ const QUALIFY_EVERY = 4;
 //
 // Do not loosen it to make the feature fire more often.
 //
-// It is applied twice: to the anchors that matched, and again to the ones that
+// It is applied twice: to the landmarks that matched, and again to the ones that
 // survive the solver's outlier rejection. Matching 16 and agreeing with 11 is
-// eleven anchors' worth of support however it is counted, and 11 is inside the
+// eleven landmarks' worth of support however it is counted, and 11 is inside the
 // range the measurement above has nothing to say about.
-const MIN_ANCHORS_FOR_FIX = 15;
+const MIN_LANDMARKS_FOR_FIX = 15;
 
-// Re-association: how close an anchor's projection has to land to a tracked
+// Re-association: how close an landmark's projection has to land to a tracked
 // point before that point is taken to *be* it, and how much closer than the
-// runner-up. An anchor is a 3D point and the pose is known to a few centimetres,
+// runner-up. An landmark is a 3D point and the pose is known to a few centimetres,
 // so a genuine match lands within a few pixels; the margin is what stops two
 // nearby features being swapped, which would be a wrong landmark rather than a
 // missing one. Same discipline as adopting a device fingerprint: a unique strong
@@ -97,12 +98,21 @@ const MIN_ANCHORS_FOR_FIX = 15;
 // guard for the case that is rare rather than absent.
 const REASSOC_PX = 3;
 const REASSOC_MARGIN = 2.5;
+// The solve path's own adoption radius. 3 px assumes the projecting pose is
+// tag-derived; the cross-check's seed is the ARCore-carried pose, whose drift
+// is the very thing being measured — measured on a real walk, in-view
+// landmarks reprojected ~26 px off through it, so at 3 px the solve adopted
+// nothing and the cross-check went 0-for-553. At 12 px, 68 of those frames
+// had >=15 landmarks in range (110 at 24 px; the rest genuinely look away
+// from the landmark region). The uniqueness margin and the RANSAC are what
+// keep a looser radius honest; swept by replay via --solve-reassoc-px.
+const SOLVE_REASSOC_PX = 12;
 // Aliases outlive the tracks that made them, harmlessly but not for free. Track
 // ids climb monotonically within a generation, so the stale ones are simply the
 // low ones.
 const ALIAS_CAP = 4000;
 
-// Anchors are individually meaningless — a corner of something, no identity, no
+// Landmarks are individually meaningless — a corner of something, no identity, no
 // extent — and a list of 133 of them says nothing a person can act on. Grouped
 // by proximity they become the thing that was actually surveyed: the region of
 // the room whose features are being tracked. That is what the drawer shows
@@ -110,13 +120,13 @@ const ALIAS_CAP = 4000;
 // square whose pose is known to millimetres, a group is a cloud of corners on
 // whatever furniture happens to be there.
 //
-// Membership is decided once, when an anchor qualifies, against the groups that
+// Membership is decided once, when an landmark qualifies, against the groups that
 // exist at that moment. Re-clustering the whole set on every push would be
 // tidier and would renumber the cards under the reader's hand every second.
 //
 // The radius is chosen on the *card* count, not the region count — singletons
 // collapse into one note, so those are already free. Measured on two recorded
-// walks (124 and 65 anchors):
+// walks (124 and 65 landmarks):
 //
 //   radius   cards        group sizes
 //   0.35 m   11 / 10      42/27/19/18/12/9/8/6/3/3/2  ·  19/13/7/6/5/4/4/3/2/2
@@ -125,46 +135,46 @@ const ALIAS_CAP = 4000;
 //   1.60 m    2 /  2      132/18                      ·  38/29
 //
 // 0.35 m produced a drawer of eleven cards nobody reads. Past 0.6 m the greedy
-// centroid growth starts chaining — at 0.9 m one group holds 105 of 124 anchors,
+// centroid growth starts chaining — at 0.9 m one group holds 105 of 124 landmarks,
 // i.e. most of the room in a single card, which is the failure mode that matters
 // here: a region is supposed to name a *place*, and one that spans the room
 // names nothing. 0.6 m halves the cards and keeps the largest group under half
 // the map.
 const GROUP_M = 0.6;
 
-// Anchor staleness. Nothing revalidated a qualified anchor: if the thing it was
-// a corner of is moved — a chair, a door, a laptop lid — the anchor keeps
+// Landmark staleness. Nothing revalidated a qualified landmark: if the thing it was
+// a corner of is moved — a chair, a door, a laptop lid — the landmark keeps
 // asserting a point the room no longer contains, and the only symptom is a fix
 // that is quietly a few centimetres wrong. The survey has `RESEED_DISAGREE_M`
 // for exactly this on tags, and the argument carries over unchanged.
 //
 // The evidence is a reprojection residual taken on a frame where the *tags*
-// supplied the pose, so it is independent of the anchors themselves — the same
+// supplied the pose, so it is independent of the landmarks themselves — the same
 // reason the survey refines a tag from a leave-one-out fix rather than from the
 // fix the tag helped make. A residual measured against a landmark-derived pose
-// would be the anchor grading its own homework.
+// would be the landmark grading its own homework.
 //
 // Streak, not a single frame, and the same shape the survey uses: one bad
 // sighting is an optical-flow track sliding, a run of them is the feature not
-// being where the map says. A dropped anchor is not lost work — its track is
+// being where the map says. A dropped landmark is not lost work — its track is
 // still live, so it starts accumulating observations again on the very next
 // report and re-qualifies from where the feature actually is.
 //
 // The alias goes with it. On a persistent disagreement one of two things is
-// wrong — the anchor moved, or this track is not looking at it — and nothing
+// wrong — the landmark moved, or this track is not looking at it — and nothing
 // available here can say which, so neither is kept.
 // The threshold is where it is because it was swept, and the first setting
 // tried was wrong in the direction that matters. Residual distributions differ
 // by session far more than expected — one recorded walk sits at 32/32/23/8/2/2%
 // across 0-2/2-4/4-8/8-16/16-32/>32 px, another at 7/22/47/21/2/0% — so a gate
-// inside the second session's bulk drops honest anchors. At 12 px it dropped 17
+// inside the second session's bulk drops honest landmarks. At 12 px it dropped 17
 // of 133 there and made the holdout *worse* (worst-case position 316 -> 491 mm),
 // which is the whole failure this feature could have introduced.
 //
-// Swept on that session (anchors / holdout / median / worst):
+// Swept on that session (landmarks / holdout / median / worst):
 //
 //   off      133  219/264  39 mm  316 mm
-//   12 px    123  217/264  43 mm  491 mm   <- drops honest anchors
+//   12 px    123  217/264  43 mm  491 mm   <- drops honest landmarks
 //   16 px    132  220/264  42 mm  300 mm
 //   20 px    133  219/264  39 mm  318 mm   <-
 //   24 px    133  220/264  44 mm  334 mm
@@ -181,22 +191,22 @@ const GROUP_M = 0.6;
 // a 400 mm move is caught in 5 sightings (the streak itself — the first
 // disagreement is immediate), 100 mm in 15, 50 mm not at all at that range,
 // which is the gate doing what the paragraph above says it does. In every case
-// the dropped anchor re-qualifies at its new position on the next pass, and
+// the dropped landmark re-qualifies at its new position on the next pass, and
 // false drops stay at zero up to 8x the observation noise (2.4 px), so this is
 // not living off the noise floor.
 const STALE_PX = 20;
 const STALE_STREAK = 5;
 
-// Which reports may found an anchor. Here rather than in server.js because the
+// Which reports may found an landmark. Here rather than in server.js because the
 // replay tool has to ask the *same* function: it did not, and the divergence
 // cost three sessions. The tool tested `quality === 'good' && mapSafe && pose`
 // while the server also demanded a fresh jitter figure, so the replay reported a
-// working feature — 133, 63 and 46 anchors on three walks — while the live
+// working feature — 133, 63 and 46 landmarks on three walks — while the live
 // server built zero on every one of them.
 //
-// Anchors are only worth founding on a pose the survey itself would stand behind
+// Landmarks are only worth founding on a pose the survey itself would stand behind
 // — the same statement walls.js makes before carving, and for the same reason: a
-// wrong anchor is as durable as the session and nothing downstream can tell it
+// wrong landmark is as durable as the session and nothing downstream can tell it
 // from a right one. The gates are deliberately not shared code with walls: that
 // module *scores* jitter into a weight and has a whole second path for tag-less
 // frames, where this needs one yes/no.
@@ -221,6 +231,175 @@ const STALE_STREAK = 5;
 // 'good'` — with the split-arc qualification behind it to throw out the rest.
 const LANDMARK_MAX_JITTER_MM = 25;
 
+// The landmark solve as a cross-check on the ARCore-carried pose (stage 1 of
+// the carving plan, .plans/landmark-carving.md). On a tag-less 'tracked' frame
+// the solve runs against the landmark map — which is a frozen record of the
+// room frame as the tags defined it — and agreement with the carried pose
+// within these bounds is genuine cross-validation: the two share no
+// measurement. They live here, not in server.js, for the same reason
+// landmarkGate does: replay-landmarks.js must test the same numbers or it
+// measures a different product (that divergence cost three sessions once).
+//
+// Placeholders until the first instrumented walk: the disagreement
+// distribution between a landmark solve and the carried pose has never been
+// measured (the solve never ran on this path), and LANDMARK_AGREE_M cannot be
+// chosen before it is. Swept by replay against `lmCheck` journal lines.
+const LANDMARK_AGREE_M = 0.10;
+const LANDMARK_AGREE_DEG = 5;
+// The solve's own quality bar for confirmation, on top of agreement: TRIM_PX
+// inliers with an rms at the trim ceiling are a fit on the edge of its own
+// outlier gate.
+const LANDMARK_CONFIRM_RMS_PX = 5;
+// Whether an agreeing solve may rescue mapSafe (stage 2). The cross-check and
+// its journal line run regardless — this only gates the consequence, so the
+// measurement stage can ship with the behaviour off.
+const LANDMARK_RESCUE = true;
+// How many consecutive failed cross-checks may pass before the solve stops
+// seeding from its own last answer and falls back to the carried pose.
+// Chaining is what the holdout always measured ("the seed is chained
+// deliberately") and the live path never did — it re-seeded every frame from
+// the drifted carry, so one successful solve did not help the next frame
+// find its matches. Measured on the corner walk (00:53 03/08): 18 isolated
+// solves in 447 eligible frames, each one re-losing the lock its
+// predecessor had established.
+const SOLVE_CHAIN_MAX = 10;
+// Chained founding (stage 5): landmarks founded under a landmark-confirmed
+// pose carry depth = 1 + the deepest landmark that confirmed it, and founding
+// is refused past this cap. Raised 0 → 1 on the stage-1/2 measurements the
+// plan demanded (22:40 02/08/26 walk: 13 solves, 11 confirmed, rescue
+// firing, median disagreement 86 mm): without it the map can never extend
+// past the 2 s alignFresh band from a tag glance — measured on the kitchen
+// walk, refined landmarks reached 15-in-view on under half the tag-less
+// frames and the deep frames had nothing to match at all. The half-tolerance
+// gates on the chained branch in check() are the compounding-drift defence.
+const LANDMARK_MAX_DEPTH = 1;
+
+// ARCore's depth map as a *prior*, self-measured against the tags. This is
+// the depth ban's demand made continuous: every detected tag carries both a
+// depth sample (t.d) and a solver-grade truth for the same pixel (tvec[2]),
+// so the session measures its own depth source as it runs and the hybrid
+// qualification below only exists while that measurement holds. Measured on
+// the first instrumented walk (02/08/26, 103 sightings at 2-3 m): raw median
+// error 106 mm dominated by a systematic short-read (bias −96 mm, drifting
+// −129 → −81 across the walk — hence a live bias, not a constant), residual
+// after bias removal 70 mm median. That is *prior* grade: enough to say
+// where a point roughly is and that it is a fixed point, not enough to be
+// its coordinates — which is why the hybrid keeps triangulation for the
+// final position and hands depth only the split-arc test's discrimination
+// job. With discrimination no longer resting on the arc, the arc only has to
+// condition a seeded triangulation, and 5° (one sidestep) does that where
+// the split test needed 20°.
+const DEPTH_TRUST_RING = 50;
+const DEPTH_TRUST_MIN_N = 10;
+// The calibration is a *scale*, not an offset: measured across two walks the
+// short-read grows with distance (−63 mm at 1-2 m, −147 at 2-3, −248 at 3-5;
+// k = median(d/z) 0.953 and 0.963), and an additive bias fitted to one range
+// over-corrects the other. The residual after scale removal still grows with
+// z (44 → 64 → 110 mm across 1-5 m), so the trust gate and every tolerance
+// downstream are *relative* to distance, never a fixed millimetre figure.
+//
+// Two thresholds, not one: sessions sit *on* the line and flap. Measured on
+// the 00:27 03/08 walk, the residual crossed a single 6% gate repeatedly
+// (5.2 → 6.2 → 5.7 → 6.7 → 5.9 → 6.1%), and every flap-off shut founding
+// down mid-walk — the map lost supply not because depth was bad but because
+// the verdict would not sit still. Trust is earned below REL and kept until
+// REL_OFF; the band is the same shape as GUIDE_NEAR_LEAVE_M and for the
+// same reason.
+const DEPTH_TRUST_REL = 0.06;
+const DEPTH_TRUST_REL_OFF = 0.08;
+// Depth-backed sightings before hybrid qualification is attempted, and how
+// many distinct 0.15 m camera cells they must span: a fore/background depth
+// mixture at a corner cannot stay consistent across moving viewpoints, which
+// is what stands in for the split test's discrimination.
+const DEPTH_EST_MIN = 5;
+const DEPTH_MIN_VIEWS = 2;
+const DEPTH_VIEW_CELL_M = 0.15;
+// Medoid consistency of the depth estimates and how close the refining
+// triangulation must land to their median — disagreement past these is the
+// mixture case, refused rather than averaged. Relative to the point's
+// distance (the measured noise scales with z), with floors for near range.
+const DEPTH_EST_TOL_M = 0.06;
+const DEPTH_EST_TOL_REL = 0.06;
+const DEPTH_AGREE_M = 0.25;
+const DEPTH_AGREE_REL = 0.12;
+const DEPTH_HYBRID_MIN_ARC_DEG = 5;
+
+// Landmarks from spatial consensus, with no track identity at all
+// (.plans/depth-consensus-landmarks.md). The hybrid qualification above still
+// rides on a track surviving to DEPTH_EST_MIN sightings, and track survival —
+// not the gates — is the measured supply bottleneck: on one instrumented walk
+// 14,616 optical-flow tracks were born and 70 lived to five sightings (the
+// gates then passed 17 of those 70). Walking kills tracks, and walking is what
+// the founding procedure requires; standing still keeps tracks alive and fails
+// the viewpoint gate instead. So the assumption dropped here is that a
+// landmark needs a surviving track to be founded. With trusted depth every
+// point sighting is an independent 3D measurement (±5%·z), and estimates from
+// *different* tracks landing in the same small volume across viewpoints are
+// the same physical feature announcing itself — the survey's own tryPromote
+// pattern applied to depth points. Track identity is already irrelevant to
+// *use*: reassociate adopts whatever fresh track sits on a landmark's
+// projection, with no memory of which track founded it.
+//
+// The voxel is deliberately coarser than CLUSTER_M: it has to catch one
+// feature's ±5%·z noise ball (10-15 cm at room range), not distinguish two
+// features. A feature may straddle a voxel boundary, so promotion reads the
+// 3×3×3 neighbourhood — the quantisation must not halve a feature out of
+// existence.
+const VOXEL_M = 0.12;
+// Stricter than the hybrid's DEPTH_MIN_VIEWS 2: there is no rms or
+// triangulation cross-check behind a consensus landmark, so viewpoint spread
+// is the whole mixture defence. A fore/background depth mixture at a
+// silhouette cannot stay consistent as the viewpoint moves.
+const VOXEL_MIN_N = 6;
+const VOXEL_MIN_VIEWS = 3;
+// Session state, not a map: a voxel untouched this many reports is noise from
+// a part of the walk that never confirmed, and the cap bounds the whole
+// accumulator. The clock is the report counter — the module stays clock-free
+// and replays deterministically.
+const VOXEL_TTL_REPORTS = 300;
+const VOXEL_CAP = 4096;
+// Per-voxel sample ring. Votes and viewpoint cells count every deposit; the
+// stored estimates are what the promotion median and spread are read from,
+// and past this many they are thinned (every second kept) rather than
+// shifted, same argument as OBS_RING.
+const VOXEL_PTS_RING = 24;
+
+// The solve's seed correction, and the piece that finally closes the kitchen
+// loop. The carried pose drifts (measured 0.25 m deep in the kitchen), which
+// reprojects even px-grade landmarks 50-150 px away from their points — no
+// adoption radius survives that honestly, and matching is what the solve
+// needs before it can measure the very drift that broke the matching. Depth
+// breaks the circle: back-projecting the frame's points through the drifted
+// seed puts them in room 3D where the drift is a near-rigid offset measured
+// in *metres*, and pairing against the landmark cloud at that scale is easy.
+// The component-wise median of the pair deltas is the correction — robust,
+// no fitted rotation (the PnP refinement recovers rotation once matching
+// works; the translation is what moves reprojections back into radius).
+// Coarse landmarks are welcome in the pairing — at this grade they are as
+// good as the depth they came from — and the correction only ever adjusts
+// the *seed*: the solve still measures, and reports, its own answer.
+const SEED_PAIR_M = 0.3;
+const SEED_PAIR_MIN = 12;
+const SEED_SHIFT_MAX_M = 1.0;
+
+// A consensus landmark is born *coarse*: its position is depth-grade, ±5%·z
+// (5-10 cm at room range), which is enough to exist and to anchor a carve
+// ray but not to support the solve — measured on the first kitchen walk,
+// 639 landmarks and 0 of 556 tag-less frames solved, because reprojections
+// scattered 25-60 px from the tracked points (incoherently: the shared-shift
+// component was 9 px, so this is per-landmark position noise, not seed
+// drift). The pipeline that fixes it is below: adopt a track onto the coarse
+// landmark at a radius its own noise actually fits inside, accumulate that
+// track's sightings under founding-grade poses, and upgrade the position by
+// the same seeded triangulation the hybrid qualification runs — after which
+// the landmark is px-grade and the solve may count it. Until then the solve
+// must not: RANSAC against 8 cm noise either rejects them (wasted match) or
+// fits them (poisoned pose).
+const CONSENSUS_ADOPT_PX = 24;
+// The refinement observation ring, thinned like OBS_RING — the triangulation
+// wants the arc, not the density.
+const ROBS_RING = 40;
+
 function landmarkGate(entry) {
   const { msg, room } = entry;
   if (!room?.pose || room.mapSafe !== true) return false;
@@ -232,14 +411,40 @@ function landmarkGate(entry) {
   return true;
 }
 
+// Which reports may found landmarks, and at what provenance depth. Null =
+// none; 0 = a tag confirmed this very frame (landmarkGate, the original
+// rule); 1 = ARCore carrying the pose inside the survey's own alignFresh
+// window (mapSafe true on a 'tracked' frame).
+//
+// Depth 1 exists because "found only where a tag is in frame" is not merely
+// restrictive but geometrically impossible in the room this feature is for:
+// tags 2/6 face *out* of the kitchen with a wall between them and it, so no
+// camera can ever hold a tag and a kitchen feature in one frame. The carried
+// pose within ALIGN_FRESH_MS is the same pose walls.js accepts as permanent
+// carve evidence — glance at a tag, swing to the doorway, and the two seconds
+// of tag-anchored carry are the founding window. The jitter and source gates
+// apply unchanged; mapSafe must be the survey's own (a landmark-rescued frame
+// founds through the chained branch in check(), against LANDMARK_MAX_DEPTH,
+// not here — landmarks must not bootstrap deeper landmarks by this path).
+function foundingDepth(entry) {
+  if (landmarkGate(entry)) return 0;
+  const { msg, room } = entry;
+  if (entry.kind !== 'xr-pose' || !room?.pose) return null;
+  if (room.quality !== 'tracked' || room.mapSafe !== true) return null;
+  if (room.safeVia === 'landmark' || msg.source === 'guess') return null;
+  const j = room.jitter;
+  if (j && !j.stale && j.jitterMm > LANDMARK_MAX_JITTER_MM) return null;
+  return 1;
+}
+
 // Guidance: which feature the person holding the phone should work on next, and
 // what to do about it.
 //
 // This exists because the honest state of the feature is unreadable from its
-// own outputs. Anchors accumulate only from *orbiting* motion, normal walking
+// own outputs. Landmarks accumulate only from *orbiting* motion, normal walking
 // reaches 3-9 deg of arc against the gate, and the two failures — "nothing
 // worth looking at here" and "you are walking past everything" — look identical
-// from an empty anchor cloud. A count cannot say either; a direction can.
+// from an empty landmark cloud. A count cannot say either; a direction can.
 //
 // The arc is subtended *at the feature*, which is the part that is not obvious
 // and drives every number below: one metre of sidestep is 53 deg at 1 m away
@@ -269,6 +474,14 @@ const GUIDE_STICKY = 1.35;
 // needed, and the guide then had to ask for 5 deg more. Overshooting once beats
 // a second instruction that reads like the first one failed.
 const GUIDE_OVERSHOOT_DEG = 8;
+// When the camera stands roughly opposite the covered arc, the two ends are
+// nearly equidistant and the choice between them is noise — measured as the
+// arc's arrow flipping direction frame to frame on the boundary. Inside this
+// band the previous direction is kept for the same standing target.
+const GUIDE_DIR_HYST_DEG = 12;
+// An arc trimmed by the wall test to less than this is not worth drawing —
+// the target is effectively walled off from where the user stands.
+const GUIDE_MIN_SWEEP_DEG = 5;
 
 const norm180 = (d) => {
   let a = (d + 180) % 360;
@@ -282,9 +495,28 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
   // the wrong feature, and only a real room can say where it sits.
   const reassocPx = opts.reassocPx ?? REASSOC_PX;
   const reassocMargin = opts.reassocMargin ?? REASSOC_MARGIN;
+  const solveReassocPx = opts.solveReassocPx ?? SOLVE_REASSOC_PX;
   const stalePx = opts.stalePx ?? STALE_PX;
   const staleStreak = opts.staleStreak ?? STALE_STREAK;
   const groupM = opts.groupM ?? GROUP_M;
+  // The consensus gates, swept the same way: supply against ghosts, and only
+  // a recorded walk can say where the trade sits.
+  const voxelMinN = opts.voxelMinN ?? VOXEL_MIN_N;
+  const voxelMinViews = opts.voxelMinViews ?? VOXEL_MIN_VIEWS;
+  const consensusAdoptPx = opts.consensusAdoptPx ?? CONSENSUS_ADOPT_PX;
+  // The count gate itself. replay-landmarks advertised --min-landmarks and
+  // never wired it — a sweep of the single most consequential number in the
+  // module silently measured the default every time.
+  const minLandmarks = opts.minLandmarks ?? MIN_LANDMARKS_FOR_FIX;
+  // The mint-block radius around an existing landmark is one voxel, not
+  // CLUSTER_M: 5 cm is smaller than the quantisation itself, so at the depth
+  // noise a consensus estimate of a feature an existing landmark already
+  // marks routinely lands 5-12 cm away and minted a duplicate beside it —
+  // and near-duplicate projections kill each other's reassociation under the
+  // uniqueness margin. Swept on both instrumented walks: at CLUSTER_M the
+  // 17:49 walk's only cross-check solve disappeared (0 of 1); at VOXEL_M
+  // both walks kept every solve (3 and 1) with supply still 568/214.
+  const voxelClusterM = opts.voxelClusterM ?? VOXEL_M;
   // The qualification gates themselves, so a replay can sweep the thing the
   // whole feature turns on. They were advertised by replay-landmarks.js and
   // never wired to anything, which meant the one question the tool exists to
@@ -296,40 +528,50 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
   if (opts.maxRmsPx !== undefined) qualifyOpts.maxRmsPx = opts.maxRmsPx;
   // clientId -> {
   //   gen,
-  //   tracks:  Map(trackId  -> { obs, est }),  candidates, not yet anchors.
+  //   tracks:  Map(trackId  -> { obs, est }),  candidates, not yet landmarks.
   //            `est` is the last qualification attempt's point and arc, kept
   //            only so the maps can show what is being worked on — see
   //            `candidates`. Nothing in the solve reads it.
-  //   anchors: Map(anchorId -> {P,n,span,err}),
-  //   alias:   Map(trackId  -> anchorId),  which track is currently looking at it
+  //   landmarks: Map(landmarkId -> {P,n,span,err}),
+  //   alias:   Map(trackId  -> landmarkId),  which track is currently looking at it
   // }
   //
-  // The anchor id is deliberately *not* the track id it was born from. An
+  // The landmark id is deliberately *not* the track id it was born from. An
   // optical-flow track is a few seconds of correspondence and nothing more —
   // measured, the set turns over almost completely across a fast pan — so
   // addressing a landmark by the track that discovered it makes the whole map
   // unusable within seconds of collecting it, which is exactly what happened:
-  // 133 good anchors and a solve that could match fewer than 15 of them.
+  // 133 good landmarks and a solve that could match fewer than 15 of them.
   //
-  // The anchor is a fixed 3D point, so it can be found again: project it through
+  // The landmark is a fixed 3D point, so it can be found again: project it through
   // the current pose and see which freshly seeded corner is sitting on it. That
   // is what `reassociate` does, and it turns the map from "usable while its
   // tracks live" into "usable while it is being looked at".
   const clients = new Map();
   // `bestSpan` is the single most useful number here and the reason the others
-  // are not enough. Anchors need orbiting motion — a walk *past* something gives
+  // are not enough. Landmarks need orbiting motion — a walk *past* something gives
   // a narrow effective baseline however long it is looked at — and when nothing
-  // qualifies, "no anchors" is indistinguishable from "broken" without knowing
+  // qualifies, "no landmarks" is indistinguishable from "broken" without knowing
   // how wide an arc the room has actually been seen through. Measured on real
   // recorded sessions: median per-feature arc 3.5-8.9 deg against the gate,
   // i.e. normal walking never gets close, and that is the behaviour to surface
   // rather than a bug to hunt.
   const stats = {
-    observed: 0, qualified: 0, solved: 0, refused: 0, reassociated: 0, rej: {},
-    // Anchors dropped for disagreeing with the tags, and the distribution of the
+    observed: 0, qualified: 0, qualifiedDepth: 0, qualifiedConsensus: 0,
+    solved: 0, refused: 0,
+    // Consensus landmarks dropped by the staleness gate early in their life —
+    // the ghost tripwire from the plan: a depth mixture that slipped past the
+    // viewpoint gate does not survive reprojection against tag-derived poses
+    // for long, so a high early-death rate means VOXEL_MIN_VIEWS is too loose.
+    consensusEarly: 0,
+    // Coarse consensus landmarks upgraded to triangulation grade — the
+    // number that decides whether the kitchen can ever solve.
+    refinedConsensus: 0,
+    reassociated: 0, rej: {},
+    // Landmarks dropped for disagreeing with the tags, and the distribution of the
     // residual that decides it. The histogram is the tuning surface: the gate is
     // only honest if the bulk of a healthy session sits well below it, and
-    // that is not something to assume — an anchor's own qualification RMS runs
+    // that is not something to assume — an landmark's own qualification RMS runs
     // 2.3-7.0 px, but a residual is measured through a *later* pose and carries
     // that pose's error too.
     dropped: 0, resid: [0, 0, 0, 0, 0, 0], checked: 0,
@@ -342,8 +584,10 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
     let s = clients.get(clientId);
     if (!s) {
       s = {
-        gen, tracks: new Map(), anchors: new Map(), alias: new Map(),
-        groups: new Map(), bestSpan: 0, nextAnchor: 1, nextGroup: 1,
+        gen, tracks: new Map(), landmarks: new Map(), alias: new Map(),
+        groups: new Map(), bestSpan: 0, nextLandmark: 1, nextGroup: 1,
+        depthErrs: [], depthTrustedWas: false,
+        voxels: new Map(), reportSeq: 0, sinceSolve: Infinity,
       };
       clients.set(clientId, s);
     }
@@ -353,17 +597,251 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
     // different physical points under one id.
     if (s.gen !== gen) {
       log(`Landmarks: client ${clientId} tracker generation ${s.gen} -> ${gen}, `
-        + `dropping ${s.anchors.size} anchor(s)`);
+        + `dropping ${s.landmarks.size} landmark(s)`);
       s.gen = gen;
       s.tracks.clear();
-      s.anchors.clear();
+      s.landmarks.clear();
       s.alias.clear();
       s.groups.clear();
       s.lastPose = null;
       s.bestSpan = 0;
       s.guide = null;
+      // A new session re-measures its own depth: the bias is per-session
+      // state as much as the tracks are.
+      s.depthErrs = [];
+      s.depthTrustedWas = false;
+      // The consensus accumulator was built from the old generation's poses.
+      s.voxels.clear();
+      s.reportSeq = 0;
+      s.sinceSolve = Infinity;
     }
     return s;
+  }
+
+  // The depth trust verdict for one client-session: sample count, the live
+  // scale (median d/z vs the tags), and the relative residual after removing
+  // it. Recomputed per ask — the ring is 50 pairs. Hysteresis rides on
+  // `depthTrustedWas`, which only noteDepth writes, so every caller inside
+  // one report sees one verdict and replays stay deterministic.
+  function depthState(s) {
+    const n = s.depthErrs.length;
+    if (n < DEPTH_TRUST_MIN_N) return { n, trusted: false, k: 1, residRel: null };
+    const ks = s.depthErrs.map((e) => e.d / e.z).sort((a, b) => a - b);
+    const k = ks[n >> 1];
+    const rel = s.depthErrs.map((e) => Math.abs(e.d / k - e.z) / e.z).sort((a, b) => a - b);
+    const residRel = rel[n >> 1];
+    const bar = s.depthTrustedWas ? DEPTH_TRUST_REL_OFF : DEPTH_TRUST_REL;
+    return { n, trusted: residRel <= bar, k, residRel };
+  }
+
+  // The hybrid qualification: depth answers "is this a fixed 3D point" (the
+  // split-arc test's job), triangulation answers "where exactly" (its
+  // measured 26-50 mm grade), and the arc only has to condition the latter —
+  // 5° instead of 20°. Null when depth is untrusted, the estimates are
+  // inconsistent, or the refined triangulation walks away from them.
+  function depthQualify(s, obs, opts) {
+    const ds = depthState(s);
+    if (!ds.trusted) return null;
+    const dObs = obs.filter((o) => o.d != null);
+    if (dObs.length < DEPTH_EST_MIN) return null;
+    const cells = new Set();
+    const est = dObs.map((o) => {
+      const dc = o.d / ds.k;
+      cells.add(`${Math.round(o.pose.p[0] / DEPTH_VIEW_CELL_M)}:`
+        + `${Math.round(o.pose.p[2] / DEPTH_VIEW_CELL_M)}`);
+      return transformPoint(o.pose, [
+        (o.u - o.K.cx) / o.K.fx * dc,
+        (o.v - o.K.cy) / o.K.fy * dc,
+        dc,
+      ]);
+    });
+    if (cells.size < DEPTH_MIN_VIEWS) return null;
+    const med = [0, 1, 2].map((k) =>
+      est.map((e) => e[k]).sort((a, b) => a - b)[est.length >> 1]);
+    const devs = est.map((e) => dist3(e, med)).sort((a, b) => a - b);
+    // Tolerances scale with the point's distance, like the measured noise.
+    const zMed = dObs.map((o) => o.d / ds.k).sort((a, b) => a - b)[dObs.length >> 1];
+    if (devs[devs.length >> 1] > Math.max(DEPTH_EST_TOL_M, DEPTH_EST_TOL_REL * zMed)) {
+      return null;
+    }
+    // splitFloorMm: Infinity disables exactly the no-collapse gate — depth
+    // consistency across viewpoints just did that gate's job. The rms gate
+    // stays: a triangulation that cannot explain its own pixels is refused
+    // whatever depth says.
+    const j = qualifyTrack(obs, {
+      ...opts,
+      minObs: Math.min(opts.minObs ?? MIN_OBS, DEPTH_EST_MIN),
+      minArcDeg: DEPTH_HYBRID_MIN_ARC_DEG,
+      splitFloorMm: Infinity,
+    });
+    if (!j.ok) return null;
+    if (dist3(j.P, med) > Math.max(DEPTH_AGREE_M, DEPTH_AGREE_REL * zMed)) return null;
+    return j;
+  }
+
+  // ±1024 cells of 0.12 m is ±122 m of room, packed into one exact integer so
+  // the accumulator keys on a number rather than a string built per point per
+  // report.
+  const voxelKey = (ix, iy, iz) => ((ix + 1024) * 2048 + (iy + 1024)) * 2048 + (iz + 1024);
+
+  // One promotion attempt, centred on a voxel that took a deposit this report
+  // — thresholds are only ever crossed by a deposit, and a deposit into a
+  // neighbour runs this for that neighbour, so nothing is missed by scanning
+  // only what was touched. Reads the 3×3×3 neighbourhood whole (see VOXEL_M:
+  // a straddled feature must not be halved out of existence) and clears it
+  // whole on promotion.
+  function promoteVoxel(s, v) {
+    let n = 0;
+    let depth = 0;
+    const cells = new Set();
+    const est = [];
+    const keys = [];
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dz = -1; dz <= 1; dz++) {
+          const key = voxelKey(v.ix + dx, v.iy + dy, v.iz + dz);
+          const nb = s.voxels.get(key);
+          if (!nb) continue;
+          keys.push(key);
+          n += nb.n;
+          for (const c of nb.cells) cells.add(c);
+          for (const e of nb.pts) est.push(e);
+          if (nb.depth > depth) depth = nb.depth;
+        }
+      }
+    }
+    if (n < voxelMinN || cells.size < voxelMinViews) return 0;
+    const med = [0, 1, 2].map((k) =>
+      est.map((e) => e[k]).sort((a, b) => a - b)[est.length >> 1]);
+    // Same relative consistency discipline as the hybrid: the measured depth
+    // noise scales with distance, so a fixed millimetre tolerance would refuse
+    // everything far and admit mixtures near.
+    const zMed = est.map((e) => e[3]).sort((a, b) => a - b)[est.length >> 1];
+    const devs = est.map((e) => dist3(e, med)).sort((a, b) => a - b);
+    if (devs[devs.length >> 1] > Math.max(DEPTH_EST_TOL_M, DEPTH_EST_TOL_REL * zMed)) {
+      return 0;
+    }
+    // Consensus at an existing landmark's position is re-observation of it,
+    // not a new feature — and if the landmark is wrong there, the staleness
+    // path owns that, not a duplicate.
+    for (const a of s.landmarks.values()) {
+      if (dist3(a.P, med) < voxelClusterM) return 0;
+    }
+    const j = { P: med, n, span: 0 };
+    const landmarkId = s.nextLandmark++;
+    // No alias: nothing is looking at it yet by construction — the tracks
+    // that fed it may all be dead, which is the point. reassociate adopts a
+    // fresh track onto it the next time its projection has one, exactly as
+    // for any landmark whose founding track died. Born coarse — see
+    // CONSENSUS_ADOPT_PX: the position is depth-grade until the refinement
+    // path has re-triangulated it, and the solve must not count it before.
+    s.landmarks.set(landmarkId, {
+      P: med, n, span: 0, err: null, group: groupFor(s, j),
+      depth, src: 'consensus', coarse: true, robs: [],
+    });
+    for (const key of keys) s.voxels.delete(key);
+    stats.qualified++;
+    stats.qualifiedConsensus++;
+    return 1;
+  }
+
+  // The consensus path: every depth-bearing point sighting deposited into a
+  // quantised room-position accumulator, promotion where deposits from spread
+  // viewpoints agree. Runs only while the session's own depth measurement
+  // holds (depthState.trusted) — this is the depth ban's gate, same as the
+  // hybrid's. The report counter is the decay clock: per-report, never
+  // wall-clock, so replays are deterministic.
+  function consensusObserve(s, pts, camPose, K, foundDepth) {
+    const seq = ++s.reportSeq;
+    let added = 0;
+    const ds = depthState(s);
+    if (ds.trusted) {
+      const cell = `${Math.round(camPose.p[0] / DEPTH_VIEW_CELL_M)}:`
+        + `${Math.round(camPose.p[2] / DEPTH_VIEW_CELL_M)}`;
+      const touched = [];
+      for (const p of pts) {
+        if (p.d == null) continue;
+        const dc = p.d / ds.k;
+        const P = transformPoint(camPose, [
+          (p.u - K.cx) / K.fx * dc,
+          (p.v - K.cy) / K.fy * dc,
+          dc,
+        ]);
+        const ix = Math.floor(P[0] / VOXEL_M);
+        const iy = Math.floor(P[1] / VOXEL_M);
+        const iz = Math.floor(P[2] / VOXEL_M);
+        if (Math.abs(ix) >= 1024 || Math.abs(iy) >= 1024 || Math.abs(iz) >= 1024) continue;
+        const key = voxelKey(ix, iy, iz);
+        let v = s.voxels.get(key);
+        if (!v) {
+          v = { ix, iy, iz, n: 0, cells: new Set(), pts: [], depth: 0, lastAt: 0 };
+          s.voxels.set(key, v);
+        }
+        // One vote per voxel per report: a frame's two hundred points must
+        // not confirm each other — consensus is across frames and viewpoints.
+        if (v.lastAt === seq) continue;
+        v.lastAt = seq;
+        v.n++;
+        v.cells.add(cell);
+        if (foundDepth > v.depth) v.depth = foundDepth;
+        v.pts.push([P[0], P[1], P[2], dc]);
+        if (v.pts.length > VOXEL_PTS_RING) {
+          let w = 0;
+          for (let i = 0; i < v.pts.length; i += 2) v.pts[w++] = v.pts[i];
+          v.pts.length = w;
+        }
+        touched.push(v);
+      }
+      for (const v of touched) {
+        // An earlier promotion this report may have cleared this voxel as a
+        // neighbour of the promoted one.
+        if (s.voxels.get(voxelKey(v.ix, v.iy, v.iz)) === v) added += promoteVoxel(s, v);
+      }
+    }
+    // Decay, on the report clock. The TTL sweep is strided — it walks the
+    // whole map — and the cap eviction runs only when the cap is actually
+    // breached.
+    if (seq % 64 === 0) {
+      for (const [key, v] of s.voxels) {
+        if (seq - v.lastAt > VOXEL_TTL_REPORTS) s.voxels.delete(key);
+      }
+    }
+    if (s.voxels.size > VOXEL_CAP) {
+      const byAge = [...s.voxels.entries()].sort((a, b) => a[1].lastAt - b[1].lastAt);
+      for (const [key] of byAge.slice(0, byAge.length - VOXEL_CAP)) s.voxels.delete(key);
+    }
+    return added;
+  }
+
+  // The 3D seed correction described at SEED_PAIR_M. Returns a corrected
+  // pose, or the seed unchanged when depth is untrusted, the frame carries
+  // too little depth, or the pairing is too thin to say anything.
+  function depthSeedCorrect(s, pts, K, seed) {
+    const ds = depthState(s);
+    if (!ds.trusted) return seed;
+    const deltas = [];
+    for (const p of pts) {
+      if (p.d == null) continue;
+      const dc = p.d / ds.k;
+      const P = transformPoint(seed, [
+        (p.u - K.cx) / K.fx * dc,
+        (p.v - K.cy) / K.fy * dc,
+        dc,
+      ]);
+      let best = null;
+      let bestD = SEED_PAIR_M;
+      for (const a of s.landmarks.values()) {
+        const d = dist3(a.P, P);
+        if (d < bestD) { bestD = d; best = a; }
+      }
+      if (best) deltas.push([best.P[0] - P[0], best.P[1] - P[1], best.P[2] - P[2]]);
+    }
+    if (deltas.length < SEED_PAIR_MIN) return seed;
+    const shift = [0, 1, 2].map((k) =>
+      deltas.map((d) => d[k]).sort((a, b) => a - b)[deltas.length >> 1]);
+    // A correction the size of the room is not drift, it is a wrong pairing.
+    if (Math.hypot(...shift) > SEED_SHIFT_MAX_M) return seed;
+    return { p: seed.p.map((v, k) => v + shift[k]), q: seed.q };
   }
 
   function modelOf(intr) {
@@ -373,7 +851,7 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
     };
   }
 
-  // Which region of the room this anchor belongs to — the nearest existing
+  // Which region of the room this landmark belongs to — the nearest existing
   // group centroid within GROUP_M, or a new group. The centroid is a running
   // mean, so a group settles onto the middle of whatever it is sitting on as it
   // gains members.
@@ -401,15 +879,20 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
     return best;
   }
 
-  // Take an anchor back out of the map, with everything that referred to it.
+  // Take an landmark back out of the map, with everything that referred to it.
   // The group keeps a running mean, so the member has to be subtracted from it
   // rather than merely uncounted, or the region drifts towards a point that is
   // no longer claimed to exist.
-  function dropAnchor(s, anchorId) {
-    const a = s.anchors.get(anchorId);
+  function dropLandmark(s, landmarkId) {
+    const a = s.landmarks.get(landmarkId);
     if (!a) return;
-    s.anchors.delete(anchorId);
-    for (const [trackId, id] of s.alias) if (id === anchorId) s.alias.delete(trackId);
+    // The ghost tripwire: a consensus landmark that dies young to the
+    // staleness gate was very likely never a fixed point at all (a depth
+    // mixture at a silhouette), and the rate of these is the number that
+    // decides whether VOXEL_MIN_VIEWS is doing its job.
+    if (a.src === 'consensus' && (a.checks ?? 0) < 50) stats.consensusEarly++;
+    s.landmarks.delete(landmarkId);
+    for (const [trackId, id] of s.alias) if (id === landmarkId) s.alias.delete(trackId);
     const g = s.groups.get(a.group);
     if (g) {
       g.n--;
@@ -425,40 +908,95 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
     stats.dropped++;
     // Rare enough to say out loud every time, and worth saying: the map lost a
     // point it had qualified, which on a session where nothing was touched
-    // means the re-association is putting tracks on the wrong anchors.
-    log(`Landmarks: anchor ${anchorId} disagreed with the tags for `
-      + `${staleStreak} sightings — dropped (${s.anchors.size} left)`);
+    // means the re-association is putting tracks on the wrong landmarks.
+    log(`Landmarks: landmark ${landmarkId} disagreed with the tags for `
+      + `${staleStreak} sightings — dropped (${s.landmarks.size} left)`);
   }
 
-  // Does the anchor still explain what the track is looking at? Called only
+  // Does the landmark still explain what the track is looking at? Called only
   // under a tag-derived pose — see the note on STALE_PX.
-  function checkAnchor(s, anchorId, p, pose, K) {
-    const a = s.anchors.get(anchorId);
+  function checkLandmark(s, landmarkId, p, pose, K) {
+    const a = s.landmarks.get(landmarkId);
     if (!a) return;
     const q = reproject(a.P, { K, pose });
-    // Behind the camera: the anchor is not being looked at, whatever the track
+    // Behind the camera: the landmark is not being looked at, whatever the track
     // is doing. That is an absence of evidence, not evidence against it.
     if (!q) return;
     const d = Math.hypot(p.u - q[0], p.v - q[1]);
     stats.checked++;
+    a.checks = (a.checks ?? 0) + 1;
     let b = 0;
     while (b < RESID_EDGES.length && d > RESID_EDGES[b]) b++;
     stats.resid[b]++;
     if (d <= stalePx) { a.bad = 0; return; }
     a.bad = (a.bad ?? 0) + 1;
-    if (a.bad >= staleStreak) dropAnchor(s, anchorId);
+    if (a.bad >= staleStreak) dropLandmark(s, landmarkId);
   }
 
-  // Hand anchors that no track is currently following to whichever fresh point
+  // The upgrade path for a coarse consensus landmark: the adopted track's
+  // sightings under founding-grade poses accumulate here, and the same seeded
+  // triangulation the hybrid qualification runs replaces the depth-grade
+  // position with a px-grade one. The staleness check deliberately does not
+  // run while coarse — the reprojection residual against a ±8 cm position is
+  // dominated by that position's own error and would drop honest landmarks
+  // in five sightings of being looked at.
+  //
+  // The agreement gate is the wrong-adoption guard reassociate's margin
+  // cannot be at the wide radius: a track sitting on a *different* feature
+  // triangulates to that feature, lands outside the depth tolerance of the
+  // stored position, and a streak of that drops the landmark rather than
+  // moving it onto the wrong thing. Within the tolerance, replacing the
+  // position IS the refinement.
+  function refineLandmark(s, landmarkId, a, p, pose, K) {
+    a.robs.push({ u: p.u, v: p.v, K, pose, d: p.d });
+    if (a.robs.length > ROBS_RING) {
+      let w = 0;
+      for (let i = 0; i < a.robs.length; i += 2) a.robs[w++] = a.robs[i];
+      a.robs.length = w;
+    }
+    if (a.robs.length < DEPTH_EST_MIN
+      || (a.robs.length - DEPTH_EST_MIN) % QUALIFY_EVERY !== 0) return;
+    const j = qualifyTrack(a.robs, {
+      ...qualifyOpts,
+      minObs: DEPTH_EST_MIN,
+      minArcDeg: DEPTH_HYBRID_MIN_ARC_DEG,
+      splitFloorMm: Infinity,
+    });
+    if (!j.ok) return;
+    const z = dist3(pose.p, a.P);
+    if (dist3(j.P, a.P) > Math.max(DEPTH_AGREE_M, DEPTH_AGREE_REL * z)) {
+      a.bad = (a.bad ?? 0) + 1;
+      if (a.bad >= staleStreak) dropLandmark(s, landmarkId);
+      return;
+    }
+    a.bad = 0;
+    // The group centroid was built from the coarse position; move its share.
+    const g = s.groups.get(a.group);
+    if (g) {
+      for (let k = 0; k < 3; k++) {
+        g.sum[k] += j.P[k] - a.P[k];
+        g.p[k] = g.sum[k] / g.n;
+      }
+    }
+    a.P = j.P;
+    a.n = j.n;
+    a.span = j.span;
+    a.err = j.err;
+    a.coarse = false;
+    delete a.robs;
+    stats.refinedConsensus++;
+  }
+
+  // Hand landmarks that no track is currently following to whichever fresh point
   // is sitting on them. `pts` are already undistorted, so this works in the one
   // space everything else here does.
   //
-  // Only anchors with no live alias are offered, and only points with no alias
+  // Only landmarks with no live alias are offered, and only points with no alias
   // are candidates, so nothing is stolen from a track that is still doing its
   // job. The uniqueness margin is the whole safety argument: a wrong adoption
   // does not lose a landmark, it silently moves one.
-  function reassociate(s, pts, pose, K) {
-    if (!s.anchors.size || !pose) return 0;
+  function reassociate(s, pts, pose, K, adoptPx = reassocPx) {
+    if (!s.landmarks.size || !pose) return 0;
     const taken = new Set();
     for (const p of pts) {
       const a = s.alias.get(p.id);
@@ -468,10 +1006,24 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
     if (!free.length) return 0;
 
     let added = 0;
-    for (const [anchorId, a] of s.anchors) {
-      if (taken.has(anchorId)) continue;
+    // Solve-grade landmarks pick first, coarse ones take the leftovers: an
+    // adopted point is off the market, and the coarse cloud outnumbers the
+    // refined set several-to-one with a wider radius — in insertion order it
+    // was adopting the very points the solve needed. Measured on the corner
+    // walk (01:20 03/08): 65 of 128 tag-less frames had fifteen refined
+    // landmarks within adoption range and the solve fired on 12. The sort is
+    // stable, so order stays deterministic within each grade.
+    const byGrade = [...s.landmarks]
+      .sort((x, y) => (x[1].coarse ? 1 : 0) - (y[1].coarse ? 1 : 0));
+    for (const [landmarkId, a] of byGrade) {
+      if (taken.has(landmarkId)) continue;
       const q = reproject(a.P, { K, pose });
       if (!q) continue;
+      // A coarse consensus landmark's own position noise is tens of pixels,
+      // so the tight radius can never catch one — it gets the radius its
+      // grade actually needs, and the refinement guard (not this margin) is
+      // what keeps a wrong adoption from moving it.
+      const radius = a.coarse ? Math.max(adoptPx, consensusAdoptPx) : adoptPx;
       let best = null;
       let bestD = Infinity;
       let secondD = Infinity;
@@ -482,9 +1034,9 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
         else if (d < secondD) secondD = d;
       }
       // Close enough, and clearly closer than anything else it could be.
-      if (!best || bestD > reassocPx || secondD < bestD * reassocMargin) continue;
-      s.alias.set(best.id, anchorId);
-      taken.add(anchorId);
+      if (!best || bestD > radius || secondD < bestD * reassocMargin) continue;
+      s.alias.set(best.id, landmarkId);
+      taken.add(landmarkId);
       added++;
     }
     if (added) stats.reassociated += added;
@@ -497,12 +1049,43 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
   }
 
   return {
-    // Called only where a tag-derived camera pose exists — an anchor can be
+    // The live depth measurement: every detected tag carries both a depth
+    // sample (t.d) and the solver's truth for the same pixel (tvec[2]), so
+    // the trust verdict and the live bias accumulate from ordinary tag
+    // sightings with no ritual attached. Called for every xr-pose report
+    // that carries tags, before any founding decision — trust must be able
+    // to build on frames that found nothing.
+    noteDepth(clientId, gen, tags) {
+      if (gen == null || !tags?.length) return;
+      const s = stateFor(clientId, gen);
+      let took = false;
+      for (const t of tags) {
+        if (t.d == null || !Array.isArray(t.tvec) || !(t.tvec[2] > 0.3)) continue;
+        s.depthErrs.push({ d: t.d, z: t.tvec[2] });
+        if (s.depthErrs.length > DEPTH_TRUST_RING) s.depthErrs.shift();
+        took = true;
+      }
+      if (!took) return;
+      const ds = depthState(s);
+      if (ds.trusted !== s.depthTrustedWas) {
+        s.depthTrustedWas = ds.trusted;
+        // The runtime verdict the depth ban asks for, out loud — especially
+        // its loss, which silently demotes founding back to bearing-only.
+        log(`Landmarks: client ${clientId} depth ${ds.trusted ? 'TRUSTED' : 'NOT trusted'}`
+          + ` — scale ${ds.k.toFixed(3)}, residual ±${(ds.residRel * 100).toFixed(1)}%`
+          + ` over ${ds.n} tag sample(s)`);
+      }
+    },
+
+    // Called only where a tag-derived camera pose exists — an landmark can be
     // created nowhere else. `camPose` must be the *raw* fix, never a smoothed
     // one: feeding a filter's output into the map that produced it makes the
     // two agree with each other instead of with the room, which is the same
     // reason the tag survey extends and refines on the raw fix.
-    observe(clientId, points, gen, camPose, intr) {
+    // `foundDepth` is the chain depth of the pose the landmarks are founded
+    // under: 0 for a tag-confirmed pose, 1 + the deepest confirming landmark
+    // for a landmark-confirmed one (stage 5, off at LANDMARK_MAX_DEPTH 0).
+    observe(clientId, points, gen, camPose, intr, foundDepth = 0) {
       if (!points?.length || !camPose || gen == null) return 0;
       const K = modelOf(intr);
       if (!K) { bump('no-intrinsics'); return 0; }
@@ -518,28 +1101,37 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
       // re-association below, which would otherwise redo it per candidate pair.
       const pts = points.map((p) => {
         const [u, v] = undistort(p.u, p.v, K);
-        return { id: p.id, u, v };
+        return { id: p.id, u, v, d: p.d ?? null };
       });
       // With a tag-derived pose in hand this is the best chance there is to
-      // recognise anchors again, so it happens here rather than only when they
+      // recognise landmarks again, so it happens here rather than only when they
       // are needed.
       reassociate(s, pts, camPose, K);
+      // The consensus path sees every depth-bearing sighting, aliased or not
+      // — track identity is exactly what it does not consume. Promotions land
+      // before the per-track loop, so a consensus landmark is adoptable from
+      // the next report on (this report's reassociate already ran).
+      added += consensusObserve(s, pts, camPose, K, foundDepth);
 
       for (const p of pts) {
-        // A track already looking at an anchor does not accumulate a second
+        // A track already looking at an landmark does not accumulate a second
         // candidate — but the sighting is not thrown away either: with a
         // tag-derived pose in hand it is the one chance to ask whether the
-        // anchor is still where the map says.
+        // landmark is still where the map says — or, for a coarse consensus
+        // landmark, the one chance to refine it to a position worth asking
+        // that question of.
         const on = s.alias.get(p.id);
         if (on !== undefined) {
-          checkAnchor(s, on, p, camPose, K);
+          const al = s.landmarks.get(on);
+          if (al?.coarse) refineLandmark(s, on, al, p, camPose, K);
+          else checkLandmark(s, on, p, camPose, K);
           continue;
         }
         let t = s.tracks.get(p.id);
         if (!t) { t = { obs: [], est: null }; s.tracks.set(p.id, t); }
         const obs = t.obs;
         const { u, v } = p;
-        obs.push({ u, v, K, pose: camPose });
+        obs.push({ u, v, K, pose: camPose, d: p.d });
         if (obs.length > OBS_RING) {
           // Thin, do not shift: keeping the arc matters, keeping the most
           // recent sightings does not. In place, and keeping every even index,
@@ -553,42 +1145,65 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
 
         // The stride is anchored on whatever minimum is in force, or a swept
         // `minObs` would change which sightings are even attempted as well as
-        // what passes, and the sweep would measure two things at once.
+        // what passes, and the sweep would measure two things at once. The
+        // hybrid path keeps its own stride on its own (smaller) minimum for
+        // the same reason — and so the split-arc attempts stay on exactly the
+        // sighting counts they have always run at, which is what keeps old
+        // journals replaying bit-identically.
         const minObs = qualifyOpts.minObs ?? MIN_OBS;
-        if (obs.length < minObs || (obs.length - minObs) % QUALIFY_EVERY !== 0) continue;
-        const j = qualifyTrack(obs, qualifyOpts);
-        // Only from a track a single 3D point can actually explain. A
-        // triangulation with no answer lands the point beside the camera, and
-        // the bearing to something a few centimetres away sweeps most of a
-        // circle as the phone moves — so the *worst* tracks report the widest
-        // arcs. Unfiltered, one of them pinned this readout at 234 deg for a
-        // whole session while nothing qualified, which is exactly backwards
-        // from what it is for.
-        if (Number.isFinite(j.err) && j.err < MAX_RMS_PX && j.span > s.bestSpan) {
-          s.bestSpan = j.span;
+        const splitDue = obs.length >= minObs
+          && (obs.length - minObs) % QUALIFY_EVERY === 0;
+        const hybridDue = obs.length >= DEPTH_EST_MIN
+          && (obs.length - DEPTH_EST_MIN) % QUALIFY_EVERY === 0;
+        if (!splitDue && !hybridDue) continue;
+        const j = splitDue ? qualifyTrack(obs, qualifyOpts) : null;
+        if (j) {
+          // Only from a track a single 3D point can actually explain. A
+          // triangulation with no answer lands the point beside the camera, and
+          // the bearing to something a few centimetres away sweeps most of a
+          // circle as the phone moves — so the *worst* tracks report the widest
+          // arcs. Unfiltered, one of them pinned this readout at 234 deg for a
+          // whole session while nothing qualified, which is exactly backwards
+          // from what it is for.
+          if (Number.isFinite(j.err) && j.err < MAX_RMS_PX && j.span > s.bestSpan) {
+            s.bestSpan = j.span;
+          }
+          // What this track currently looks like, kept for the candidate view
+          // (see `candidates`). Same gate as bestSpan above and for the same
+          // reason: a triangulation with no answer puts the point next to the
+          // camera, and plotting those would fill the map with a cloud that
+          // follows whoever is holding the phone. Cleared when it fails, so a
+          // track that stops resolving stops being shown rather than freezing
+          // where it last was.
+          t.est = j.P && Number.isFinite(j.err) && j.err < MAX_RMS_PX
+            ? { P: j.P, span: j.span, az0: j.az0, az1: j.az1, err: j.err }
+            : null;
         }
-        // What this track currently looks like, kept for the candidate view (see
-        // `candidates`). Same gate as bestSpan above and for the same reason: a
-        // triangulation with no answer puts the point next to the camera, and
-        // plotting those would fill the map with a cloud that follows whoever is
-        // holding the phone. Cleared when it fails, so a track that stops
-        // resolving stops being shown rather than freezing where it last was.
-        t.est = j.P && Number.isFinite(j.err) && j.err < MAX_RMS_PX
-          ? { P: j.P, span: j.span, az0: j.az0, az1: j.az1, err: j.err }
-          : null;
-        if (!j.ok) { bump(j.reason); continue; }
+        let q = j?.ok ? j : null;
+        let viaDepth = false;
+        if (!q && hybridDue) {
+          q = depthQualify(s, obs, qualifyOpts);
+          viaDepth = !!q;
+        }
+        if (!q) {
+          if (j && !j.ok) bump(j.reason);
+          continue;
+        }
         // Promoted: it gets an identity of its own, and the track that found it
         // becomes merely the first thing to be looking at it. The observations
-        // are dropped: an anchor is checked by reprojection from then on (see
-        // checkAnchor), never re-triangulated, and holding sixty sightings each
-        // for hundreds of anchors is memory for nothing.
-        const anchorId = s.nextAnchor++;
-        s.anchors.set(anchorId, {
-          P: j.P, n: j.n, span: j.span, err: j.err, group: groupFor(s, j),
+        // are dropped: a landmark is checked by reprojection from then on (see
+        // checkLandmark), never re-triangulated, and holding sixty sightings each
+        // for hundreds of landmarks is memory for nothing. `src` is provenance
+        // for replay and diagnostics only — downstream a landmark is a landmark.
+        const landmarkId = s.nextLandmark++;
+        s.landmarks.set(landmarkId, {
+          P: q.P, n: q.n, span: q.span, err: q.err, group: groupFor(s, q),
+          depth: foundDepth, src: viaDepth ? 'depth' : 'arc',
         });
-        s.alias.set(p.id, anchorId);
+        s.alias.set(p.id, landmarkId);
         s.tracks.delete(p.id);
         stats.qualified++;
+        if (viaDepth) stats.qualifiedDepth++;
         added++;
       }
       return added;
@@ -609,37 +1224,66 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
       if (!K) return null;
       const s = clients.get(clientId);
       if (!s || s.gen !== gen) return null;
-      if (s.anchors.size < MIN_ANCHORS_FOR_FIX) return null;
-      const from = seed ?? s.lastPose;
-      if (!from) { stats.refused++; return null; }
+      if (s.landmarks.size < minLandmarks) return null;
+      const carried = seed ?? s.lastPose;
+      if (!carried) { stats.refused++; return null; }
 
       // Undistorted here as at observe, so one convention holds across the
-      // whole module and the solver is told the camera is ideal.
+      // whole module and the solver is told the camera is ideal. Depth rides
+      // along for the seed correction below.
       const pts = points.map((p) => {
         const [u, v] = undistort(p.u, p.v, K);
-        return { id: p.id, u, v };
+        return { id: p.id, u, v, d: p.d ?? null };
       });
+      // The carried seed may have drifted past any adoption radius — measure
+      // and remove the bulk of the drift in 3D before asking for px matches.
+      const from = depthSeedCorrect(s, pts, K, carried);
       // Recognise what can be recognised from the seed *before* solving, which
       // is what makes a long tag-less stretch survivable: without it the
       // matchable set only ever shrinks as tracks die.
       reassociate(s, pts, from, K);
 
-      const objs = [];
-      const imgs = [];
-      for (const p of pts) {
-        const a = s.anchors.get(s.alias.get(p.id));
-        if (!a) continue;
-        objs.push(a.P);
-        imgs.push([p.u, p.v]);
+      const match = () => {
+        const objs = [];
+        const imgs = [];
+        const metas = [];
+        for (const p of pts) {
+          const landmarkId = s.alias.get(p.id);
+          const a = s.landmarks.get(landmarkId);
+          // Coarse consensus landmarks are excluded from the fit outright:
+          // ±5%·z position noise either wastes the match as a RANSAC outlier
+          // or poisons the pose as an inlier. Their aliases still form here
+          // — solve-time adoption is how a kitchen landmark gets a track to
+          // refine from at the next founding-grade frame.
+          if (!a || a.coarse) continue;
+          objs.push(a.P);
+          imgs.push([p.u, p.v]);
+          metas.push({ id: landmarkId, a });
+        }
+        return { objs, imgs, metas };
+      };
+      let { objs, imgs, metas } = match();
+      // Escalation, not replacement: 3 px assumes the projecting pose is tag-
+      // accurate, and a carried pose whose drift is the very thing being
+      // measured reprojects in-view landmarks ~26 px off — at 3 px the
+      // cross-check adopted nothing and went 0-for-553 on a real walk. The
+      // wider radius runs only when the tight one came up short, so the
+      // holdout behaviour the sweeps were measured at is untouched wherever
+      // 3 px suffices (replacing it outright cost that journal 106 → 88
+      // localized frames). The uniqueness margin and the RANSAC are what keep
+      // the wide pass honest; swept via --solve-reassoc-px.
+      if (objs.length < minLandmarks && solveReassocPx > reassocPx) {
+        reassociate(s, pts, from, K, solveReassocPx);
+        ({ objs, imgs, metas } = match());
       }
-      if (objs.length < MIN_ANCHORS_FOR_FIX) {
+      if (objs.length < minLandmarks) {
         stats.refused++;
         return null;
       }
 
       const sol = solveLandmarkPose(objs, imgs,
         { fx: K.fx, fy: K.fy, cx: K.cx, cy: K.cy }, from,
-        { minPoints: MIN_ANCHORS_FOR_FIX });
+        { minPoints: minLandmarks });
       if (!sol || !sol.p.every(Number.isFinite)) {
         stats.refused++;
         return null;
@@ -650,48 +1294,174 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
       // And again from the answer, which is better than the seed was: the next
       // report starts with more of the map already found.
       reassociate(s, pts, pose, K);
-      return { pose, n: sol.n, inliers: sol.inliers, rms: sol.rms };
+      // The landmarks that actually supported the fit, with each one's residual
+      // under it. Inlier membership is the statement "this landmark was seen
+      // this frame", which is what a carve ray hangs on — a landmark merely
+      // projected into the frame proves nothing about the line of sight.
+      const seen = (sol.inlierIdx ?? []).map((i, k) => ({
+        id: metas[i].id, P: metas[i].a.P, res: sol.inlierRes?.[k] ?? 0,
+      }));
+      const maxDepth = seen.reduce((d, l) => {
+        const a = s.landmarks.get(l.id);
+        return Math.max(d, a?.depth ?? 0);
+      }, 0);
+      return { pose, n: sol.n, inliers: sol.inliers, rms: sol.rms, seen, maxDepth };
     },
 
-    // Distinct anchors, not raw tracks: several tracks routinely sit on one
+    // The cross-check on a tag-less ARCore-carried frame (stage 1/2 of the
+    // carving plan): solve against the landmark map — a frozen record of the
+    // room frame as the tags defined it, no ARCore in it — and compare with
+    // the carried pose. Mutates entry.room exactly the way maintainLandmarks
+    // always has (before the journal and the walls carve), and lives here
+    // rather than in server.js for the landmarkGate reason: replay-landmarks
+    // must replay the identical decision or it measures a different product.
+    //
+    // On agreement past every gate the report earns mapSafe (`safeVia:
+    // 'landmark'`, journalled so a replay can tell the sources apart) and
+    // carries `landmarkRays` — the inlier landmarks, seen this frame, whose
+    // lines of sight the walls module may carve. Disagreement is not neutral:
+    // it is evidence ARCore has drifted, and it must never extend mapSafe.
+    //
+    // The survey's own quarantine (room.quarantined: founding, unresolved
+    // mirror, slip) vetoes absolutely — those say the *room frame* is in
+    // doubt, and the landmarks were founded against that very frame, so they
+    // would confirm its flip.
+    check(clientId, entry) {
+      const { msg, room } = entry;
+      if (entry.kind !== 'xr-pose' || !room?.pose || room.quality !== 'tracked') return null;
+      if (!msg.points?.length || msg.gen == null) return null;
+      // Chained seed: while solves keep landing, each one seeds the next —
+      // re-seeding from the carried pose every frame handed the matcher the
+      // very drift the previous solve had just measured away. The carry is
+      // still the comparison reference below, only the *seed* chains.
+      const s = clients.get(clientId);
+      const chain = s && s.gen === msg.gen && s.sinceSolve <= SOLVE_CHAIN_MAX;
+      const fix = this.solve(clientId, msg.points, msg.gen,
+        msg.intr ?? msg.intrinsics, chain ? null : room.pose);
+      if (s && s.gen === msg.gen) s.sinceSolve = fix ? 0 : s.sinceSolve + 1;
+      if (!fix) return null;
+      const dp = dist3(fix.pose.p, room.pose.p);
+      const deg = quatAngleDeg(fix.pose.q, room.pose.q);
+      // Journalled whether or not it changes anything: this line is the
+      // measurement LANDMARK_AGREE_M is chosen from, and the replay's parity
+      // check reads it back.
+      room.lmCheck = {
+        dpMm: Math.round(dp * 1000), deg: Math.round(deg * 10) / 10,
+        inliers: fix.inliers, rms: Math.round(fix.rms * 100) / 100,
+      };
+      const agrees = dp <= LANDMARK_AGREE_M && deg <= LANDMARK_AGREE_DEG;
+      const confirmed = agrees && room.quarantined !== true
+        && fix.inliers >= minLandmarks
+        && fix.rms <= LANDMARK_CONFIRM_RMS_PX;
+      if (confirmed && LANDMARK_RESCUE && room.mapSafe !== true) {
+        room.mapSafe = true;
+        room.safeVia = 'landmark';
+      }
+      let chained = false;
+      if (confirmed && room.mapSafe === true) {
+        // The rays walls.js may carve free space along. The far end of such a
+        // ray asserts nothing — a landmark may be the corner of a chair — so
+        // only the line of sight is evidence, and inlier membership is what
+        // says the landmark was seen this frame rather than merely projected
+        // into it.
+        room.landmarkRays = fix.seen.map((l) => ({
+          id: l.id,
+          p: l.P.map((v) => Math.round(v * 1000) / 1000),
+          res: Math.round(l.res * 10) / 10,
+        }));
+        // Chained founding (stage 5, off at LANDMARK_MAX_DEPTH 0): a
+        // landmark-confirmed pose may found deeper landmarks, under the
+        // solve's own pose — never the ARCore-carried one; information still
+        // flows tags → landmarks → deeper landmarks one way — and only past
+        // *half* the agreement thresholds, because each generation compounds
+        // the risk of landmarks agreeing with a drift they were founded
+        // during.
+        const depth = 1 + (fix.maxDepth ?? 0);
+        if (depth <= LANDMARK_MAX_DEPTH
+          && dp <= LANDMARK_AGREE_M / 2 && deg <= LANDMARK_AGREE_DEG / 2
+          && fix.rms <= LANDMARK_CONFIRM_RMS_PX / 2) {
+          this.observe(clientId, msg.points, msg.gen, fix.pose,
+            msg.intr ?? msg.intrinsics, depth);
+          chained = true;
+        }
+      }
+      // The takeover: a solve past the full quality bar that *disagrees* is
+      // the drift caught in the act — measured on the corner walk, 7 of 18
+      // solves found 100+ mm of it and the pipeline logged them and reported
+      // the drifted pose anyway. The reported pose becomes the solve's; the
+      // carried one is kept on the entry (`carried`) so replays re-derive
+      // from what ARCore actually said. mapSafe is deliberately untouched —
+      // where the dot is drawn and what evidence may be carved are different
+      // bars, and disagreement still refuses the carve. Quarantine vetoes:
+      // the landmarks were founded in the very room frame quarantine says is
+      // in doubt.
+      const strong = room.quarantined !== true
+        && fix.inliers >= minLandmarks
+        && fix.rms <= LANDMARK_CONFIRM_RMS_PX;
+      let took = false;
+      if (strong && !agrees) {
+        room.carried = room.pose;
+        room.pose = fix.pose;
+        room.lmFix = true;
+        took = true;
+      }
+      return { fix, dp, deg, agrees, confirmed, chained, took };
+    },
+
+    // Distinct landmarks, not raw tracks: several tracks routinely sit on one
     // physical feature and a raw count overstates what the room actually has.
     count(clientId) {
       const s = clients.get(clientId);
       if (!s) return 0;
-      return clusterAnchors([...s.anchors.values()]).length;
+      return clusterLandmarks([...s.landmarks.values()]).length;
     },
 
     // What a client needs to be told about its own landmark state, for the
-    // on-phone overlay. `bestSpan` is the actionable one: anchors need a wide
+    // on-phone overlay. `bestSpan` is the actionable one: landmarks need a wide
     // viewing arc, that is the thing the person holding the phone controls, and
     // it is the difference between "walk differently" and "this is broken".
     summary(clientId) {
       const s = clients.get(clientId);
       if (!s) return null;
+      const ds = depthState(s);
       return {
-        anchors: clusterAnchors([...s.anchors.values()]).length,
-        tracks: s.tracks.size,
+        landmarks: clusterLandmarks([...s.landmarks.values()]).length,
+        // The ones the solve may actually count — arc, hybrid and refined
+        // consensus. The difference between this and `landmarks` is the
+        // coarse backlog still waiting to be looked at.
+        solid: clusterLandmarks(
+          [...s.landmarks.values()].filter((a) => !a.coarse)).length,
+        candidates: s.tracks.size,
         arc: Math.round(s.bestSpan),
+        // The depth verdict, for the phone chip: warming (too few samples),
+        // trusted ±N %, or refused ±N % — the difference between "walk a
+        // step and glance" and "orbit like before".
+        depth: {
+          n: ds.n,
+          trusted: ds.trusted,
+          residPct: ds.residRel === null ? null : Math.round(ds.residRel * 1000) / 10,
+          k: Math.round(ds.k * 1000) / 1000,
+        },
       };
     },
 
-    // The anchor clouds as regions, for the drawer to show beside the tags.
-    // `live` is how many of the group's anchors a track is currently sitting on
+    // The landmark clouds as regions, for the drawer to show beside the tags.
+    // `live` is how many of the group's landmarks a track is currently sitting on
     // — the difference between a region the map merely remembers and one it can
     // localize against right now, which is the whole distinction between a
     // landmark and a tag and should be visible as such.
     groups(clientId) {
       const s = clients.get(clientId);
       if (!s) return [];
-      // Distinct anchors, not alias entries: a dead track leaves its alias
-      // behind, and several tracks can have looked at one anchor over a
-      // session, so counting entries reported more live anchors than exist.
+      // Distinct landmarks, not alias entries: a dead track leaves its alias
+      // behind, and several tracks can have looked at one landmark over a
+      // session, so counting entries reported more live landmarks than exist.
       const seen = new Set();
       const live = new Map();
-      for (const anchorId of s.alias.values()) {
-        if (seen.has(anchorId)) continue;
-        seen.add(anchorId);
-        const a = s.anchors.get(anchorId);
+      for (const landmarkId of s.alias.values()) {
+        if (seen.has(landmarkId)) continue;
+        seen.add(landmarkId);
+        const a = s.landmarks.get(landmarkId);
         if (a) live.set(a.group, (live.get(a.group) ?? 0) + 1);
       }
       return [...s.groups]
@@ -705,9 +1475,9 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
         .sort((a, b) => b.n - a.n);
     },
 
-    // The tracks that are not anchors yet, with the arc each has been seen
+    // The tracks that are not landmarks yet, with the arc each has been seen
     // through so far. This is the answer to "nothing is qualifying, is it
-    // broken?" — the one question the anchor cloud cannot answer, because it is
+    // broken?" — the one question the landmark cloud cannot answer, because it is
     // empty in both the working case and the broken one.
     //
     // What it shows is where the room's *candidate* features are and how far
@@ -717,7 +1487,7 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
     // real sessions, normal walking reaches 3-9° against a 60° gate, so the
     // stuck case is the *usual* one and deserves to be visible.
     //
-    // Merged like the anchors are, and sorted widest-arc first so the survivor
+    // Merged like the landmarks are, and sorted widest-arc first so the survivor
     // of each cluster is the best-seen member rather than an arbitrary one.
     candidates(clientId) {
       const s = clients.get(clientId);
@@ -725,7 +1495,7 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
       const est = [];
       for (const t of s.tracks.values()) if (t.est) est.push(t.est);
       est.sort((a, b) => b.span - a.span);
-      return clusterAnchors(est).map((c) => ({
+      return clusterLandmarks(est).map((c) => ({
         p: c[0].P.map((v) => Math.round(v * 1000) / 1000),
         span: Math.round(c[0].span),
       }));
@@ -736,17 +1506,35 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
     // right answer far more often than not, and saying nothing is better than
     // sending someone after two corners of a doorframe.
     //
-    // Returns { p, n, span, need, dist, mode, radius, from, to } in room
+    // `blocked(a, b)`, when given, answers "does the straight line between
+    // these two floor points cross an emitted wall" — injected by server.js,
+    // because this module deliberately knows nothing about walls. A target the
+    // camera cannot see past a wall is a target in another room: unfiltered,
+    // the guidance scored candidates on straight-line distance alone and
+    // asked for walks through the [2 6] wall.
+    //
+    // Returns { p, n, span, need, dist, mode, radius, from, sweep } in room
     // coordinates and degrees:
     //   mode 'closer' — too far for the arc to be worth walking; approach first.
-    //   mode 'arc'    — walk the ground from `from` to `to` around `p`, which is
-    //                   an azimuth sweep at `radius` metres. `to` is past
-    //                   whichever end of the covered arc the camera is nearest,
-    //                   so the instruction always extends the arc rather than
-    //                   re-walking ground already covered.
-    guide(clientId, camPose) {
+    //   mode 'arc'    — walk the ground around `p` starting at azimuth `from`
+    //                   (where the camera stands), through `sweep` signed
+    //                   degrees, at `radius` metres. The magnitude travels the
+    //                   wire explicitly: it used to be reconstructed on the
+    //                   phone from two wrapped endpoints, and the mod-360
+    //                   ambiguity turned a stale −3° into 357° — the
+    //                   full-circle "arc".
+    guide(clientId, camPose, { blocked } = {}) {
       const s = clients.get(clientId);
       if (!s || !camPose) return null;
+      // With trusted depth the whole premise of the instruction is gone: the
+      // split-arc gate is no longer how landmarks are founded (measured on
+      // the first consensus walks — 0 by arc, all by depth and consensus),
+      // and the walk it asks for is self-defeating anyway: walking the arc
+      // kills the very tracks it is meant to ripen, the cluster re-seeds in
+      // place, the sticky target re-picks it, and the same orbit is demanded
+      // forever. Depth founding needs only the walking the person is already
+      // doing; the depth chip says so. Say nothing.
+      if (depthState(s).trusted) return null;
       const est = [];
       for (const t of s.tracks.values()) if (t.est) est.push(t.est);
       if (!est.length) return null;
@@ -756,13 +1544,15 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
       est.sort((a, b) => b.span - a.span);
 
       const C = camPose.p;
+      const losBlocked = (P) => !!blocked && blocked([C[0], C[2]], [P[0], P[2]]);
       let best = null;
-      for (const c of clusterAnchors(est, groupM)) {
+      for (const c of clusterLandmarks(est, groupM)) {
         if (c.length < GUIDE_MIN_MEMBERS) continue;
         const head = c[0];
         const P = head.P;
         const dist = dist3(C, P);
         if (!(dist < GUIDE_MAX_M)) continue;
+        if (losBlocked(P)) continue;
         // More corners, further along, and nearer: nearer twice over, because
         // it is both less walking to get there and more arc per step once
         // there. Progress saturates at the gate — a track already past 60 deg
@@ -776,21 +1566,30 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
       // Stickiness: keep the standing target unless the new pick is clearly
       // better. Without this the pick changes with every push as clusters trade
       // places by a hair, and an instruction that moves cannot be followed.
+      // The wall test applies to the held target too — stickiness must not pin
+      // a target the user has since put a wall between themselves and.
       const prev = s.guide;
       if (prev) {
-        const still = clusterAnchors(est, groupM)
+        const still = clusterLandmarks(est, groupM)
           .map((c) => c[0])
           .find((h) => dist3(h.P, prev.P) < groupM);
         if (still && still !== best.head) {
           const held = dist3(C, still.P);
-          if (held < GUIDE_MAX_M && best.score < prev.score * GUIDE_STICKY) {
+          if (held < GUIDE_MAX_M && !losBlocked(still.P)
+            && best.score < prev.score * GUIDE_STICKY) {
             best = { score: prev.score, P: still.P, n: prev.n, head: still, dist: held };
           }
         }
       }
       const wasFar = s.guide?.far ?? false;
+      // The arc direction is target-local state: it only means anything while
+      // the instruction keeps pointing at the same feature.
+      const sameTarget = prev && dist3(best.P, prev.P) < groupM;
       const far = best.dist > (wasFar ? GUIDE_NEAR_LEAVE_M : GUIDE_NEAR_M);
-      s.guide = { P: best.P, score: best.score, n: best.n, far };
+      s.guide = {
+        P: best.P, score: best.score, n: best.n, far,
+        dir: sameTarget ? prev.dir : null,
+      };
 
       const { P, head } = best;
       const need = Math.max(0, Math.ceil(MIN_ARC_DEG - head.span));
@@ -811,7 +1610,7 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
         radius: Math.round(radius * 100) / 100,
       };
       if (far) return { ...out, mode: 'closer' };
-      // Wide enough already and still not an anchor: what it is short of is
+      // Wide enough already and still not a landmark: what it is short of is
       // *observations*, not viewpoints — the split-arc gap has to collapse, and
       // that happens as noise averages down with more sightings of the same
       // arc. Measured on real walks, this is the common case by a wide margin:
@@ -822,12 +1621,52 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
 
       // Which end of the covered arc the camera is standing at. Extending the
       // near end is the only instruction that adds arc; setting off from the far
-      // end re-walks ground the track already has.
+      // end re-walks ground the track already has. When the camera stands
+      // nearly opposite the covered arc the two ends are equidistant and the
+      // choice is noise — keep the previous direction for the same target
+      // rather than flipping the arrow frame to frame.
       const azNow = azimuthOf(P, { pose: camPose });
       const d0 = Math.abs(norm180(azNow - head.az0));
       const d1 = Math.abs(norm180(azNow - head.az1));
-      const from = d1 <= d0 ? head.az1 : head.az0;
-      const dir = d1 <= d0 ? 1 : -1;
+      let dir = d1 <= d0 ? 1 : -1;
+      if (s.guide.dir && Math.abs(d0 - d1) < GUIDE_DIR_HYST_DEG) dir = s.guide.dir;
+      s.guide.dir = dir;
+      // The target is a *fixed room azimuth*: the point at which the covered
+      // arc will have reached the gate, anchored on the far covered end —
+      // extending past az1 means finishing at az0 + the gate, and vice versa.
+      // It must not be derived from where the camera stands: the covered-arc
+      // estimate refreshes only every few sightings, so a target placed
+      // "need° ahead of the camera" was re-laid ahead of every step taken
+      // toward it — an arrowhead that receded exactly as fast as it was
+      // chased, reported as precisely that. Anchored this way it stays put:
+      // walking extends the near end toward it while the far end holds, and
+      // the two meet where the target has been all along.
+      const target = (dir === 1 ? head.az0 : head.az1)
+        + dir * (MIN_ARC_DEG + GUIDE_OVERSHOOT_DEG);
+      const delta = ((dir * (target - azNow)) % 360 + 360) % 360;
+      // Past the target already (the estimate is a beat behind the walk):
+      // arrived. Hold and let the sightings catch up — the wrap would
+      // otherwise turn "5° past" into "355° to go".
+      if (delta > 315) return { ...out, mode: 'dwell' };
+      let sweep = dir * Math.min(delta, 180);
+      // Trim the sweep where the standing arc leaves the room: a point on the
+      // walk whose line to the feature crosses a wall is a viewpoint that
+      // cannot see it. Sampled coarsely — this is an instruction, not a
+      // measurement — and a sweep trimmed to nearly nothing means the target
+      // is effectively walled off; say nothing rather than point at a wall.
+      if (blocked) {
+        const az0 = norm180(azNow);
+        const step = 10 * Math.sign(sweep);
+        let ok = 0;
+        for (let a = step; Math.abs(a) <= Math.abs(sweep); a += step) {
+          const rad = (az0 + a) * Math.PI / 180;
+          const S = [P[0] + radius * Math.sin(rad), P[2] + radius * Math.cos(rad)];
+          if (blocked([P[0], P[2]], S)) break;
+          ok = a;
+        }
+        if (Math.abs(sweep) > Math.abs(ok) + 10) sweep = ok;
+        if (Math.abs(sweep) < GUIDE_MIN_SWEEP_DEG) return null;
+      }
       return {
         ...out,
         mode: 'arc',
@@ -835,22 +1674,29 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
         // the arc becomes wide enough. Drawn as one sweep because that is the
         // ground they have to cross, covered or not.
         from: Math.round(norm180(azNow) * 10) / 10,
-        to: Math.round(norm180(from + dir * (need + GUIDE_OVERSHOOT_DEG)) * 10) / 10,
-        dir,
+        sweep: Math.round(sweep * 10) / 10,
       };
     },
 
     // For the viewer. Deliberately the merged set, for the same reason.
+    // `solid` is the grade split the maps draw: a coarse consensus landmark
+    // is a depth-grade guess the solve may not count yet, and showing the two
+    // identically is why a working feature looked like nothing was happening.
     forClient(clientId) {
       const s = clients.get(clientId);
       if (!s) return [];
-      return clusterAnchors([...s.anchors.values()]).map((c) => ({
+      // `group` is the cluster representative's, alongside its position, count
+      // and span — the map draws a point per cluster and needs to know which
+      // region card it belongs to, or a hovered region can only light a whole
+      // client's cloud.
+      return clusterLandmarks([...s.landmarks.values()]).map((c) => ({
         p: c[0].P, n: c[0].n, span: Math.round(c[0].span), merged: c.length,
+        solid: c.some((a) => !a.coarse), group: c[0].group,
       }));
     },
 
-    // A client disconnected, the marker size changed (every anchor is in the
-    // old metric scale), or the anchor went (the room frame is redefined).
+    // A client disconnected, the marker size changed (every landmark is in the
+    // old metric scale), or the anchor tag went (the room frame is redefined).
     reset(clientId) {
       if (clientId === undefined) clients.clear();
       else clients.delete(clientId);
@@ -860,22 +1706,31 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
       return {
         ...stats,
         clients: [...clients.entries()].map(([id, s]) => ({
-          clientId: id, gen: s.gen, tracks: s.tracks.size, anchors: s.anchors.size,
+          clientId: id, gen: s.gen, tracks: s.tracks.size, landmarks: s.landmarks.size,
           bestSpan: s.bestSpan,
         })),
       };
     },
 
-    // Replay needs this to answer "would it have solved with fewer anchors" —
+    // Replay needs this to answer "would it have solved with fewer landmarks" —
     // the count gate is the thing most worth testing and the hardest to reach
     // from outside.
-    _anchorsFor(clientId) {
-      return clients.get(clientId)?.anchors ?? new Map();
+    _landmarksFor(clientId) {
+      return clients.get(clientId)?.landmarks ?? new Map();
+    },
+
+    // Same purpose: which track is on which landmark, so replay probes can
+    // measure what a correspondence-based fix would have had to work with.
+    _aliasFor(clientId) {
+      return clients.get(clientId)?.alias ?? new Map();
     },
   };
 }
 
 module.exports = {
-  createLandmarks, landmarkGate, MIN_ANCHORS_FOR_FIX, LANDMARK_MAX_JITTER_MM,
+  createLandmarks, landmarkGate, foundingDepth,
+  MIN_LANDMARKS_FOR_FIX, LANDMARK_MAX_JITTER_MM,
+  LANDMARK_AGREE_M, LANDMARK_AGREE_DEG, LANDMARK_CONFIRM_RMS_PX,
+  LANDMARK_RESCUE, LANDMARK_MAX_DEPTH,
   OBS_RING, QUALIFY_EVERY, dist3,
 };

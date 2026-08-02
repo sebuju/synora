@@ -32,6 +32,7 @@ function usage(err) {
   console.error('usage: node replay-walls.js <journal.pose.jsonl> [more ...]\n'
     + '  [--markers markers.json] [--jitter-mm N] [--jitter-soft-mm N] [--min-views N]\n'
     + '  [--tagonly-scale X] [--frustum-scale X] [--cell-m X]\n'
+    + '  [--landmark-scale X] [--landmark-half-m X]\n'
     + '  [--veto-radius-m X] [--veto-cross-m X]\n'
     + '  [--neg-scale X] [--neg-jitter-mm N] [--neg-tracked-scale X] [--neg-min-px N]\n'
     + '  [--neg-max-dist X] [--neg-min-views N] [--l-blocked X] [--ded-on X]\n'
@@ -70,6 +71,8 @@ if (flags['jitter-mm'] !== undefined) opts.maxJitterMm = Number(flags['jitter-mm
 if (flags['jitter-soft-mm'] !== undefined) opts.softJitterMm = Number(flags['jitter-soft-mm']);
 if (flags['min-views'] !== undefined) opts.minViews = Number(flags['min-views']);
 if (flags['tagonly-scale'] !== undefined) opts.tagonlyScale = Number(flags['tagonly-scale']);
+if (flags['landmark-scale'] !== undefined) opts.landmarkScale = Number(flags['landmark-scale']);
+if (flags['landmark-half-m'] !== undefined) opts.landmarkHalfM = Number(flags['landmark-half-m']);
 if (flags['frustum-scale'] !== undefined) opts.frustumScale = Number(flags['frustum-scale']);
 if (flags['cell-m'] !== undefined) opts.cellM = Number(flags['cell-m']);
 if (flags['veto-radius-m'] !== undefined) opts.vetoRadiusM = Number(flags['veto-radius-m']);
@@ -125,12 +128,22 @@ console.log(`reports accepted ${s.reports.accepted}/${s.reports.total}`
   + ` — rejected: ${rejLine(s.reports.rej)}`);
 console.log(`rays    accepted ${s.rays.accepted}/${s.rays.total}`
   + ` — rejected: ${rejLine(s.rays.rej)}`);
+if (s.landmarkRays.total) {
+  console.log(`lm rays accepted ${s.landmarkRays.accepted}/${s.landmarkRays.total}`
+    + ` (mean w ${s.landmarkRays.meanW ?? '—'}) — rejected: ${rejLine(s.landmarkRays.rej)}`);
+}
 console.log(`veto:   ${s.veto.waived}/${s.veto.planes} plane-test(s) waived`
   + ' (wedge crossed the plane — the sighting outranks the assumed reach)');
 console.log(`grid: ${s.cells} cells touched, ${s.free} free / ${s.occ} occupied`
   + ` (${s.freeM2} m² attested free)`);
+// Groups whose far side holds landmark-ray endpoints are excluded from the
+// headline — a surveyed far side makes behind-cells legitimate — but the
+// exclusion is always said out loud, never silent.
+const farSide = walls.leaksDetail().filter((g) => g.farSide);
 console.log(`leaks: ${leakCount} free cell(s) behind a tag plane`
-  + ' (wrong by construction — this is the gate-quality headline)');
+  + ' (wrong by construction — this is the gate-quality headline)'
+  + farSide.map((g) => ` (+${g.count} behind far-side-surveyed [${g.ids.join(' ')}] — excluded)`)
+    .join(''));
 const sb = walls.sightBlocks();
 console.log(`sight: ${sb.blocked}/${sb.total} proven line(s) of sight crossed by an emitted wall`
   + ` (a wall standing where you looked through — must be 0); ${sb.grazed} grazed`
@@ -142,7 +155,10 @@ console.log(`neg tags    deposited ${s.neg.tags.deposited}/${s.neg.tags.total}`
 console.log(`deduced: ${s.deduced} cell(s)`
   + ` (${Math.round(s.deduced * (opts.cellM ?? DEFAULTS.cellM) ** 2 * 100) / 100} m²);`
   + ` deduced-leaks: ${walls.deducedLeaks()} behind a tag plane`
-  + ' (the negative-gate headline)');
+  + ' (the negative-gate headline)'
+  + walls.deducedLeaksDetail().filter((g) => g.farSide)
+    .map((g) => ` (+${g.count} behind far-side-surveyed [${g.ids.join(' ')}] — excluded)`)
+    .join(''));
 // leaks cannot see a wall eaten too *short* — it only looks inside the emitted
 // span. The audit is the other direction: attested extent vs what survived the
 // opening test, and how much of the loss came from behind-evidence too shallow

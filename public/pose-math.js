@@ -300,6 +300,24 @@ function transformPoint(t, v) {
   return [r[0] + t.p[0], r[1] + t.p[1], r[2] + t.p[2]];
 }
 
+// Intersection of two 2D segments in fractional units of each: t1/t2 in (0,1)
+// means a proper crossing. Null for parallels. Same math as walls.js's private
+// segIntersect, which stays untouched on purpose — the walls module is the
+// replay-regression surface and this copy exists so guidance reachability
+// (server.js guideBlocked) does not have to reach into it.
+function segIntersect2D(a1, b1, a2, b2) {
+  const d1 = [b1[0] - a1[0], b1[1] - a1[1]];
+  const d2 = [b2[0] - a2[0], b2[1] - a2[1]];
+  const cross = d1[0] * d2[1] - d1[1] * d2[0];
+  if (!cross) return null;
+  const ex = a2[0] - a1[0];
+  const ez = a2[1] - a1[1];
+  return {
+    t1: (ex * d2[1] - ez * d2[0]) / cross,
+    t2: (ex * d1[1] - ez * d1[0]) / cross,
+  };
+}
+
 // Where the pixels of one frame land in the next under camera *rotation* alone:
 // the homography K R Kinv, with R the rotation carrying the earlier camera's
 // axes onto the later one's. Translation is left out on purpose — it is the
@@ -529,7 +547,7 @@ if (typeof module !== 'undefined') {
   module.exports = {
     quatFromRvec, rvecFromQuat, quatMul, quatConj, quatNormalize, quatRotate,
     quatAngleDeg, quatMean, quatMedian, quatNudge, se3FromRvecTvec, se3Compose,
-    se3Invert, se3Identity, transformPoint, quatFromTo, solvePose,
+    se3Invert, se3Identity, transformPoint, segIntersect2D, quatFromTo, solvePose,
     matFromRvec, rvecFromMat, matMul3, mirrorRvecGuesses,
     tagPlaneAgreement, CLIP_PLANE_M, CLIP_PARALLEL_COS,
     rotationWarp, applyWarp,

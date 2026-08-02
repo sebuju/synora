@@ -15,9 +15,9 @@
 //
 // So this opens a real WebSocket, presents itself as a client, and sends the
 // journal's own pose messages back at the server verbatim. With `--watch` it
-// also connects as the viewer and reports what comes back: the anchor cloud, the
+// also connects as the viewer and reports what comes back: the landmark cloud, the
 // candidate clouds, the regions. Nothing is simulated and nothing is stubbed —
-// if this prints anchors, the live path builds anchors.
+// if this prints landmarks, the live path builds landmarks.
 //
 // **Point it at a throwaway server.** It drives the survey and the walls grid
 // with recorded data, and those write `markers.json` and `walls.json`. Start one
@@ -79,9 +79,9 @@ function startWatcher() {
       seen.landmarks++;
       last = msg;
       for (const c of msg.clients || []) {
-        if (!c.anchors?.length && !c.candidates?.length) continue;
+        if (!c.landmarks?.length && !c.candidates?.length) continue;
         const regions = (c.groups || []).filter((g) => g.n >= 2).length;
-        console.log(`  [viewer] client ${c.clientId}: ${c.anchors.length} anchor(s), `
+        console.log(`  [viewer] client ${c.clientId}: ${c.landmarks.length} landmark(s), `
           + `${c.candidates?.length ?? 0} candidate(s), ${regions} region card(s)`);
       }
     }
@@ -176,7 +176,7 @@ function feed() {
       sent++;
       if (sent % 200 === 0) {
         console.log(`  ${sent} report(s) sent · `
-          + `${lastSummary ? `${lastSummary.anchors} anchor(s), arc ${lastSummary.arc}°` : 'no summary yet'}`
+          + `${lastSummary ? `${lastSummary.landmarks} landmark(s), arc ${lastSummary.arc}°` : 'no summary yet'}`
           + (lastGuide ? ` · guide ${lastGuide.mode} (${lastGuide.n} corners at ${lastGuide.dist} m)` : ''));
       }
     }
@@ -194,7 +194,7 @@ function feed() {
     console.log(`quality: ${Object.entries(quality)
       .map(([k, v]) => `${k} ${v}`).join(', ') || 'none'}`);
     console.log(`server said: ${lastSummary
-      ? `${lastSummary.anchors} anchor(s) from ${lastSummary.tracks} live track(s), `
+      ? `${lastSummary.landmarks} landmark(s) from ${lastSummary.candidates} live candidate(s), `
         + `best arc ${lastSummary.arc}°`
       : 'nothing — no room-pose ever came back'}`);
     console.log(`guidance: closer ${guides.closer}, arc ${guides.arc}, `

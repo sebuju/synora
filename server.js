@@ -9,9 +9,11 @@ const { WebSocketServer } = require('ws');
 const qrcode = require('qrcode-terminal');
 const { createSurvey } = require('./survey.js');
 const { createWalls } = require('./walls.js');
-const { createLandmarks, landmarkGate } = require('./landmarks.js');
+const { createLandmarks, foundingDepth } = require('./landmarks.js');
 const { MIN_ARC_DEG: LANDMARK_MIN_ARC_DEG } = require('./public/landmark-math.js');
+const { segIntersect2D } = require('./public/pose-math.js');
 const { createDeviceRegistry, modelFromUa } = require('./devices.js');
+const { createSettings } = require('./settings.js');
 
 const PORT = Number(process.env.PORT) || 8443;
 // Where everything the server *writes* lives. Overridable because a second
@@ -23,6 +25,9 @@ const STATE_DIR = process.env.SYNORA_STATE_DIR || __dirname;
 const CERT_DIR = path.join(__dirname, 'certs');
 const RECORDINGS_DIR = path.join(STATE_DIR, 'recordings');
 const PUBLIC_DIR = path.join(__dirname, 'public');
+// One-off measurement rigs (in the spirit of /xr-probe, but not features at
+// all) live outside public/ so the app's own pages stay uncluttered by them.
+const EXPERIMENTS_DIR = path.join(__dirname, 'experiments');
 const FFMPEG = path.join(__dirname, 'tools', 'ffmpeg.exe');
 const AKVCAM_MANAGER = path.join(
   process.env.ProgramFiles || 'C:\\Program Files', 'AkVirtualCamera', 'x64', 'AkVCamManager.exe');
@@ -33,29 +38,22 @@ const VENDOR_DIR = path.join(PUBLIC_DIR, 'vendor');
 const MARKER_MAP_FILE = path.join(STATE_DIR, 'markers.json');
 const WALLS_FILE = path.join(STATE_DIR, 'walls.json');
 const DEVICES_FILE = path.join(STATE_DIR, 'devices.json');
-const POSE_SETTINGS_FILE = path.join(STATE_DIR, 'pose-settings.json');
+// Named for what it used to hold — the printed marker size, and nothing else.
+// Kept under the old name deliberately: it is where every existing install's
+// *measured* tag size is stored, and a rename would silently drop rooms back to
+// the 150 mm default with nothing anywhere saying so.
+const SETTINGS_FILE = path.join(STATE_DIR, 'pose-settings.json');
 const LOG_FILE = path.join(STATE_DIR, 'server.log');
 // What the capture pages are showing on their own screens, as they show it.
 // Separate from server.log on purpose: it is a transcript of one client's
 // overlay a few times a second, and interleaving that with the server's own
 // narration would bury both.
 const OVERLAY_FILE = path.join(STATE_DIR, 'overlay.log');
-// Physical marker edge length in meters — the outer edge of the black square,
-// not the sheet and not the quiet zone. Must match the printed size from
-// /markers, or every distance in the room frame scales by the same error.
-// Measured 142 mm on the printed set: a 150 mm marker sent through a printer's
-// "fit to page" comes back at about 95%, and nothing downstream can see the
-// difference — it just reports a room 5.6% too big, consistently enough to
-// look right. Changing it invalidates markers.json — the loader checks the
-// size the map was surveyed at and refuses a mismatch.
-// Settable from /markers, so this is the default rather than the value.
-const POSE_CONFIG = {
-  markerSizeM: 0.15,
-  dictionary: 'DICT_4X4_50',
-  // 10 Hz: more samples per second converges the survey and the jump gate
-  // faster; detection itself costs a client a few tens of ms per frame.
-  poseRateMs: 100,
-};
+// The tag family, which is not a setting: the printed sheets, the client
+// detector and cv-common.js all have to agree on it, and only one is ever
+// built. The measured things about a tag — its size, how often it is looked
+// for — live in the settings store below.
+const POSE_DICTIONARY = 'DICT_4X4_50';
 
 // Every device aligns its frames against this clock, so it must not step:
 // Windows resyncs the wall clock on its own schedule, and each client would
@@ -184,17 +182,33 @@ function serveApi(req, res, urlPath) {
 
   // /markers is a plain page, and the marker size it sets and renders at is the
   // room's only metric datum — so it rides a route rather than the WS protocol.
+  // Narrower than /api/settings on purpose: the printing page has no business
+  // being able to turn the pose journal off.
   if (urlPath === '/api/pose-config') {
     if (req.method === 'GET') {
-      sendJson(res, 200, { markerSizeM: POSE_CONFIG.markerSizeM });
+      sendJson(res, 200, { markerSizeM: settings.get('markerSizeM') });
     } else if (req.method === 'POST') {
       readJson(req, res, (body) => {
-        let out;
-        try {
-          out = applyMarkerSize(Number(body.markerSizeM));
-        } catch (err) {
-          out = { ok: false, error: err.message };
-        }
+        const out = applySettings({ markerSizeM: Number(body.markerSizeM) });
+        sendJson(res, out.ok ? 200 : 400, out.ok
+          ? { ok: true, markerSizeM: settings.get('markerSizeM'), changed: out.changed.length > 0 }
+          : out);
+      });
+    } else {
+      sendJson(res, 405, { ok: false, error: 'method not allowed' });
+    }
+    return true;
+  }
+
+  // Every setting, for anything without a dashboard open — a script, a curl, a
+  // second machine. The dashboard uses its own socket instead, so a change made
+  // anywhere reaches it without a poll.
+  if (urlPath === '/api/settings') {
+    if (req.method === 'GET') {
+      sendJson(res, 200, { ok: true, spec: settings.spec, values: settings.all() });
+    } else if (req.method === 'POST') {
+      readJson(req, res, (body) => {
+        const out = applySettings(body?.values ?? body);
         sendJson(res, out.ok ? 200 : 400, out);
       });
     } else {
@@ -293,9 +307,18 @@ function serveStatic(req, res) {
   if (urlPath === '/xr-probe') urlPath = '/xr-probe.html';
   if (urlPath === '/xr-client') urlPath = '/xr-client.html';
   if (urlPath === '/digital') urlPath = '/digital.html';
+  if (urlPath === '/audio-lab') urlPath = '/experiments/audio-lab.html';
 
-  const filePath = path.join(PUBLIC_DIR, path.normalize(urlPath));
-  if (!filePath.startsWith(PUBLIC_DIR)) {
+  // Experiment pages are served from their own folder; everything they share
+  // with the app (common.js, style.css) still comes from public/, so the
+  // rewrite maps the URL prefix to the folder rather than merging the trees.
+  let rootDir = PUBLIC_DIR;
+  if (urlPath.startsWith('/experiments/')) {
+    rootDir = EXPERIMENTS_DIR;
+    urlPath = urlPath.slice('/experiments'.length);
+  }
+  const filePath = path.join(rootDir, path.normalize(urlPath));
+  if (!filePath.startsWith(rootDir)) {
     res.writeHead(403);
     res.end('Forbidden');
     return;
@@ -349,6 +372,10 @@ const clients = new Map();
 const clientIdsByDevice = new Map();
 let nextClientId = 1;
 let viewerSocket = null;
+// /audio-lab pages (the acoustic ranging experiment). Not clients: no roster
+// tile, no recording, no pose — they only relay chirp parameters to each other
+// and journal their measurements.
+const audioLabSockets = new Set();
 
 // Everything log() prints also lands in server.log. Appended, not truncated:
 // `npm run dev` restarts on every file change, and truncating meant the log of
@@ -520,6 +547,7 @@ function closePoseJournal(ws) {
 }
 
 function journalPose(ws, entry) {
+  if (!settings.get('poseJournalEnabled')) return;
   if (!ws.poseJournal) {
     fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
     ws.poseJournalPath = path.join(RECORDINGS_DIR,
@@ -534,7 +562,7 @@ function journalPose(ws, entry) {
       at: Date.now(),
       clientId: ws.clientId,
       deviceId: ws.deviceId,
-      markerSizeM: POSE_CONFIG.markerSizeM,
+      markerSizeM: settings.get('markerSizeM'),
     })}\n`);
     log(`Pose journal started: ${path.relative(__dirname, ws.poseJournalPath)}`);
   }
@@ -568,38 +596,47 @@ function journalOverlay(ws, text) {
   overlayStream.write(`[${fmtDateTime(new Date())}] client ${ws.clientId}\n${body}\n\n`);
 }
 
+// The acoustic ranging experiment's journal (/audio-lab). One shared file per
+// server session rather than one per socket: the whole point of the experiment
+// is joining what the chirper emitted against what the listener heard, and two
+// files would put the join on the reader. Every line carries the sender's
+// deviceId and a server-clock stamp for exactly that join.
+let audioJournal = null;
+let audioJournalPath = null;
+let audioJournalLines = 0;
+
+function journalAudio(ws, entry) {
+  if (!entry || typeof entry !== 'object') return;
+  const line = JSON.stringify({ ...entry, deviceId: ws.deviceId, serverAt: serverNow() });
+  // Same stance as journalOverlay: the page is not trusted to size its own
+  // append. A measurement event is a handful of numbers, never this.
+  if (line.length > 8192) return;
+  if (!audioJournal) {
+    fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
+    audioJournalPath = path.join(RECORDINGS_DIR, `${fmtFileStamp(new Date())}_audiolab.jsonl`);
+    audioJournal = fs.createWriteStream(audioJournalPath);
+    audioJournal.write(`${JSON.stringify({ kind: 'meta', at: Date.now() })}\n`);
+    log(`Audio journal started: ${path.relative(__dirname, audioJournalPath)}`);
+  }
+  audioJournal.write(`${line}\n`);
+  audioJournalLines++;
+}
+
 // ---------------------------------------------------------------------------
+// Everything about this server a person is allowed to change, loaded before
+// anything that reads one. The printed marker size is the reason the store
+// exists: it is measured, not decided — a printer's "fit to page" silently
+// returns a 150 mm marker at ~142 mm and nothing downstream can tell, the room
+// simply comes out uniformly too big — so it has to be settable at runtime and
+// has to survive a restart. What each setting *does* is registered below, once
+// the things it does it to exist.
+const settings = createSettings({ file: SETTINGS_FILE, log });
+
 // Marker survey: turns per-tag camera-frame observations from the clients into
 // a persistent room-frame marker map and room-frame client poses.
-// The printed marker size is measured, not decided: a printer's "fit to page"
-// silently returns a 150 mm marker at ~142 mm, and nothing downstream can tell
-// — the room simply comes out uniformly too big. So it is settable from
-// /markers and persisted here, ahead of the survey that depends on it.
-function loadPoseSettings() {
-  let raw;
-  try {
-    raw = JSON.parse(fs.readFileSync(POSE_SETTINGS_FILE, 'utf8'));
-  } catch {
-    return;   // no settings yet — the defaults above stand
-  }
-  if (raw.markerSizeM > 0) POSE_CONFIG.markerSizeM = raw.markerSizeM;
-}
-
-function savePoseSettings() {
-  const tmp = `${POSE_SETTINGS_FILE}.tmp`;
-  try {
-    fs.writeFileSync(tmp, JSON.stringify({ markerSizeM: POSE_CONFIG.markerSizeM }, null, 1));
-    fs.renameSync(tmp, POSE_SETTINGS_FILE);
-  } catch (err) {
-    log(`Could not save pose settings: ${err.message}`);
-  }
-}
-
-loadPoseSettings();
-
 const survey = createSurvey({
   file: MARKER_MAP_FILE,
-  markerSizeM: POSE_CONFIG.markerSizeM,
+  markerSizeM: settings.get('markerSizeM'),
   log,
 });
 
@@ -608,7 +645,7 @@ const survey = createSurvey({
 // re-run any session through the identical code path.
 const walls = createWalls({
   file: WALLS_FILE,
-  markerSizeM: POSE_CONFIG.markerSizeM,
+  markerSizeM: settings.get('markerSizeM'),
   log,
 });
 
@@ -622,10 +659,16 @@ const walls = createWalls({
 // becomes the anchor, and a landmark-derived pose is never handed back for
 // survey maintenance. One bad feature must not be able to move the room datum.
 const landmarks = createLandmarks({ log });
-// Anchors accumulate silently and mostly do not accumulate at all, so this says
+// Master switch for the whole landmarking feature on the server side: off,
+// maintainLandmarks is a no-op, room-pose carries no landmark summary or
+// guidance, and no landmark push is scheduled. The client has its own toggle
+// (which is the one that saves the tracker's per-frame cost); this one protects
+// the server hot path even against clients still sending points.
+const landmarksOn = () => settings.get('landmarksEnabled');
+// Landmarks accumulate silently and mostly do not accumulate at all, so this says
 // why rather than leaving "no landmarks" to be told apart from "broken" by
 // guesswork. The number that matters is the widest viewing arc any one feature
-// has been seen through: anchors need *orbiting* motion, and a walk past
+// has been seen through: landmarks need *orbiting* motion, and a walk past
 // something never builds one however long it is in frame. Measured on recorded
 // sessions, normal walking reaches 3-9 deg against a 60 deg gate — so a report
 // that says `best arc 8 deg` is the feature working exactly as measured, and one
@@ -642,9 +685,9 @@ function logLandmarks(clientId) {
     .map(([k, v]) => `${k} ${v}`).join(', ') || 'none';
   const n = landmarks.count(clientId);
   const arc = c?.bestSpan ?? 0;
-  log(`Landmarks client ${clientId}: ${n} anchor(s) from ${c?.tracks ?? 0} track(s), `
+  log(`Landmarks client ${clientId}: ${n} landmark(s) from ${c?.tracks ?? 0} track(s), `
     + `best arc ${arc.toFixed(0)}°`
-    // The hint is for the case it explains, and only that one: once anchors are
+    // The hint is for the case it explains, and only that one: once landmarks are
     // forming, the arc is wide enough and saying so every five seconds is noise.
     + (n ? '' : ` (needs ${LANDMARK_MIN_ARC_DEG}° — orbit a region rather than walk past it)`)
     + `, ${s.observed} obs`
@@ -655,44 +698,92 @@ function logLandmarks(clientId) {
 }
 
 // One function for both pose paths, called with the entry after the survey has
-// had its say. It either feeds the map or draws on it, never both: a report
-// good enough to found anchors is a report that already has a tag-derived pose.
+// had its say. A report good enough to found landmarks is a report that already
+// has a tag-derived pose; on a tag-less 'tracked' frame the map is instead
+// *drawn on* — the solve cross-checks the ARCore-carried pose, and agreement
+// can rescue mapSafe (see below). Everything it writes onto entry.room happens
+// before journalPose and walls.handleReport, so it is journalled and replayed.
 function maintainLandmarks(ws, entry) {
+  if (!landmarksOn()) return;
   const { msg, room } = entry;
   const gen = msg.gen;
   if (!msg.points?.length || gen == null) return;
   // The XR page calls it `intrinsics`; /client calls it `intr`. Same thing.
   const intr = msg.intr ?? msg.intrinsics;
 
-  if (landmarkGate(entry)) {
+  // Depth trust accumulates from every tag sighting, before any founding
+  // decision — the verdict must be able to build on frames that found nothing.
+  if (entry.kind === 'xr-pose') landmarks.noteDepth(ws.clientId, gen, msg.tags);
+
+  const found = foundingDepth(entry);
+  if (found !== null) {
     // The raw fix, never a smoothed one: feeding a filter's output into the map
     // that produced it lets the two agree with each other instead of with the
     // room. Both pose paths report the fix they maintain the survey from.
-    landmarks.observe(ws.clientId, msg.points, gen, room.pose, intr);
-    // Pushed whenever the map was fed, not only when an anchor appeared. The
+    landmarks.observe(ws.clientId, msg.points, gen, room.pose, intr, found);
+    // Pushed whenever the map was fed, not only when a landmark appeared. The
     // message carries the *candidates* too, and those move continuously while
-    // anchors arrive minutes apart — measured, a 608-report walk produced five
+    // landmarks arrive minutes apart — measured, a 608-report walk produced five
     // pushes, so the candidate cloud and the region cards sat frozen on screen
     // between them while the phone's own guidance updated ten times a second.
     // The push is debounced to 1 Hz, so this costs one snapshot a second while
     // a client is reporting and nothing at all when none is.
     scheduleLandmarkPush();
     logLandmarks(ws.clientId);
+    // Depth 0 is a tag-confirmed frame — nothing to cross-check against.
+    // Depth 1 is an alignFresh-carried frame, which is also exactly the
+    // cross-check's frame: fall through so the same report both feeds the map
+    // and (once enough landmarks exist) confirms the carried pose.
+    if (found === 0) return;
+  }
+
+  // ARCore carrying a tag-less frame: the one place the solve runs constantly
+  // (measured before this existed: 0 landmark fixes across 33 sessions,
+  // because the fallback below only fired with no pose at all). The whole
+  // decision lives in landmarks.check() so replay-landmarks replays it
+  // verbatim; this side only logs and schedules the push.
+  if (entry.kind === 'xr-pose' && room.pose && room.quality === 'tracked') {
+    const r = landmarks.check(ws.clientId, entry);
+    if (r) {
+      logLandmarkCheck(ws.clientId, r.dp, r.deg, r.fix, r.agrees);
+      if (r.chained) scheduleLandmarkPush();
+    }
     return;
   }
-  // No usable tag fix this frame. This is the whole feature: the tags are out
-  // of view and the anchors collected while they were visible carry the pose.
-  // Anything the survey could still report for itself is left alone — a
-  // landmark fix is a last resort, below dead reckoning's first second.
+
+  // No usable tag fix and no carried pose. This is the last resort: the tags
+  // are out of view and the landmarks collected while they were visible carry
+  // the pose. Anything the survey could still report for itself is left alone —
+  // a landmark fix sits below dead reckoning's first second.
   if (room.pose && room.quality !== 'dead') return;
   const fix = landmarks.solve(ws.clientId, msg.points, gen, intr, room.pose);
   if (!fix) return;
   room.pose = fix.pose;
   room.quality = 'landmark';
   // Not survey-quarantined and not tag-derived, so it must never become
-  // permanent evidence anywhere: walls reads exactly this flag.
+  // permanent evidence anywhere: walls reads exactly this flag. The rescue
+  // above does not apply — with no carried pose there is nothing independent
+  // to agree with.
   room.mapSafe = false;
   room.landmarks = { n: fix.n, inliers: fix.inliers, rms: Math.round(fix.rms * 100) / 100 };
+}
+
+// The cross-check's own log, throttled like logLandmarks — except a
+// disagreement past the gate, which is evidence ARCore has drifted and is
+// worth saying every time it starts.
+const LANDMARK_CHECK_LOG_MS = 5000;
+let lastLandmarkCheckLog = 0;
+let lastCheckAgreed = true;
+
+function logLandmarkCheck(clientId, dp, deg, fix, agrees) {
+  const flip = agrees !== lastCheckAgreed;
+  lastCheckAgreed = agrees;
+  if (!flip && Date.now() - lastLandmarkCheckLog < LANDMARK_CHECK_LOG_MS) return;
+  lastLandmarkCheckLog = Date.now();
+  const line = `Landmark check client ${clientId}: ${agrees ? 'agrees' : 'DISAGREES'} `
+    + `dp ${(dp * 1000).toFixed(0)} mm, ${deg.toFixed(1)}°, `
+    + `${fix.inliers} inlier(s), rms ${fix.rms.toFixed(2)} px`;
+  log(agrees ? line : `${line} — the carried pose has drifted off the landmark map`);
 }
 
 // Debounced full-snapshot push: the grid takes evidence at 10 Hz per client
@@ -707,10 +798,28 @@ let lastWallsLog = 0;
 // everything already watching it. Built in one place so a newly connected
 // viewer and a mid-session push can never describe the grid differently.
 function wallsMessages() {
+  const segs = walls.getWalls();
+  // Guidance reachability reads the same emitted set, refreshed here because
+  // this already runs at the 1 Hz walls cadence — walls.js is clock-free and
+  // getWalls() is far too expensive for guide()'s 10 Hz question.
+  guideSegs = segs;
   return [
     { type: 'floor', ...walls.getFloor() },
-    { type: 'walls', walls: walls.getWalls() },
+    { type: 'walls', walls: segs },
   ];
+}
+
+// A guide target whose line of sight from the camera crosses an emitted wall
+// is a target in another room: filtering those is what stops the guidance
+// asking for a walk through the [2 6] wall (it scored candidates on straight-
+// line distance alone). Proper crossings only — an endpoint brushing a wall is
+// the target being mounted on it.
+let guideSegs = [];
+function guideBlocked(a, b) {
+  return guideSegs.some((g) => {
+    const hit = segIntersect2D(a, b, g.a, g.b);
+    return !!hit && hit.t1 > 0 && hit.t1 < 1 && hit.t2 > 0 && hit.t2 < 1;
+  });
 }
 
 function sendWalls(ws) {
@@ -721,10 +830,10 @@ function broadcastWalls() {
   for (const m of wallsMessages()) sendRoom(m, { bulk: true });
 }
 
-// The anchor cloud, per client. Debounced for the same reason the grid is: it
+// The landmark cloud, per client. Debounced for the same reason the grid is: it
 // grows a few points at a time at 10 Hz and the viewer only needs to see it
 // settle. Sent whole rather than diffed — a few hundred triples is cheaper to
-// resend than to reconcile, and a client whose anchors were dropped has to be
+// resend than to reconcile, and a client whose landmarks were dropped has to be
 // able to say so by sending fewer.
 const LANDMARK_PUSH_MS = 1000;
 let landmarkPushTimer = null;
@@ -740,15 +849,21 @@ function landmarkMessage() {
       //
       // Rounded to the millimetre: this goes to the phone as well as the
       // dashboard, once a second, and full float precision more than doubles
-      // it for digits no one can see on a 2 px dot.
-      anchors: landmarks.forClient(clientId)
-        .map((a) => a.p.map((v) => Math.round(v * 1000) / 1000)),
+      // it for digits no one can see on a 2 px dot. The fourth element is
+      // the grade (1 = solve-grade, 0 = coarse consensus) and the fifth the
+      // region the point belongs to, so a hovered region card can light its
+      // own points rather than its client's whole cloud. Both appended rather
+      // than restructured, so the views' triple indexing stays valid.
+      landmarks: landmarks.forClient(clientId)
+        .map((a) => [
+          ...a.p.map((v) => Math.round(v * 1000) / 1000), a.solid ? 1 : 0, a.group,
+        ]),
       // The same cloud as regions rather than points, for the drawer. Tiny
-      // beside the anchor list and it is what a person can actually read.
+      // beside the landmark list and it is what a person can actually read.
       groups: landmarks.groups(clientId),
       // The tracks that have not qualified, with the arc each has reached. Sent
       // alongside rather than folded in: they are a different claim entirely —
-      // an anchor is a point the room has been shown to contain, a candidate is
+      // a landmark is a point the room has been shown to contain, a candidate is
       // one feature's current guess — and the renderers draw them as such.
       candidates: landmarks.candidates(clientId),
     })),
@@ -794,19 +909,15 @@ function scheduleWallsPush() {
 // identity back.
 const registry = createDeviceRegistry({ file: DEVICES_FILE, log });
 
-// Changing the marker size rescales the room, so the survey goes with it:
-// every tag position was measured in the old scale and a mixture of the two is
-// worse than either.
-const MARKER_SIZE_MIN_M = 0.02;
-const MARKER_SIZE_MAX_M = 1;
-
-function applyMarkerSize(m) {
-  if (!(m >= MARKER_SIZE_MIN_M && m <= MARKER_SIZE_MAX_M)) {
-    return { ok: false, error: `marker size must be ${MARKER_SIZE_MIN_M}-${MARKER_SIZE_MAX_M} m` };
-  }
-  if (m === POSE_CONFIG.markerSizeM) return { ok: true, markerSizeM: m, changed: false };
-  POSE_CONFIG.markerSizeM = m;
-  savePoseSettings();
+// What each setting does, wired up now that everything it acts on exists. The
+// store validated and persisted the value before any of these ran; all that is
+// left here is the effect, and every effect is the same call some other path
+// already makes for the same reason (a wipe, a re-push, a broadcast).
+//
+// Changing the marker size rescales the room, so the survey goes with it: every
+// tag position was measured in the old scale and a mixture of the two is worse
+// than either.
+settings.on('markerSizeM', (m) => {
   survey.setMarkerSize(m);
   // The grid was carved in the old scale; a rescaled room invalidates it the
   // same way it invalidates the survey.
@@ -817,13 +928,84 @@ function applyMarkerSize(m) {
   // no version of them worth rescaling — they cost seconds to collect again.
   landmarks.reset();
   broadcastLandmarks();
-  // Clients scale every distance they report by this, so none may keep the
-  // old value for even one more pose message.
-  for (const client of clients.values()) {
-    send(client, { type: 'pose-config', ...POSE_CONFIG });
-  }
+  broadcastPoseConfig();
   sendRoom({ type: 'marker-map', ...survey.getMarkerMap() });
-  return { ok: true, markerSizeM: m, changed: true };
+  log(`Marker size set to ${(m * 1000).toFixed(0)} mm — survey, carve and landmarks reset`);
+});
+
+settings.on('poseRateMs', (ms) => {
+  broadcastPoseConfig();
+  log(`Detection interval set to ${ms} ms`);
+});
+
+// Off means forgotten, not merely frozen: the anchors already on the dashboard
+// would otherwise sit there being drawn for the rest of the session with
+// nothing left to update or contradict them.
+settings.on('landmarksEnabled', (on) => {
+  if (!on) {
+    landmarks.reset();
+    broadcastLandmarks();
+  }
+  log(`Landmarks ${on ? 'enabled' : 'disabled'}`);
+});
+
+// The grid is deliberately kept — it is measured evidence of the room, and the
+// wipe that throws it away is its own control in the dashboard.
+settings.on('wallsEnabled', (on) => log(`Wall carving ${on ? 'enabled' : 'disabled'}`));
+
+// Close what is open rather than leaving half-written files behind: a journal
+// is read by the replay tools, and one that simply stops mid-session with no
+// end is indistinguishable from a server that crashed.
+settings.on('poseJournalEnabled', (on) => {
+  if (!on) for (const client of clients.values()) closePoseJournal(client);
+  log(`Pose journal ${on ? 'enabled' : 'disabled'}`);
+});
+
+// What a capture client has to be told about the room's tags. Assembled here
+// rather than stored, so there is no second copy of the marker size to fall out
+// of step with the store.
+function poseConfigMessage() {
+  return {
+    type: 'pose-config',
+    markerSizeM: settings.get('markerSizeM'),
+    dictionary: POSE_DICTIONARY,
+    poseRateMs: settings.get('poseRateMs'),
+  };
+}
+
+// Clients scale every distance they report by the marker size and pace their
+// detection by the interval, so none may keep an old value for even one more
+// pose message.
+function broadcastPoseConfig() {
+  for (const client of clients.values()) send(client, poseConfigMessage());
+}
+
+// The dashboard renders the settings form from the schema, so it never has to
+// know what settings exist — a new one in settings.js appears in the drawer
+// with no viewer change at all. `out` is the outcome of the attempt that
+// prompted the message, absent when nothing prompted it (the initial push).
+function settingsMessage(out = null) {
+  return {
+    type: 'settings',
+    spec: settings.spec,
+    values: settings.all(),
+    error: out && !out.ok ? out.error : null,
+    changed: out?.changed ?? [],
+  };
+}
+
+// The one way in, whichever door was used: the dashboard's socket and the
+// /markers page's HTTP route both land here.
+//
+// The dashboard is told the outcome whether or not it was the one that asked —
+// a size applied from the printing page has to be on screen at once rather than
+// at the next reload, and a value the store *refused* has to reach the form
+// that offered it, since nothing in the drawer is optimistic and the field
+// would otherwise sit showing a number the server never took.
+function applySettings(patch, asker = null) {
+  const out = settings.set(patch);
+  if (out.changed?.length || asker === viewerSocket) send(viewerSocket, settingsMessage(out));
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -946,7 +1128,7 @@ function handleSignal(ws, msg) {
       send(ws, { type: 'client-id', clientId: ws.clientId });
       // The printed marker size is the server's to declare — a client assuming
       // a different size would scale every distance it reports.
-      send(ws, { type: 'pose-config', ...POSE_CONFIG });
+      send(ws, poseConfigMessage());
       if (viewerSocket) send(ws, { type: 'viewer-ready' });
     } else if (msg.role === 'client-bulk') {
       // A client's second socket, carrying only bulk binary (recorder chunks)
@@ -956,6 +1138,11 @@ function handleSignal(ws, msg) {
       ws.role = 'client-bulk';
       ws.clientId = clientIdFor(msg.deviceId);
       ws.deviceId = msg.deviceId;
+    } else if (msg.role === 'audio-lab') {
+      ws.role = 'audio-lab';
+      ws.deviceId = msg.deviceId;
+      audioLabSockets.add(ws);
+      log(`Audio lab connected (${audioLabSockets.size} total)`);
     } else if (msg.role === 'viewer') {
       if (viewerSocket && viewerSocket !== ws) {
         // Told, not merely closed. A displaced dashboard sees an ordinary
@@ -976,6 +1163,7 @@ function handleSignal(ws, msg) {
       // id it is streaming to, so leave that case alone.
       if (!vcamDeviceId) detectVcam();
       send(ws, { type: 'vcam-state', clientId: vcamClientId, available: !!vcamDeviceId });
+      send(ws, settingsMessage());
       send(ws, { type: 'marker-map', ...survey.getMarkerMap() });
       sendWalls(ws);
       send(ws, landmarkMessage());
@@ -1007,6 +1195,14 @@ function handleSignal(ws, msg) {
         // its screen it gives it. Anything but these two is off — the value is
         // also what decides whether the room messages are sent at all.
         map: msg.map === 'split' || msg.map === 'full' ? msg.map : 'off',
+        // XR only: whether landmark collection is on (the client's own toggle
+        // — the tracker cost lives on the phone, so the phone owns the switch).
+        landmarks: msg.landmarks === undefined ? null : !!msg.landmarks,
+        // WebXR features the session actually granted, as reconnaissance —
+        // string-filtered and capped because this rides to the dashboard.
+        xrFeatures: Array.isArray(msg.xrFeatures)
+          ? msg.xrFeatures.filter((f) => typeof f === 'string').slice(0, 16)
+          : null,
       };
       // The XR client shares a browser, and therefore a deviceId, with /client
       // on the same phone. It has no mic, no recorder and no resolution to
@@ -1063,6 +1259,22 @@ function handleSignal(ws, msg) {
     if (ws.role === 'client') openRecording(ws);
     return;
   }
+  // Audio-lab coordination, fanned to the other audio-lab pages verbatim:
+  // chirp-params keeps a listener's matched filter tuned to the chirp actually
+  // in the air (the sweep changes it every few seconds), range-round announces
+  // a ranging exchange, range-report carries each side's two chirp timestamps
+  // — the BeepBeep math needs both and each device only measures its own.
+  if (msg.type === 'chirp-params' || msg.type === 'range-round' || msg.type === 'range-report'
+    || msg.type === 'beacon-params') {
+    if (ws.role === 'audio-lab') {
+      for (const other of audioLabSockets) if (other !== ws) send(other, msg);
+    }
+    return;
+  }
+  if (msg.type === 'audio-log') {
+    if (ws.role === 'audio-lab') journalAudio(ws, msg.entry);
+    return;
+  }
   if (msg.type === 'ping') {
     // Liveness probe: clients treat an unanswered ping as a dead socket. The
     // reply carries viewer presence so a client that missed a viewer-ready
@@ -1106,12 +1318,16 @@ function handleSignal(ws, msg) {
     }
     return;
   }
+  if (msg.type === 'settings-set') {
+    if (ws.role === 'viewer') applySettings(msg.values, ws);
+    return;
+  }
   if (msg.type === 'marker-remove') {
     if (ws.role === 'viewer' && Number.isInteger(msg.id)) {
       survey.removeMarker(msg.id);
       const map = survey.getMarkerMap();
       sendRoom({ type: 'marker-map', ...map });
-      // Removing the anchor resets the survey; the grid and the anchors were
+      // Removing the anchor resets the survey; the grid and the landmarks were
       // measured in that room frame and must not survive into the next one.
       if (map.anchorId == null) {
         walls.reset();
@@ -1175,7 +1391,7 @@ function handleSignal(ws, msg) {
     if (ws.role === 'client') {
       // ARCore already knows where the camera is; the tags only say where the
       // room is relative to ARCore's frame.
-      const { pose, rawPose, quality, mapChanged, jitter, mapSafe } =
+      const { pose, rawPose, quality, mapChanged, jitter, mapSafe, quarantined } =
         survey.alignXr(ws.clientId, msg.xr, msg.tags || [], msg.sid ?? null, msg.intrinsics,
           msg.source, msg.xrNow ?? null);
       // One entry object for both consumers: the journal records it and the
@@ -1190,7 +1406,11 @@ function handleSignal(ws, msg) {
       // object, so nothing has to know which path it is on.
       const entry = {
         kind: 'xr-pose', at: Date.now(), msg,
-        room: { pose: rawPose ?? pose, quality, jitter, mapSafe }, mapChanged,
+        // `quarantined` distinguishes "mapSafe false because the alignment is
+        // stale" (rescuable by a landmark confirmation) from "the room frame
+        // itself is in doubt" (never rescuable). Journalled so replays can
+        // reproduce the rescue decision.
+        room: { pose: rawPose ?? pose, quality, jitter, mapSafe, quarantined }, mapChanged,
       };
       // Before the journal and every send, so that what is recorded and what is
       // shown are the pose actually being reported. It only ever fills in where
@@ -1212,18 +1432,20 @@ function handleSignal(ws, msg) {
       // own pose and the room pose, and only this side has both.
       send(ws, {
         type: 'room-pose', pose: shown.pose, quality: shown.quality, jitter,
-        landmarks: landmarks.summary(ws.clientId),
+        landmarks: landmarksOn() ? landmarks.summary(ws.clientId) : null,
         // Where to walk next, for the phone's own map and overlay. Computed
         // here rather than on the client for the same reason every other
         // room-frame answer is: the client knows nothing about the room, and
         // the arc this is derived from is measured in it.
-        guide: entry.room.pose ? landmarks.guide(ws.clientId, entry.room.pose) : null });
+        guide: landmarksOn() && entry.room.pose
+          ? landmarks.guide(ws.clientId, entry.room.pose, { blocked: guideBlocked })
+          : null });
       if (mapChanged) {
         const map = survey.getMarkerMap();
         sendRoom({ type: 'marker-map', ...map });
         walls.setMarkerMap(map);
       }
-      if (walls.handleReport(entry)) scheduleWallsPush();
+      if (settings.get('wallsEnabled') && walls.handleReport(entry)) scheduleWallsPush();
     }
     return;
   }
@@ -1244,13 +1466,13 @@ function handleSignal(ws, msg) {
       // here) — reflect it back for the on-client stats overlay.
       send(ws, {
         type: 'room-pose', pose: entry.room.pose, quality: entry.room.quality,
-        landmarks: landmarks.summary(ws.clientId) });
+        landmarks: landmarksOn() ? landmarks.summary(ws.clientId) : null });
       if (mapChanged) {
         const map = survey.getMarkerMap();
         sendRoom({ type: 'marker-map', ...map });
         walls.setMarkerMap(map);
       }
-      if (walls.handleReport(entry)) scheduleWallsPush();
+      if (settings.get('wallsEnabled') && walls.handleReport(entry)) scheduleWallsPush();
     }
     return;
   }
@@ -1317,7 +1539,7 @@ function main() {
         if (clients.get(ws.clientId) !== ws) return;
         clients.delete(ws.clientId);
         // Track ids are meaningful only inside one tracker generation, and a
-        // reconnecting client starts a new one. Holding the old anchors would
+        // reconnecting client starts a new one. Holding the old landmarks would
         // at best waste memory and at worst fuse two different features under
         // one id before the generation change is noticed.
         landmarks.reset(ws.clientId);
@@ -1333,6 +1555,9 @@ function main() {
       } else if (ws === viewerSocket) {
         viewerSocket = null;
         log('Viewer disconnected');
+      } else if (ws.role === 'audio-lab') {
+        audioLabSockets.delete(ws);
+        log(`Audio lab disconnected (${audioLabSockets.size} total)`);
       }
     });
 

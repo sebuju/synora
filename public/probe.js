@@ -2,7 +2,7 @@
 
 // Landmark feasibility probe. Not part of the product: this page exists to
 // answer one question offline, against recordings already on disk, before any
-// landmark pipeline is written — is a detected object's anchor point a fixed 3D
+// landmark pipeline is written — is a detected object's landmark point a fixed 3D
 // point at all, and how wide a viewing arc does it take to tell?
 //
 // It reuses the real detector (detect-core.js) and the real transform maths
@@ -69,8 +69,8 @@ let bitmap = null;            // decoded frame on screen; owned here, closed on 
 let autoTracks = null;        // id -> [{ t, u, v, w, h, pose }] from autoCollect
 let autoVerdict = new Map();  // id -> { ok, P } so the overlay can show both
 let framePose = [];           // frame index -> tag-solved camera pose, or null
-let anchorMap = [];           // qualified anchors + descriptors, from this session
-let loadedMap = null;         // an anchor map from a *different* session, for M6
+let landmarkMap = [];           // qualified landmarks + descriptors, from this session
+let loadedMap = null;         // a landmark map from a *different* session, for M6
 
 function status(msg) {
   els.status.textContent = msg;
@@ -422,10 +422,10 @@ function compute() {
 }
 
 // ---------------------------------------------------------------------------
-// Automatic anchor collection.
+// Automatic landmark collection.
 //
 // This is the point of the whole exercise: hand-labelling was only ever
-// scaffolding to find out whether a landmark's anchor point is a fixed 3D point
+// scaffolding to find out whether a landmark's landmark point is a fixed 3D point
 // before committing to a detector. It is, so the clicking can go.
 //
 // Note what this deliberately does NOT do: detect objects. M1 showed the failure
@@ -448,11 +448,11 @@ function compute() {
 // build, so a descriptor cannot be computed at an arbitrary point — ORB has to
 // pick its own keypoints and each track then adopts the nearest one. That is
 // also the honest arrangement: at relocalization time ORB will again pick its
-// own keypoints, so an anchor described at a location ORB does not naturally
+// own keypoints, so a landmark described at a location ORB does not naturally
 // choose could never be matched.
 const ORB_FEATURES = 1200;
 const ORB_ASSOC_PX = 4;
-const DESC_PER_ANCHOR = 12;    // kept per anchor, spread across the arc
+const DESC_PER_ANCHOR = 12;    // kept per landmark, spread across the arc
 const MATCH_RATIO = 0.75;      // Lowe ratio
 const RELOC_MIN_MATCHES = 6;
 
@@ -564,22 +564,22 @@ async function autoCollect() {
   }
 
   // Several tracks often sit on one physical feature, so a raw count overstates
-  // how many anchors the room actually gained.
+  // how many landmarks the room actually gained.
   const good = judged.filter((j) => j.ok).sort((a, b) => a.last - b.last);
-  const clusters = clusterAnchors(good);
+  const clusters = clusterLandmarks(good);
 
   orb.delete();
   autoTracks = tracks;
   for (const j of judged) autoVerdict.set(j.id, { ok: j.ok, P: j.P });
   // The saveable map: a qualified 3D point plus the descriptors that were seen
-  // sitting on it. Anchors with no descriptor are useless for relocalization
+  // sitting on it. Landmarks with no descriptor are useless for relocalization
   // however good their geometry — they can never be found again.
-  anchorMap = good
+  landmarkMap = good
     .filter((j) => descs.get(j.id)?.length)
     .map((j) => ({ P: j.P, n: j.n, span: j.span, desc: descs.get(j.id).map((d) => [...d]) }));
   // Exposed so a scripted run can hand the map straight to a second session
   // without a download-and-repick round trip. Diagnostics only.
-  self.__anchorMap = anchorMap;
+  self.__landmarkMap = landmarkMap;
   draw();
 
   const out = [];
@@ -589,13 +589,13 @@ async function autoCollect() {
   out.push(`  arc too narrow      ${tooNarrow}   (< ${minArc}°)`);
   out.push(`  judgeable           ${judged.length}`);
   out.push(`  QUALIFIED           ${good.length}`);
-  out.push(`  distinct anchors    ${clusters.length}   (within ${CLUSTER_M * 1000} mm merged)`);
+  out.push(`  distinct landmarks  ${clusters.length}   (within ${CLUSTER_M * 1000} mm merged)`);
   out.push('');
   if (!judged.length) {
     out.push('Nothing was judgeable. Either too few frames carried a camera pose,');
     out.push('or the walk did not swing far enough around anything.');
   } else {
-    out.push('top anchors by split-arc agreement:');
+    out.push('top landmarks by split-arc agreement:');
     out.push('   n   arc    rng     rms      narrow -> widest        position');
     for (const j of clusters.slice(0, 15)) {
       const b = j[0];
@@ -617,13 +617,13 @@ async function autoCollect() {
     }
   }
   els.out.textContent = out.join('\n');
-  status(`auto-collect done · ${clusters.length} distinct anchors from ${tracks.size} tracks`);
+  status(`auto-collect done · ${clusters.length} distinct landmarks from ${tracks.size} tracks`);
 }
 
 // ---------------------------------------------------------------------------
 // M6: re-identification. Everything up to here rides on LK, which hands over
 // correspondence for free as long as the feature never leaves the frame. That
-// says nothing about walking back in tomorrow. Here the anchors come from a
+// says nothing about walking back in tomorrow. Here the landmarks come from a
 // *different session* and the only link is the descriptor: ORB picks its own
 // keypoints in the new frames, matches them against the stored map, and
 // solvePnPRansac has to recover a pose from whatever survives.
@@ -632,11 +632,11 @@ async function autoCollect() {
 // the solve — they only say where the camera actually was.
 
 async function relocalizeM6() {
-  if (!loadedMap?.length) { status('load an anchor map first'); return; }
+  if (!loadedMap?.length) { status('load a landmark map first'); return; }
   if (!shots.length || !core?.ready) { status('load frames first'); return; }
   const cv = core.cv;
 
-  // One train matrix of every stored descriptor, plus a row -> anchor index map.
+  // One train matrix of every stored descriptor, plus a row -> landmark index map.
   const rows = [];
   const owner = [];
   loadedMap.forEach((a, ai) => {
@@ -669,7 +669,7 @@ async function relocalizeM6() {
     const kp = new cv.KeyPointVector();
     const dsc = new cv.Mat();
     orb.detectAndCompute(gray, new cv.Mat(), kp, dsc);
-    const pairs = new Map();   // anchor index -> best 2D point for it
+    const pairs = new Map();   // landmark index -> best 2D point for it
     if (dsc.rows) {
       const mv = new cv.DMatchVectorVector();
       matcher.knnMatch(dsc, train, mv, 2);
@@ -679,8 +679,8 @@ async function relocalizeM6() {
         const a = pair.get(0);
         const b = pair.get(1);
         // Lowe's ratio against the *second* neighbour. Several descriptors can
-        // belong to one anchor, so a tie between two views of the same anchor
-        // is not ambiguity — compare only across different anchors.
+        // belong to one landmark, so a tie between two views of the same landmark
+        // is not ambiguity — compare only across different landmarks.
         if (owner[a.trainIdx] !== owner[b.trainIdx] && a.distance < MATCH_RATIO * b.distance) {
           const ai = owner[a.trainIdx];
           const prev = pairs.get(ai);
@@ -697,8 +697,8 @@ async function relocalizeM6() {
     dsc.delete();
     gray.delete();
 
-    // How many anchors were geometrically in shot at all, from the tag pose.
-    // Without this a low match rate is unreadable: an anchor that was never in
+    // How many landmarks were geometrically in shot at all, from the tag pose.
+    // Without this a low match rate is unreadable: a landmark that was never in
     // frame cannot be matched, and a map built on one object is out of view for
     // most of a walk through the flat. This is the ceiling the matcher is
     // actually competing against.
@@ -755,13 +755,13 @@ async function relocalizeM6() {
   const pcs = (arr, p) => arr.slice().sort((a, b) => a - b)[Math.floor((arr.length - 1) * p)];
   const out = [];
   out.push('M6 — re-identification across sessions');
-  out.push('   anchors come from a different recording; the only link is the ORB');
+  out.push('   landmarks come from a different recording; the only link is the ORB');
   out.push('   descriptor. Tags supply the reference pose only, never the solve.');
   out.push('');
   const couldSee = res.filter((r) => r.visible >= RELOC_MIN_MATCHES);
-  out.push(`anchors in map     ${loadedMap.length}  (${rows.length} descriptors)`);
+  out.push(`landmarks in map     ${loadedMap.length}  (${rows.length} descriptors)`);
   out.push(`frames with a tag pose  ${posed}`);
-  out.push(`  of those, frames where ≥${RELOC_MIN_MATCHES} anchors were actually in shot: `
+  out.push(`  of those, frames where ≥${RELOC_MIN_MATCHES} landmarks were actually in shot: `
     + `${couldSee.length}   <- the ceiling`);
   out.push(`frames with ≥${RELOC_MIN_MATCHES} matches   ${res.filter((r) => r.matches >= RELOC_MIN_MATCHES).length}`);
   out.push(`RANSAC returned a pose  ${solved.length}`);
@@ -778,7 +778,7 @@ async function relocalizeM6() {
   if (solved.length) {
     const dp = solved.map((r) => r.dp);
     out.push(`position error   median ${pcs(dp, 0.5).toFixed(0)} mm · p90 ${pcs(dp, 0.9).toFixed(0)} mm`);
-    out.push(`matched anchors  median ${pcs(solved.map((r) => r.matches), 0.5)} per frame`);
+    out.push(`matched landmarks  median ${pcs(solved.map((r) => r.matches), 0.5)} per frame`);
     if (good.length) {
       const g = good.map((r) => r.dp);
       out.push(`among the ${good.length} plausible fixes: median ${pcs(g, 0.5).toFixed(0)} mm · `
@@ -793,11 +793,11 @@ async function relocalizeM6() {
 }
 
 // ---------------------------------------------------------------------------
-// M3: can a camera localize on the collected anchors with the tags withheld?
+// M3: can a camera localize on the collected landmarks with the tags withheld?
 //
-// The holdout has to be real. Anchors are triangulated *from* tag-solved camera
-// poses, so building and testing on the same frames asks whether the anchors
-// agree with the poses that created them — which they trivially do. Anchors are
+// The holdout has to be real. Landmarks are triangulated *from* tag-solved camera
+// poses, so building and testing on the same frames asks whether the landmarks
+// agree with the poses that created them — which they trivially do. Landmarks are
 // therefore built from even frames only and tested on odd ones.
 //
 // Withholding tags does not mean withholding the tag *pose*: that is the
@@ -809,15 +809,15 @@ function holdoutM3() {
   const minObs = Math.max(4, Number(els.minObs.value) || 12);
   const minArc = Math.max(10, Number(els.minArc.value) || 60);
 
-  // ---- build anchors from even frames only --------------------------------
-  const anchors = new Map();
+  // ---- build landmarks from even frames only --------------------------------
+  const landmarks = new Map();
   for (const [id, obs] of autoTracks) {
     const build = obs.filter((o) => o.t % 2 === 0);
     const j = qualifyTrack(build, { minObs, minArcDeg: minArc });
-    if (j.ok) anchors.set(id, j.P);
+    if (j.ok) landmarks.set(id, j.P);
   }
 
-  // ---- localize each odd frame from those anchors alone -------------------
+  // ---- localize each odd frame from those landmarks alone -------------------
   const rows = [];
   let attempted = 0;
   for (let i = 1; i < shots.length; i += 2) {
@@ -826,7 +826,7 @@ function holdoutM3() {
     const objs = [];
     const imgs = [];
     let K = null;
-    for (const [id, P] of anchors) {
+    for (const [id, P] of landmarks) {
       const o = autoTracks.get(id).find((x) => x.t === i);
       if (!o) continue;
       K ??= o.K;
@@ -870,15 +870,15 @@ function holdoutM3() {
   // ---- report -------------------------------------------------------------
   const solved = rows.filter((r) => r.solved);
   const out = [];
-  out.push(`M3 — localization with tags withheld (holdout: anchors from even frames,`);
-  out.push(`     tested on odd frames, so no anchor was built from the frame it is tested on)`);
+  out.push(`M3 — localization with tags withheld (holdout: landmarks from even frames,`);
+  out.push(`     tested on odd frames, so no landmark was built from the frame it is tested on)`);
   out.push('');
-  out.push(`anchors built     ${anchors.size}`);
+  out.push(`landmarks built     ${landmarks.size}`);
   out.push(`test frames       ${attempted}`);
-  out.push(`solved            ${solved.length}   (needs ≥4 anchors in view)`);
+  out.push(`solved            ${solved.length}   (needs ≥4 landmarks in view)`);
   if (!solved.length) {
     out.push('');
-    out.push('Nothing solved. Either too few anchors survive on even frames alone,');
+    out.push('Nothing solved. Either too few landmarks survive on even frames alone,');
     out.push('or they are never 4-at-a-time in one odd frame.');
     els.out.textContent = out.join('\n');
     return;
@@ -893,8 +893,8 @@ function holdoutM3() {
 
   // The curve, not the verdict: how good the fix is given how much it had.
   out.push('');
-  out.push('as a function of how many anchors were in view:');
-  out.push('  anchors   n    median mm   median °');
+  out.push('as a function of how many landmarks were in view:');
+  out.push('  landmarks   n    median mm   median °');
   const buckets = [[4, 5], [6, 8], [9, 14], [15, 24], [25, 1e9]];
   for (const [lo, hi] of buckets) {
     const g = solved.filter((r) => r.n >= lo && r.n <= hi);
@@ -908,7 +908,7 @@ function holdoutM3() {
   out.push('');
   out.push(`gross failures (> 1 m): ${gross} of ${solved.length}`);
   els.out.textContent = out.join('\n');
-  status(`M3 done · median ${pcs(dp, 0.5).toFixed(0)} mm from ${anchors.size} anchors`);
+  status(`M3 done · median ${pcs(dp, 0.5).toFixed(0)} mm from ${landmarks.size} landmarks`);
 }
 
 // ---------------------------------------------------------------------------
@@ -1017,25 +1017,25 @@ document.getElementById('bAuto').onclick = () => {
   });
 };
 document.getElementById('bSaveMap').onclick = () => {
-  if (!anchorMap.length) { status('run auto-collect first'); return; }
-  const blob = new Blob([JSON.stringify({ anchors: anchorMap })], { type: 'application/json' });
+  if (!landmarkMap.length) { status('run auto-collect first'); return; }
+  const blob = new Blob([JSON.stringify({ anchors: landmarkMap })], { type: 'application/json' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = 'anchor-map.json';
+  a.download = 'landmark-map.json';
   a.click();
-  status(`saved ${anchorMap.length} anchors with `
-    + `${anchorMap.reduce((s, x) => s + x.desc.length, 0)} descriptors`);
+  status(`saved ${landmarkMap.length} landmarks with `
+    + `${landmarkMap.reduce((s, x) => s + x.desc.length, 0)} descriptors`);
 };
 
 els.fAnchors.addEventListener('change', async (ev) => {
   const f = ev.target.files[0];
   if (!f) return;
   try {
-    loadedMap = JSON.parse(await f.text()).anchors;
-    status(`anchor map loaded: ${loadedMap.length} anchors, `
+    loadedMap = JSON.parse(await f.text()).anchors;  // field name kept for old saved maps
+    status(`landmark map loaded: ${loadedMap.length} landmarks, `
       + `${loadedMap.reduce((s, x) => s + x.desc.length, 0)} descriptors`);
   } catch (err) {
-    status(`anchor map failed: ${err.message}`);
+    status(`landmark map failed: ${err.message}`);
   }
 });
 

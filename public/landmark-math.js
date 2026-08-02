@@ -21,7 +21,7 @@
 // collide with the global of the same name.
 const LM_PM = typeof require === 'function' ? require('./pose-math.js') : globalThis;
 
-// Two anchors closer than this are one physical feature seen under two ids, so
+// Two landmarks closer than this are one physical feature seen under two ids, so
 // a raw count overstates how many the room actually gained.
 const CLUSTER_M = 0.05;
 // Below this the split-arc test is noise-dominated and says nothing.
@@ -34,11 +34,11 @@ const MIN_OBS = 12;
 // either way. That is still true, and it is no longer the whole story — the
 // forward-backward check on the client now removes the drifting tracks upstream
 // (measured: 8.8% of tracks described a fixed point before it, 97% after), the
-// solve's RANSAC trims what still gets through, and a wrong anchor is dropped by
+// solve's RANSAC trims what still gets through, and a wrong landmark is dropped by
 // the staleness gate. The arc gate was carrying a load that has since been taken
 // off it.
 //
-// So it was swept end to end — anchors built from half a recorded walk, camera
+// So it was swept end to end — landmarks built from half a recorded walk, camera
 // localized from the other half with the tag pose withheld — across five
 // sessions:
 //
@@ -49,10 +49,10 @@ const MIN_OBS = 12;
 //   19:24      86 ·  56/267 · 31 mm     113 ·  57/267 · 58 mm     152 ·  57/267 · 45 mm
 //   23:28      21 ·  60/468 · 28 mm      55 · 106/468 · 29 mm      90 · 114/468 · 26 mm
 //
-// Anchor supply rises 1.3-2.7x, coverage rises or holds on every session, and
+// Landmark supply rises 1.3-2.7x, coverage rises or holds on every session, and
 // the median error is a wash — it moves both ways by ~15 mm, which is inside the
-// session-to-session spread. Supply is what is actually scarce: MIN_ANCHORS_FOR
-// _FIX is a cliff at 15, and the 23:28 walk had *21* anchors at 60 deg, so a
+// session-to-session spread. Supply is what is actually scarce: MIN_LANDMARKS_FOR
+// _FIX is a cliff at 15, and the 23:28 walk had *21* landmarks at 60 deg, so a
 // third of its map going missing was the difference between localizing 60 frames
 // and 106.
 //
@@ -63,7 +63,26 @@ const MIN_OBS = 12;
 //
 // In walking terms this is the difference that matters to whoever is holding the
 // phone: at 2 m, 60 deg is a 2.0 m sidestep and 40 deg is 1.37 m.
-const MIN_ARC_DEG = 40;
+//
+// Swept again (02/08/26) 40 vs 20, four sessions, after the guidance work made
+// clear the arc demand is what keeps the feature from firing at all on a
+// normal walk:
+//
+//   session   40 deg                     20 deg
+//   23:28      55 · 106/468 · 28 mm ·  371   125 · 114/468 · 26 mm · 247
+//   19:24     113 ·  60/267 · 59 mm ·  382   159 ·  60/267 · 47 mm · 263
+//   16:51     123 · 156/256 · 35 mm ·  165   177 · 229/256 · 36 mm · 249
+//   00:50      32 ·   0/144 ·  —    ·   —     41 ·   0/144 ·  —    ·  —
+//
+// Supply rises 28-127%, coverage rises or holds everywhere (156 -> 229 on
+// 16:51 is the count cliff being cleared), medians are a wash, and the worst
+// case moves both ways within the session spread. At 20 deg the split-arc test
+// itself is near its noise floor (a fixed point showed 62.9 mm of split at 16
+// deg), so below here the discrimination is genuinely the forward-backward
+// check + the RANSAC + the staleness gate — which is what the end-to-end
+// holdout above says they can carry. 20 deg at 2 m is a 0.70 m sidestep:
+// walking past something starts to qualify, which is the whole point.
+const MIN_ARC_DEG = 20;
 // The gap at the widest window must be this many times smaller than at the
 // narrowest. Measured separation: genuine points collapse ~35x, viewpoint-
 // dependent ones ~1.9x.
@@ -76,7 +95,7 @@ const SPLIT_COLLAPSE = 5;
 // test becomes 0 < 0/5 — which is how a noise-free synthetic check first caught
 // it, and which a low-noise track can approach in the room.
 const SPLIT_FLOOR_MM = 2;
-// Deliberately loose. A real anchor sat at 2.3-7.0 px and a bad one at 27.9 px
+// Deliberately loose. A real landmark sat at 2.3-7.0 px and a bad one at 27.9 px
 // and worse (up to 1422 px); this gate only rules out "no 3D point fits these
 // observations at all", the split-arc trend does the actual discriminating.
 const MAX_RMS_PX = 10;
@@ -93,7 +112,7 @@ const dist3 = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
 // calibration of a real client displaces the frame corner by ~14 px, and that
 // error is *viewpoint-correlated*, which is precisely the signature the
 // split-arc test exists to reject. Left uncorrected it would not announce
-// itself, it would quietly cost anchors near the frame edge.
+// itself, it would quietly cost landmarks near the frame edge.
 //
 // Returns the input unchanged when there is no distortion to remove, which is
 // also the offline probe's case: its intrinsics are fitted as a pure pinhole.
@@ -324,7 +343,7 @@ function qualifyTrack(obs, opts = {}) {
 // Fitting the whole set first and trimming what disagrees does not work here,
 // and the failure is worth recording: the first fit is dragged by the very
 // outliers it is meant to expose, so the residuals it is trimmed on are already
-// corrupted. Measured against cv.solvePnPRansac at 16 anchors with 15% of
+// corrupted. Measured against cv.solvePnPRansac at 16 landmarks with 15% of
 // tracks displaced, trim-from-a-full-fit gave a median of 69 mm where the
 // RANSAC gave 1 mm.
 //
@@ -402,18 +421,26 @@ function solveLandmarkPose(objPts, imgPts, K, seed, opts = {}) {
   const res = residualsUnder(bestPose);
   const obj = [];
   const img = [];
+  const inlierIdx = [];
   for (let i = 0; i < n; i++) {
-    if (res[i] <= trimPx) { obj.push(objPts[i]); img.push(imgPts[i]); }
+    if (res[i] <= trimPx) { obj.push(objPts[i]); img.push(imgPts[i]); inlierIdx.push(i); }
   }
   if (obj.length < minPoints) return null;
   const refined = LM_PM.solvePose(obj, img, K, bestPose) ?? bestPose;
-  return { ...refined, inliers: obj.length, n };
+  // Per-inlier residuals under the *refined* pose, not the hypothesis they were
+  // selected by — the caller weights rays by them, and the hypothesis residuals
+  // systematically flatter the subset that picked it.
+  const finalRes = residualsUnder(refined);
+  return {
+    ...refined, inliers: obj.length, n,
+    inlierIdx, inlierRes: inlierIdx.map((i) => finalRes[i]),
+  };
 }
 
 // Several tracks routinely sit on one physical feature, so a raw count
-// overstates the anchor supply. Greedy single-link at CLUSTER_M, taking the
+// overstates the landmark supply. Greedy single-link at CLUSTER_M, taking the
 // list in whatever order the caller ranked it.
-function clusterAnchors(list, m = CLUSTER_M) {
+function clusterLandmarks(list, m = CLUSTER_M) {
   const clusters = [];
   for (const j of list) {
     const hit = clusters.find((c) => dist3(c[0].P, j.P) < m);
@@ -425,7 +452,7 @@ function clusterAnchors(list, m = CLUSTER_M) {
 if (typeof module !== 'undefined') {
   module.exports = {
     undistort, rayOf, solve3, triangulate, reproject, azimuthOf, rms, dist3,
-    unwrapAzimuths, splitArc, qualifyTrack, clusterAnchors, solveLandmarkPose,
+    unwrapAzimuths, splitArc, qualifyTrack, clusterLandmarks, solveLandmarkPose,
     CLUSTER_M, MIN_OBS, MIN_ARC_DEG, SPLIT_COLLAPSE, SPLIT_FLOOR_MM, MAX_RMS_PX,
     TRIM_PX,
   };
