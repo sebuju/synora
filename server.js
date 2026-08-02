@@ -1123,6 +1123,16 @@ function handleSignal(ws, msg) {
     }
     return;
   }
+  // What one tag has been doing, for the drawer card the dashboard has open.
+  // Polled rather than pushed: only the open card wants it, it is hundreds of
+  // samples, and the marker-map push it would otherwise ride on goes to every
+  // room watcher several times a second.
+  if (msg.type === 'tag-history') {
+    if (ws.role === 'viewer' && Number.isInteger(msg.id)) {
+      send(ws, { type: 'tag-history', ...survey.getTagHistory(msg.id) });
+    }
+    return;
+  }
   // ARCore tracking loss on an XR client. The client keeps detecting tags
   // through it and falls back to plain `pose` reports, so this is a change of
   // localization mode rather than an outage — but it used to be sent as

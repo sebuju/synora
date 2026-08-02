@@ -18,6 +18,7 @@ const {
   solvePose,
 } = require('./public/pose-math.js');
 const { markerCornersM } = require('./public/cv-common.js');
+const { createTagHistory } = require('./tag-history.js');
 
 // Observation gates. err is mean corner reprojection error in px — the best
 // single-number proxy for a bad detection (blur, oblique view, tiny tag).
@@ -228,7 +229,17 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
   let lastJitterLog = 0;
   let saveTimer = null;
 
-  function load() {
+  // What each tag has been doing over the life of the map — see tag-history.js.
+  // Beside the map file rather than inside it: it is a log of a map, not part of
+  // one. The path is derived so a replay, which is handed a scratch map file,
+  // writes its history beside that scratch file and cannot touch the live one.
+  const history = createTagHistory({
+    file: file.replace(/(\.json)?$/, '-history.json'),
+    log,
+    anchorId: () => anchorId,
+  });
+
+  function loadMap() {
     let raw;
     try {
       raw = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -251,6 +262,12 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
         from: m.from || [],
         hops: Number.isFinite(m.hops) ? m.hops : null,
         verified: Number.isFinite(m.verified) ? m.verified : null,
+        // Who has cross-checked this tag since, back to numeric ids. Absent in
+        // maps written before it was recorded, and null there means the same as
+        // it does the first time a tag is seen: nothing has checked it yet.
+        chainFrom: m.chainFrom
+          ? new Map(Object.entries(m.chainFrom).map(([k, v]) => [Number(k), v]))
+          : null,
         // Restored only when actually recorded: the resid EMAs seed themselves
         // on `=== undefined`, so a null here would arithmetic into the first
         // sighting instead of being replaced by it.
@@ -472,6 +489,10 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
           id, {
             p: m.pose.p, q: m.pose.q, nObs: m.nObs,
             from: m.from || [], hops: m.hops ?? null, verified: m.verified ?? null,
+            // Persisted for the same reason `verified` is: a restart that forgot
+            // it would re-stranded every tag the map has since chained, which
+            // reads exactly like a tag nothing has ever checked.
+            chainFrom: m.chainFrom ? Object.fromEntries(m.chainFrom) : null,
             // Refinement provenance, not geometry: without it every tag reads
             // "never refined" in the drawer after a restart, which is
             // indistinguishable from the never-corrected state it warns about.
@@ -1244,6 +1265,30 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
     return { from, hops: depths.length ? Math.min(...depths) + 1 : null };
   }
 
+  // The same two questions asked of refinement instead of promotion: which tags
+  // have checked this one since it entered the map, and how far from the datum
+  // that puts it. `provenance` above is frozen at promotion and must stay frozen
+  // — `from` is also the descendant graph the refine loop filters on and `hops`
+  // is the clip authority — so this is a second, read-only view rather than a
+  // widening of that one. A tag promoted while ARCore carried the pose has no
+  // founding chain at all and reads as the weakest thing in the map forever
+  // without it, however many times it has since been cross-checked.
+  //
+  // Derived here rather than stored, and from the parents' *founding* `hops`
+  // only, never their `chainHops`. That is what keeps it acyclic: a chained tag
+  // has a null founding depth, so it can never satisfy anything else's parent
+  // test — chained tags are always leaves and the chain is one level deep by
+  // construction.
+  function chainProvenance(m) {
+    if (!m.chainFrom || !m.chainFrom.size) return { chainFrom: [], chainHops: null };
+    const chainFrom = [...m.chainFrom.entries()]
+      .sort((a, b) => b[1] - a[1]).map(([id]) => id);
+    const depths = chainFrom
+      .map((id) => markers.get(id)?.hops)
+      .filter((h) => Number.isFinite(h));
+    return { chainFrom, chainHops: depths.length ? Math.min(...depths) + 1 : null };
+  }
+
   function tryPromote(id) {
     const ring = candidates.get(id);
     if (ring.length < PROMOTE_MIN_ESTIMATES) return false;
@@ -1309,6 +1354,14 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
       + `${from.length ? `via ${from.join(' ')}, ${hops} hop(s) from the anchor` : 'off ARCore alone'}`
       + `${clipped ? `, clipped ${markers.get(id).clippedMm} mm onto tag `
         + `${markers.get(id).clippedTo}'s plane` : ''})`);
+    // The tag entering the map, and the pose it entered on. Every later sample is
+    // read against this one — "did it arrive here or walk here" is the question
+    // the history exists to answer, and it has no answer without the arrival.
+    const m = markers.get(id);
+    history.event(id, 'promoted', {
+      n: inliers.length, of: ring.length, from, hops, verified,
+    });
+    history.record(id, { p: m.pose.p, q: m.pose.q, resid: null, residDeg: null });
     scheduleSave();
     return true;
   }
@@ -1370,10 +1423,18 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
       }
       return false;
     }
+    // A fresh room frame, so anything recorded in the previous one is not stale
+    // but meaningless — including a history that survived a restart in which the
+    // map file was lost or refused.
+    history.clear();
     anchorId = seed.id;
     // The datum: measured against nothing, and zero hops from itself.
     markers.set(seed.id, { pose: se3Identity(), nObs: 1, from: [], hops: 0 });
     log(`Marker ${seed.id} anchored as room origin`);
+    // The anchor gets an event and no samples: it sits at the origin by
+    // definition and is never refined, so a position trace of it would be a flat
+    // line asserting a measurement that was never made.
+    history.event(seed.id, 'anchored', { ambiguous: seed.sols.length > 1 });
     scheduleSave();
     return true;
   }
@@ -1582,6 +1643,12 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
             clearStreaks(o.id);
             log(`Marker ${o.id} disagrees with the map by ${off.toFixed(2)} m over `
               + `${n} sightings — dropped, will re-survey where it is now`);
+            // Kept, unlike a hand-removed tag: a re-seed is the same tag being
+            // re-measured after a knock, and the step it takes when it comes back
+            // is only readable against where it used to sit. This is also the one
+            // event a position trace cannot be read without — a re-seed and a long
+            // drift draw the same line.
+            history.event(o.id, 'reseeded', { offMm: Math.round(off * 1000), n });
             changed = true;
             scheduleSave();
           }
@@ -1612,6 +1679,16 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
         // ever shows tag pairs every tag read "0 cross-checked" forever while
         // being checked ten times a second.
         m.verified = (m.verified ?? 0) + 1;
+        // *Which* tags did that checking, counted the same way `provenance`
+        // counts the placing so the first one named did most of it. Kept apart
+        // from `from` deliberately: that field is the founding chain, and it is
+        // read by `descendsFrom` (which would then see two tags that refine each
+        // other as each other's ancestors, drop both from `others`, and deadlock
+        // refinement) and by `datumDepth` (where a chain that grows would let two
+        // tags take turns as the clip authority — the undirected rule the note
+        // above `datumDepth` forbids). Nothing but the drawer reads this one.
+        if (!m.chainFrom) m.chainFrom = new Map();
+        for (const x of others) m.chainFrom.set(x.id, (m.chainFrom.get(x.id) || 0) + 1);
 
         // Before the nudge, not after: every figure reported here — off, dq and
         // both branches — is measured against the stored pose as it stood when
@@ -1655,6 +1732,13 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
         // undone within seconds of the next sighting.
         clipToPlane(o.id);
         m.nObs++;
+        // After the nudge and after the clip, so a sample is the pose the map
+        // actually holds at that instant rather than one of the intermediate
+        // poses no reader of the map ever sees. Sampling is throttled inside the
+        // history — this line runs ten times a second per client watching the tag.
+        history.record(o.id, {
+          p: m.pose.p, q: m.pose.q, resid: m.resid, residDeg: m.residDeg,
+        });
         refined = true;
         scheduleSave();
       }
@@ -2020,7 +2104,12 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
   }
 
   return {
-    load,
+    load() {
+      loadMap();
+      // Strictly after the map: whether the history on disk describes this room
+      // frame is decided by the anchor the map just loaded with.
+      history.load();
+    },
     predictPose,
 
     // Coverage of the joint multi-tag solve, for the replay harness — if the
@@ -2052,6 +2141,9 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
       forgetJitter();
       forgetReportAlign();
       reseedStreak.clear();
+      // Every stored position was measured in the old scale, so the record of
+      // them is as invalid as the map itself.
+      history.clear();
       log(`Marker size ${(was * 1000).toFixed(0)} mm -> ${(m * 1000).toFixed(0)} mm `
         + '— survey reset, every tag must be re-observed');
       scheduleSave();
@@ -2517,16 +2609,31 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
         xrFound.clear();
         forgetJitter();
         forgetReportAlign();
+        // The room frame goes with the anchor, and every sample was recorded in
+        // it. Whatever anchors next founds a new one.
+        history.clear();
         log('Survey reset (anchor tag removed)');
       } else if (markers.has(id)) {
         markers.delete(id);
         candidates.delete(id);
         clearStreaks(id);
+        // Unlike a re-seed: a tag removed by hand is gone from the room, and if
+        // that id turns up again it is a different tag on a different wall whose
+        // history is not this one.
+        history.forget(id);
         log(`Marker ${id} removed from the map`);
       } else {
         return;
       }
       scheduleSave();
+    },
+
+    // One tag's record, for the dashboard drawer. Asked for rather than pushed:
+    // a history is hundreds of samples and only the one card a reader has open
+    // needs it, while the marker map goes out several times a second to every
+    // watcher in the room.
+    getTagHistory(id) {
+      return history.get(id);
     },
 
     getMarkerMap() {
@@ -2536,6 +2643,10 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
         markers: [...markers].map(([id, m]) => ({
           id, p: m.pose.p, q: m.pose.q, nObs: m.nObs,
           from: m.from || [], hops: m.hops ?? null, verified: m.verified ?? null,
+          // Flattened here rather than held on the marker: a stored depth is one
+          // `datumDepth` or `descendsFrom` could reach, and the whole point of
+          // the second chain is that neither can see it.
+          ...chainProvenance(m),
           // Live refinement state. Not persisted — it describes what the tag is
           // doing now, and a figure reloaded from disk would claim a settledness
           // nothing has checked since.
