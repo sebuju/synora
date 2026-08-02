@@ -25,7 +25,8 @@ const PANEL_POSE_STALE_MS = 2000;
 // drawer of saturated blocks reads as a warning rather than as a grouping.
 const CARD_TINT_ALPHA = 0.13;
 
-function createClientsPanel(el, { onControl, onVcam, onRename, onTagHover, onTagRemove }) {
+function createClientsPanel(el,
+  { onControl, onVcam, onRename, onTagHover, onTagRemove, onTagHistory }) {
   const cards = new Map();   // clientId -> card DOM
 
   function button(label, title) {
@@ -267,6 +268,23 @@ function createClientsPanel(el, { onControl, onVcam, onRename, onTagHover, onTag
   const SETTLE_MOVE_M = 0.001;
   const SETTLE_MOVE_DEG = 0.1;
 
+  // Which tag card is open, and the record the server sent for it. One at a
+  // time: a tag's history is the thing being compared *against the room*, not
+  // against the tag below it, and a drawer of open cards is a drawer nobody can
+  // find a tag in. Held out here for the same reason the hover and the arming
+  // are — the cards are rebuilt whenever a marker map arrives, several times a
+  // second while a survey is running, and the card that was open must still be
+  // open afterwards.
+  let openTagId = null;
+  // { id, samples, events } as it last arrived. Kept whole rather than merged
+  // into a running copy: the server sends the whole record every poll precisely
+  // so that there is one description of a tag's past and it is the server's.
+  let tagHist = null;
+  let histAskedAt = 0;
+  // Polled while a card is open. A sample a second is what the server records,
+  // so asking faster only re-sends the same array.
+  const HIST_POLL_MS = 1000;
+
   function settleState(tag) {
     const prev = settleHist.get(tag.id);
     const now = Date.now();
@@ -328,22 +346,34 @@ function createClientsPanel(el, { onControl, onVcam, onRename, onTagHover, onTag
   // strictly decreasing, so the tree cannot contain a cycle. A tag with no
   // recorded provenance, or whose named parent is not in the map, is its own
   // root rather than being hidden.
+  //
+  // A tag with no founding chain at all — promoted while ARCore carried the pose
+  // — is then hung off whichever tag has since done most of the *refining* of it,
+  // drawn on a dashed rail because that link is where the tag is being corrected
+  // from, not where it came from. The same cycle argument covers it, one step
+  // further on: the server derives `chainHops` from the parents' founding depth
+  // only, so a chained tag (founding depth null) can never satisfy either parent
+  // test and is always a leaf.
   function tagTree(markers, anchorId) {
     const byId = new Map(markers.map((t) => [t.id, t]));
     const kids = new Map(markers.map((t) => [t.id, []]));
     const roots = [];
     for (const tag of markers) {
-      const parent = Number.isFinite(tag.hops) && tag.hops > 0
+      const founding = Number.isFinite(tag.hops) && tag.hops > 0
         ? (tag.from || []).find((id) => byId.get(id)?.hops === tag.hops - 1)
         : undefined;
+      const parent = founding !== undefined ? founding
+        : Number.isFinite(tag.chainHops)
+          ? (tag.chainFrom || []).find((id) => byId.get(id)?.hops === tag.chainHops - 1)
+          : undefined;
       if (parent === undefined) roots.push(tag);
-      else kids.get(parent).push(tag);
+      else kids.get(parent).push({ tag, chained: founding === undefined });
     }
     const byIdAsc = (a, b) => a.id - b.id;
     // The anchor heads the list whatever its id: everything else is measured
     // from it, and a tag with no provenance is also a root but is not a datum.
     roots.sort((a, b) => (a.id === anchorId ? -1 : b.id === anchorId ? 1 : byIdAsc(a, b)));
-    for (const list of kids.values()) list.sort(byIdAsc);
+    for (const list of kids.values()) list.sort((a, b) => byIdAsc(a.tag, b.tag));
     return { roots, kids };
   }
 
@@ -360,17 +390,25 @@ function createClientsPanel(el, { onControl, onVcam, onRename, onTagHover, onTag
     const { roots, kids } = tagTree([...(markerMap?.markers || [])], markerMap?.anchorId);
     // Depth-first, so a tag is emitted directly under its parent and the rails
     // in the stylesheet are the nesting itself rather than a computed indent.
+    // Founding children first, then the refine-chained ones on their own rail —
+    // one group per kind of link, so the rail itself carries which it is. Both
+    // built through the same call, or the two rails drift apart the first time
+    // either is touched.
     const emit = (tag, into) => {
       const node = document.createElement('div');
       node.className = 'tag-node';
       node.append(buildTagCard(tag, markerMap));
       const mine = kids.get(tag.id);
-      if (mine.length) {
+      const group = (chained) => {
+        const list = mine.filter((k) => k.chained === chained);
+        if (!list.length) return;
         const sub = document.createElement('div');
-        sub.className = 'tag-kids';
-        for (const kid of mine) emit(kid, sub);
+        sub.className = chained ? 'tag-kids chained' : 'tag-kids';
+        for (const kid of list) emit(kid.tag, sub);
         node.append(sub);
-      }
+      };
+      group(false);
+      group(true);
       into.append(node);
     };
     for (const tag of roots) emit(tag, tagsEl);
@@ -380,6 +418,10 @@ function createClientsPanel(el, { onControl, onVcam, onRename, onTagHover, onTag
     for (const id of settleHist.keys()) {
       if (!tagCards.has(id)) settleHist.delete(id);
     }
+    // The open card's tag left the map — dropped for disagreeing, or forgotten
+    // by hand. Nothing would ever close it otherwise, and the panel would go on
+    // asking the server about a tag it no longer has.
+    if (openTagId !== null && !tagCards.has(openTagId)) setOpenTag(null);
     return true;
   }
 
@@ -481,11 +523,460 @@ function createClientsPanel(el, { onControl, onVcam, onRename, onTagHover, onTag
     return root;
   }
 
+  // --- What the tag has been doing ------------------------------------------
+  // The card's other lines are all *now*: where the tag is, what it is being
+  // told to correct, how long since it was last nudged. None of them can answer
+  // the questions a survey actually raises — did this tag arrive where it sits
+  // or walk there, has it ever been knocked, has it stopped moving or has it
+  // merely stopped being looked at. The server keeps the record (tag-history.js)
+  // and the open card asks for it.
+  //
+  // Drawn rather than listed: a settling line repeated two hundred times says
+  // nothing more than one of them, and the shape of the curve — a step, a slow
+  // decay, a flat line with a gap in it — is the whole of the answer.
+
+  // Sample layout as tag-history.js packs it: [t, x,y,z, qx,qy,qz,qw, mm, deg].
+  const S_T = 0, S_P = 1, S_Q = 4, S_MM = 8, S_DEG = 9;
+
+  const SPARK_H = 40;
+  // The two series share one chart and are therefore a categorical pair, checked
+  // as one against this card's own #1c1c1c: OKLab ΔE 8.9 under protanopia and
+  // deuteranopia, 16.7 with normal vision, both above the floor. They are the
+  // panel's own green and amber taken down into the dark-surface lightness band
+  // — the text colours (#8fc79d / #e0a03a) sit above it, and as 2 px lines on
+  // near-black they are too pale and too close to each other to tell apart.
+  const SPARK_MOVED = '#3aa471';
+  const SPARK_OFF = '#bd8420';
+  // Reserved, and used here for the one event that is a fault: the tag was found
+  // somewhere else and dropped. A promotion is not a fault, so it is muted.
+  const SPARK_RESEED = '#e0603a';
+  const SPARK_EVENT = '#7a7a7a';
+  const SPARK_AXIS = '#333';
+  const SPARK_INK = '#9a9a9a';
+  // A break in the line rather than a straight segment across the gap: nothing
+  // was measured in between, and a level line there reads as "held still" —
+  // which is exactly the claim a tag nobody looked at must not be allowed to
+  // make.
+  //
+  // Measured against the record's own cadence, never a fixed interval. The
+  // server samples at most once a second but only while the tag is *being
+  // refined*, which needs two known tags in one frame — on a real journal that
+  // came out at one sample every ten seconds — and the old half of a long record
+  // is thinned, so its spacing is a multiple of the new half's. A fixed 2.5 s
+  // rule broke every segment of every series: nothing was drawn but the axis.
+  const SPARK_GAP_FACTOR = 4;
+  const SPARK_GAP_MIN_MS = 5000;
+  // Below this many points the samples are drawn as dots as well as a line: a
+  // sparse record is mostly breaks, and a break between two invisible points
+  // leaves an empty chart that cannot be told from no data at all.
+  const SPARK_DOTS_UNDER = 80;
+
+  function gapMs(pts) {
+    if (pts.length < 3) return SPARK_GAP_MIN_MS;
+    const d = [];
+    for (let i = 1; i < pts.length; i++) d.push(pts[i][0] - pts[i - 1][0]);
+    d.sort((a, b) => a - b);
+    return Math.max(SPARK_GAP_MIN_MS, SPARK_GAP_FACTOR * d[d.length >> 1]);
+  }
+
+  function niceMax(v) {
+    if (!(v > 0)) return 1;
+    const mag = 10 ** Math.floor(Math.log10(v));
+    // Finer than the usual 1/2/5: a 107 mm trace against a 200 mm ceiling uses
+    // half the height it has, and these are 40 px tall to begin with. Nothing
+    // here rounds past 1.5x the data.
+    for (const step of [1, 1.5, 2, 3, 5, 7.5, 10]) {
+      if (v <= step * mag) return step * mag;
+    }
+    return 10 * mag;
+  }
+
+  // One chart, any number of series on one axis — both charts here are built
+  // from it, and a second copy would be the place the two drift apart. Series
+  // that do not share a unit never share a chart: millimetres and degrees are
+  // two charts, not two axes.
+  function drawSpark(canvas, { series, events, t0, t1, fmt, hoverT }) {
+    const w = Math.max(60, Math.round(canvas.clientWidth || 0));
+    const dpr = window.devicePixelRatio || 1;
+    if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(SPARK_H * dpr)) {
+      canvas.width = Math.round(w * dpr);
+      canvas.height = Math.round(SPARK_H * dpr);
+    }
+    const g = canvas.getContext('2d');
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, w, SPARK_H);
+    const top = 11, bottom = SPARK_H - 3;
+    const span = Math.max(1, t1 - t0);
+    let vmax = 0;
+    for (const s of series) for (const [, v] of s.pts) vmax = Math.max(vmax, v);
+    vmax = niceMax(vmax);
+    const x = (t) => ((t - t0) / span) * (w - 1);
+    const y = (v) => bottom - (Math.min(v, vmax) / vmax) * (bottom - top);
+
+    // The zero line, because every series here is a distance from something and
+    // zero is where they all mean "no disagreement left".
+    g.strokeStyle = SPARK_AXIS;
+    g.lineWidth = 1;
+    g.beginPath();
+    g.moveTo(0, bottom + 0.5);
+    g.lineTo(w, bottom + 0.5);
+    g.stroke();
+
+    // Under the traces: an event is when something happened to the tag, not a
+    // measurement of it, and it must not cover the curve it explains.
+    for (const ev of events) {
+      if (ev.t < t0) continue;
+      const ex = Math.round(x(ev.t)) + 0.5;
+      g.strokeStyle = ev.kind === 'reseeded' ? SPARK_RESEED : SPARK_EVENT;
+      g.beginPath();
+      g.moveTo(ex, top - 3);
+      g.lineTo(ex, bottom);
+      g.stroke();
+    }
+
+    for (const s of series) {
+      g.strokeStyle = s.color;
+      g.lineWidth = 2;
+      g.lineJoin = 'round';
+      g.lineCap = 'round';
+      g.beginPath();
+      const gap = gapMs(s.pts);
+      let prevT = null;
+      for (const [t, v] of s.pts) {
+        if (prevT === null || t - prevT > gap) g.moveTo(x(t), y(v));
+        else g.lineTo(x(t), y(v));
+        prevT = t;
+      }
+      g.stroke();
+      if (s.pts.length <= SPARK_DOTS_UNDER) {
+        g.fillStyle = s.color;
+        for (const [t, v] of s.pts) {
+          g.beginPath();
+          g.arc(x(t), y(v), 1.5, 0, Math.PI * 2);
+          g.fill();
+        }
+      }
+    }
+
+    // The scale, as one number: these are sparklines in a 320 px drawer and an
+    // axis would cost more room than the trace it labels. Without it the chart
+    // is shape-only and a 2 mm wobble looks like a 2 m one.
+    g.fillStyle = SPARK_INK;
+    g.font = '9px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+    g.textAlign = 'right';
+    g.textBaseline = 'top';
+    g.fillText(fmt(vmax), w - 1, 0);
+
+    if (hoverT !== null && hoverT !== undefined) {
+      const hx = Math.round(x(hoverT)) + 0.5;
+      g.strokeStyle = '#cfcfcf';
+      g.beginPath();
+      g.moveTo(hx, top - 3);
+      g.lineTo(hx, bottom);
+      g.lineWidth = 1;
+      g.stroke();
+      for (const s of series) {
+        const pt = nearestPt(s.pts, hoverT);
+        if (!pt) continue;
+        g.fillStyle = s.color;
+        g.beginPath();
+        g.arc(x(pt[0]), y(pt[1]), 2.5, 0, Math.PI * 2);
+        g.fill();
+      }
+    }
+  }
+
+  function nearestPt(pts, t) {
+    let best = null, bestD = Infinity;
+    for (const p of pts) {
+      const d = Math.abs(p[0] - t);
+      if (d < bestD) { bestD = d; best = p; }
+    }
+    return best;
+  }
+
+  // Everything the two charts draw, derived from the raw record in one place so
+  // the charts, the summary and the hover readout cannot disagree about what a
+  // number means. Both drift series are measured against the pose the map holds
+  // *now* — the question being asked of the history is how far the tag has come
+  // to get here, so the curve has to arrive at zero on the right.
+  function histSeries(hist) {
+    const s = hist.samples;
+    const out = { moved: [], off: [], turned: [], offDeg: [], path: 0 };
+    if (!s.length) return out;
+    const last = s[s.length - 1];
+    const p = [last[S_P], last[S_P + 1], last[S_P + 2]];
+    const q = [last[S_Q], last[S_Q + 1], last[S_Q + 2], last[S_Q + 3]];
+    let prev = null;
+    for (const k of s) {
+      const kp = [k[S_P], k[S_P + 1], k[S_P + 2]];
+      out.moved.push([k[S_T], Math.hypot(kp[0] - p[0], kp[1] - p[1], kp[2] - p[2]) * 1000]);
+      out.turned.push([k[S_T],
+        quatAngleDeg([k[S_Q], k[S_Q + 1], k[S_Q + 2], k[S_Q + 3]], q)]);
+      if (k[S_MM] !== null) out.off.push([k[S_T], k[S_MM]]);
+      if (k[S_DEG] !== null) out.offDeg.push([k[S_T], k[S_DEG]]);
+      // Distance actually walked, not net displacement: a tag that healed 40 mm
+      // one way and 40 mm back is not a tag that never moved.
+      if (prev) out.path += Math.hypot(kp[0] - prev[0], kp[1] - prev[1], kp[2] - prev[2]) * 1000;
+      prev = kp;
+    }
+    return out;
+  }
+
+  // Two lines: the whole record, and the last minute of it. The second is the
+  // one that answers "is it still moving" — the settle line above says settled
+  // or settling from two consecutive maps, and this says by how much.
+  function histSummary(hist, ser) {
+    const s = hist.samples;
+    const now = Date.now();
+    const first = s[0][S_T];
+    const last = s[s.length - 1];
+    const net = ser.moved[0][1];
+    // The span of the record itself, not how far back it reaches: a session that
+    // ended hours ago covers the minutes it covered, and "52 samples over 9.9
+    // hrs" claims a record of the whole night. How long ago it stopped is the
+    // second line's job.
+    const lines = [s.length < 2
+      ? '1 sample — nothing to compare it against yet'
+      : `${s.length} samples spanning ${fmtAge(last[S_T] - first)} · `
+        + `${Math.round(net)} mm net, ${Math.round(ser.path)} mm walked`];
+
+    // Against the oldest sample still inside the window, so a tag observed twice
+    // in the last minute is compared over those two and not over the whole
+    // record. A tag nobody has looked at in a minute has no answer, and says so
+    // rather than reporting the stillness of a record that simply stopped.
+    const recent = ser.moved.filter((k) => now - k[0] <= 60000);
+    if (recent.length >= 2) {
+      const turned = ser.turned.filter((k) => now - k[0] <= 60000);
+      lines.push(`last minute ${Math.round(recent[0][1] - recent[recent.length - 1][1])} mm · `
+        + `${(turned[0][1] - turned[turned.length - 1][1]).toFixed(1)}°`
+        + (last[S_MM] === null ? '' : ` · still off by ${last[S_MM]} mm, ${last[S_DEG]}°`));
+    } else {
+      lines.push('nothing recorded in the last minute — last sample '
+        + `${fmtAge(now - last[S_T])} ago`);
+    }
+    return lines;
+  }
+
+  // The legend, as its own row under each chart: two series always carry one
+  // (colour alone must not be the only thing telling them apart), and the same
+  // row is where the hover readout lands, so the card does not change height as
+  // the pointer moves across it.
+  function keyRow(el, entries) {
+    el.replaceChildren();
+    for (const [color, label] of entries) {
+      // A colourless entry is the hover readout's timestamp: it belongs to no
+      // series and must not be given a swatch that implies one.
+      if (color) {
+        const sw = document.createElement('span');
+        sw.className = 'sw';
+        sw.style.background = color;
+        el.append(sw);
+      }
+      const txt = document.createElement('span');
+      // Text in the card's own ink, never the series colour: the swatch beside
+      // it carries the identity.
+      txt.textContent = label;
+      el.append(txt);
+    }
+  }
+
+  // The two charts a tag card carries. Millimetres and degrees are two charts
+  // and never two axes on one: a second scale down the right-hand side makes any
+  // two curves look related, and the relation is the reader's own eye.
+  const HIST_CHARTS = [
+    {
+      unit: 'mm',
+      fmt: (v) => `${Math.round(v)} mm`,
+      series: [
+        [SPARK_MOVED, 'away from here', 'moved'],
+        [SPARK_OFF, 'off by', 'off'],
+      ],
+    },
+    {
+      unit: 'deg',
+      fmt: (v) => `${+v.toFixed(2)}°`,
+      series: [
+        [SPARK_MOVED, 'turned from here', 'turned'],
+        [SPARK_OFF, 'off by', 'offDeg'],
+      ],
+    },
+  ];
+
+  function buildHistBlock() {
+    const root = document.createElement('div');
+    root.className = 'hist';
+    const sum = document.createElement('div');
+    sum.className = 'hist-sum';
+    root.append(sum);
+    const charts = HIST_CHARTS.map((spec) => {
+      const canvas = document.createElement('canvas');
+      canvas.className = 'spark';
+      const key = document.createElement('div');
+      key.className = 'spark-key';
+      root.append(canvas, key);
+      const chart = { spec, canvas, key, hoverT: null, series: [], events: [], t0: 0, t1: 0 };
+      // A crosshair rather than a tooltip: the drawer is 320 px wide, a floating
+      // box would cover the chart it describes, and the legend row underneath is
+      // already the right size for the readout — so the reading lands there and
+      // the card does not change height as the pointer crosses it.
+      canvas.onpointermove = (ev) => {
+        if (!chart.series.length) return;
+        const rect = canvas.getBoundingClientRect();
+        const frac = Math.min(1, Math.max(0, (ev.clientX - rect.left) / Math.max(1, rect.width)));
+        chart.hoverT = chart.t0 + frac * (chart.t1 - chart.t0);
+        drawChart(chart);
+      };
+      canvas.onpointerleave = () => {
+        chart.hoverT = null;
+        drawChart(chart);
+      };
+      return chart;
+    });
+    return { root, sum, charts };
+  }
+
+  function drawChart(chart) {
+    drawSpark(chart.canvas, {
+      series: chart.series,
+      events: chart.events,
+      t0: chart.t0,
+      t1: chart.t1,
+      unit: chart.spec.unit,
+      fmt: chart.spec.fmt,
+      hoverT: chart.hoverT,
+    });
+    if (chart.hoverT === null) {
+      keyRow(chart.key, chart.series.map((s) => [s.color, s.label]));
+      return;
+    }
+    // The hovered instant is named by age, like every other time on this panel:
+    // a wall-clock stamp would be the only one here and would have to be read
+    // against the "nudged 4 min ago" two lines above it.
+    const at = nearestPt(chart.series[0]?.pts || [], chart.hoverT);
+    const parts = chart.series.map((s) => {
+      const pt = nearestPt(s.pts, chart.hoverT);
+      return [s.color, pt ? `${s.label} ${chart.spec.fmt(pt[1])}` : `${s.label} —`];
+    });
+    if (at) parts.unshift([null, fmtAge(Date.now() - at[0])]);
+    keyRow(chart.key, parts);
+  }
+
+  // The one notable thing that has happened to this tag, named. The charts carry
+  // events as ticks and a tick cannot say what it was — and the difference
+  // between a step in the position trace that is a re-seed and one that is a
+  // long drift is the whole reading.
+  function histEventLine(hist) {
+    const ev = hist.events[hist.events.length - 1];
+    if (!ev) return null;
+    const age = fmtAge(Date.now() - ev.t);
+    if (ev.kind === 'anchored') {
+      return `anchored ${age} ago`
+        + (ev.ambiguous ? ' — from a sighting whose mirror was still plausible' : '');
+    }
+    if (ev.kind === 'reseeded') {
+      return `re-seeded ${age} ago — it was found ${ev.offMm} mm away `
+        + `${ev.n} sightings running, so the old pose was dropped`;
+    }
+    if (ev.kind === 'promoted') {
+      return `placed ${age} ago on ${ev.n}/${ev.of} estimates`
+        + (ev.from?.length ? ` via ${ev.from.join(', ')}` : ' off ARCore alone');
+    }
+    return `${ev.kind} ${age} ago`;
+  }
+
+  function paintHistory(card) {
+    const els = card.histEls;
+    const lines = [];
+    // The record for another tag, or none yet: the poll is a round trip and the
+    // card is open before it lands. Saying so beats an empty box that cannot be
+    // told apart from a tag with no history.
+    if (!tagHist || tagHist.id !== card.tag.id) {
+      els.root.classList.add('empty');
+      els.sum.replaceChildren(textLines('reading the record…'));
+      return;
+    }
+    const hist = tagHist;
+    const ser = hist.samples.length ? histSeries(hist) : null;
+    if (!ser) {
+      els.root.classList.add('empty');
+      lines.push(card.isAnchor
+        // The anchor is not measured against anything, so there is nothing to
+        // record about it and an empty chart would imply there ought to be.
+        ? 'the room origin — its pose is asserted, not measured, so nothing about '
+          + 'it is refined and nothing is recorded'
+        // Deliberately not "it has never been refined": the record starts when
+        // the server does, and a map that has outlived its history — a restart,
+        // a re-anchoring — has tags with thousands of cross-checks and nothing
+        // recorded. Saying they were never refined would be a lie the card above
+        // it contradicts.
+        : 'nothing recorded yet — a tag is sampled as it is refined, and this one '
+          + 'has not been refined since the record began');
+      const ev = histEventLine(hist);
+      if (ev) lines.push(ev);
+      els.sum.replaceChildren(...lines.map(textLines));
+      return;
+    }
+    els.root.classList.remove('empty');
+    lines.push(...histSummary(hist, ser));
+    const ev = histEventLine(hist);
+    if (ev) lines.push(ev);
+    els.sum.replaceChildren(...lines.map(textLines));
+
+    const t0 = hist.samples[0][S_T];
+    // The right edge is now, not the last sample: a tag nobody has looked at for
+    // ten minutes must be seen to stop, or a record that simply ended reads as a
+    // tag that has settled.
+    const t1 = Date.now();
+    els.charts.forEach((chart) => {
+      chart.series = chart.spec.series.map(([color, label, key]) =>
+        ({ color, label, pts: ser[key] }));
+      chart.events = hist.events;
+      chart.t0 = t0;
+      chart.t1 = t1;
+      drawChart(chart);
+    });
+  }
+
+  function textLines(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div;
+  }
+
+  // Opening a card is what asks the server for its history, and closing one is
+  // what stops the polling. One at a time, so the answer being held is always
+  // the answer to the card on screen.
+  function setOpenTag(id) {
+    if (openTagId === id) return;
+    openTagId = id;
+    tagHist = null;
+    histAskedAt = 0;
+    for (const [tagId, card] of tagCards) {
+      card.root.classList.toggle('open', tagId === id);
+      if (tagId === id) paintHistory(card);
+    }
+    askHistory();
+  }
+
+  function askHistory() {
+    if (openTagId === null || !onTagHistory) return;
+    histAskedAt = Date.now();
+    onTagHistory(openTagId);
+  }
+
   function buildTagCard(tag, markerMap) {
     const root = document.createElement('div');
-    root.className = 'drawer-card';
+    // `tag` as well: a client card carries the remote control and must stay
+    // open, so only these collapse.
+    root.className = 'drawer-card tag';
     const head = document.createElement('div');
     head.className = 'head';
+    // The settle state, as a dot, because a collapsed card has no room for the
+    // sentence — and a drawer of collapsed cards must still be able to say which
+    // tag is the one worth opening.
+    const dot = document.createElement('span');
+    dot.className = 'dot';
     const name = document.createElement('span');
     name.className = 'name';
     name.textContent = `Tag ${tag.id}`;
@@ -497,7 +988,7 @@ function createClientsPanel(el, { onControl, onVcam, onRename, onTagHover, onTag
     // measurement, and it is the one tag whose being wrong is undetectable.
     const isAnchor = tag.id === markerMap.anchorId;
     kind.textContent = isAnchor ? 'origin' : `${tag.nObs} obs`;
-    head.append(name, kind);
+    head.append(dot, name, kind);
 
     // Everything below is a measurement, and the anchor is not one: it sits at
     // the origin facing along the room axes by definition, was measured
@@ -536,25 +1027,42 @@ function createClientsPanel(el, { onControl, onVcam, onRename, onTagHover, onTag
       // that looks wrong. Parents are ordered by how much of the placing each
       // did — the first is the one the tree hangs this card off.
       const via = document.createElement('div');
+      // How many checks this tag has survived: promoting estimates measured
+      // against a two-known-tag fix, plus every refinement since — each one
+      // compared the stored pose against a fix from *other* tags and could
+      // have disagreed. Zero means genuinely unfalsified: placed and then
+      // never once seen beside another known tag. Printed whatever the founding
+      // was, because the tag it matters most for is the one with no founding
+      // chain to print it beside — that branch used to omit it, so a tag being
+      // cross-checked ten times a second still read as the weakest thing in the
+      // map.
+      const checked = tag.verified === null || tag.verified === undefined
+        ? 'checks unrecorded'
+        : `${tag.verified} cross-checked`;
+      const depth = (h) => (h === null || h === undefined
+        ? 'depth unrecorded'
+        : `${h} hop${h === 1 ? '' : 's'} out`);
       if (tag.from?.length) {
-        // How many checks this tag has survived: promoting estimates measured
-        // against a two-known-tag fix, plus every refinement since — each one
-        // compared the stored pose against a fix from *other* tags and could
-        // have disagreed. Zero means genuinely unfalsified: placed and then
-        // never once seen beside another known tag.
-        const checked = tag.verified === null || tag.verified === undefined
-          ? 'checks unrecorded'
-          : `${tag.verified} cross-checked`;
-        via.textContent = `via ${tag.from.join(', ')} · `
-          + (tag.hops === null ? 'depth unrecorded' : `${tag.hops} hop${tag.hops === 1 ? '' : 's'} out`)
-          + ` · ${checked}`;
-        if (!tag.verified) via.className = 'warn';
+        via.textContent = `via ${tag.from.join(', ')} · ${depth(tag.hops)} · ${checked}`;
+      } else if (tag.from && tag.chainFrom?.length) {
+        // Founded with no tag in view, but chained since: the founding fact is
+        // permanent and stays first, and what has happened since follows it. A
+        // tag that has been corrected against the map for an hour is not the
+        // same thing as one that entered on ARCore this minute, and the card
+        // said they were identical.
+        via.textContent = 'placed off ARCore alone · '
+          + `since chained via ${tag.chainFrom.join(', ')} · ${depth(tag.chainHops)} · ${checked}`;
       } else {
-        // No tag in view when it was placed — the fix was ARCore carrying the
-        // pose, which is the weakest way into the map.
-        via.textContent = tag.from ? 'placed off ARCore alone' : 'placed before this was recorded';
+        // No tag in view when it was placed and none has checked it since — the
+        // fix was ARCore carrying the pose, which is the weakest way into the map.
+        via.textContent = (tag.from ? 'placed off ARCore alone' : 'placed before this was recorded')
+          + ` · ${checked}`;
       }
-      paintSettle(settle, tag);
+      // Unchecked is the thing worth colouring, not unchained: a tag founded off
+      // ARCore and cross-checked four hundred times since is no longer the
+      // suspect entry on the card.
+      if (!tag.verified) via.className = 'warn';
+      paintSettle(settle, dot, tag);
       // Asserted geometry, shown as such. This is the one number on the card
       // that was not measured, so it says which tag it was snapped to and how
       // far it was moved — a silent correction is indistinguishable from a
@@ -568,6 +1076,14 @@ function createClientsPanel(el, { onControl, onVcam, onRename, onTagHover, onTag
     }
     const live = document.createElement('div');
     lines.append(live);
+    if (isAnchor) {
+      // The datum has nothing to be settled about — it is where it is by
+      // definition — so its dot says "not a measurement" rather than "fine".
+      dot.className = 'dot datum';
+      dot.title = 'The room origin: not measured, never refined';
+    }
+
+    const histEls = buildHistBlock();
 
     // The escape hatch for a tag that is gone from the room — one shown on a
     // screen, or a wall that was repainted. This is the only way to forget one
@@ -606,19 +1122,40 @@ function createClientsPanel(el, { onControl, onVcam, onRename, onTagHover, onTag
     root.onpointerenter = () => onTagHover?.(tag.id);
     root.onpointerleave = () => onTagHover?.(null);
 
-    root.append(head, lines);
+    // Left click anywhere on the card opens it, and opening one closes whatever
+    // was open. Not on the buttons inside it: the remove button is a two-click
+    // gesture of its own, and a card that also collapsed under it would move the
+    // second click's target out from under the pointer.
+    // The charts are excluded as well as the buttons: reading one means moving
+    // the pointer along it, and a click landing at the end of that gesture must
+    // not shut the thing being read.
+    root.onclick = (ev) => {
+      if (ev.button !== 0 || ev.target.closest('button, canvas')) return;
+      setOpenTag(openTagId === tag.id ? null : tag.id);
+    };
+
+    root.append(head, lines, histEls.root);
     root.classList.toggle('hot', tag.id === hotTagId);
+    root.classList.toggle('open', tag.id === openTagId);
     // The tag itself is kept so the settle line can be repainted without a
     // rebuild: it carries an age, and the map object it came from is the only
     // thing that triggers one.
-    tagCards.set(tag.id, { root, live, confirm, settle, tag, isAnchor });
+    const card = { root, live, confirm, settle, dot, tag, isAnchor, histEls };
+    tagCards.set(tag.id, card);
+    // A rebuild throws away the canvases the history was drawn on, so the open
+    // card redraws itself from the record already in hand rather than waiting
+    // for the next poll — otherwise the charts blink out several times a second
+    // while a survey is running, which is exactly when they are being read.
+    if (tag.id === openTagId) paintHistory(card);
     return root;
   }
 
-  function paintSettle(el, tag) {
+  function paintSettle(el, dot, tag) {
     const { text, warn } = settleLine(tag);
     el.textContent = text;
     el.className = warn ? 'warn' : '';
+    dot.className = warn ? 'dot warn' : 'dot';
+    dot.title = text;
   }
 
   // The ages on the cards, moved on regardless of survey traffic. A tag that
@@ -626,7 +1163,11 @@ function createClientsPanel(el, { onControl, onVcam, onRename, onTagHover, onTag
   // and it is also the one no marker-map message will ever come back to.
   function paintTagsAges() {
     for (const card of tagCards.values()) {
-      if (!card.isAnchor) paintSettle(card.settle, card.tag);
+      if (!card.isAnchor) paintSettle(card.settle, card.dot, card.tag);
+      // The open card's charts are drawn against *now* as their right edge, so
+      // they go stale on the same clock the ages do — a tag that stopped being
+      // refined must be seen to trail off rather than ending at the edge.
+      if (card.tag.id === openTagId) paintHistory(card);
     }
   }
 
@@ -653,6 +1194,9 @@ function createClientsPanel(el, { onControl, onVcam, onRename, onTagHover, onTag
       const seen = bySeen.get(id);
       card.live.textContent = seen ? `seen by ${seen.join(' · ')}` : 'not in view';
       card.live.className = seen ? 'room' : '';
+      // Also on the card itself, because a collapsed one has no room for the
+      // line: which tags are in view right now is what a survey is walked by.
+      card.root.classList.toggle('seen', !!seen);
     }
   }
 
@@ -717,6 +1261,20 @@ function createClientsPanel(el, { onControl, onVcam, onRename, onTagHover, onTag
         paintTagsAges();
       }
       paintTagsLive(list);
+      // The history poll rides this tick rather than a timer of its own, for the
+      // same reason the ages do: nothing is asked for behind a closed drawer,
+      // because a closed drawer never calls update().
+      if (openTagId !== null && Math.abs(Date.now() - histAskedAt) >= HIST_POLL_MS) askHistory();
+    },
+
+    // The answer to askHistory(). Ignored unless it is about the card that is
+    // open — a reply can be in flight when the reader moves to another tag, and
+    // drawing it would put one tag's past on another tag's card.
+    setTagHistory(msg) {
+      if (msg.id !== openTagId) return;
+      tagHist = { id: msg.id, samples: msg.samples || [], events: msg.events || [] };
+      const card = tagCards.get(msg.id);
+      if (card) paintHistory(card);
     },
   };
 }

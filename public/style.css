@@ -897,6 +897,114 @@ body.paused #pauseOverlay {
   margin-top: 6px;
 }
 
+/* A tag card is a summary until it is asked about: a room's worth of tags, each
+   five lines deep and two charts tall, is a drawer nobody can find a tag in.
+   Only tag cards do this — a client card carries the remote control, and putting
+   the pause button behind a click would be hiding the one thing the drawer is
+   for. */
+.drawer-card.tag {
+  cursor: pointer;
+}
+
+.drawer-card.tag:not(.open) .lines,
+.drawer-card.tag:not(.open) .hist {
+  display: none;
+}
+
+/* Nothing follows the heading when the card is shut, so the gap under it would
+   be padding pretending to be content. */
+.drawer-card.tag:not(.open) .head {
+  margin-bottom: 0;
+}
+
+/* The open card is lifted off the ones around it: which tag is being read has to
+   survive the eye leaving it and coming back. */
+.drawer-card.tag.open {
+  border-color: #4a4a4a;
+  background: #212121;
+}
+
+/* Settled, settling, or not a measurement at all — the sentence that says so is
+   inside the card, and this is what is left of it when the card is shut. */
+.drawer-card .dot {
+  align-self: center;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #3aa471;
+}
+
+.drawer-card .dot.warn {
+  background: #e0a03a;
+}
+
+.drawer-card .dot.datum {
+  background: #55585c;
+}
+
+/* In view of a client right now. On the card rather than only in its lines,
+   because walking a survey in is done by watching which tags are being seen —
+   and while walking it, every card is shut. */
+.drawer-card.tag.seen {
+  /* An inset ring rather than the border itself: the border is already spoken
+     for by hover and by the open card, and a state that overwrote either would
+     make one of them disappear whenever a tag came into view. */
+  box-shadow: inset 0 0 0 1px #2e6b4d;
+}
+
+.drawer-card .hist {
+  margin-top: 6px;
+  border-top: 1px solid #2c2c2c;
+  padding-top: 6px;
+}
+
+.drawer-card .hist-sum {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #9a9a9a;
+}
+
+/* Full width and a fixed height: the canvas is sized from its own layout box in
+   device pixels every time it is drawn, so the box has to be settled by CSS
+   first or every chart is drawn at whatever width the last one had. */
+.drawer-card .hist canvas.spark {
+  display: block;
+  width: 100%;
+  height: 40px;
+  margin-top: 4px;
+}
+
+/* No charts to label when there is nothing recorded. */
+.drawer-card .hist.empty canvas.spark,
+.drawer-card .hist.empty .spark-key {
+  display: none;
+}
+
+/* The legend, and the same row the hover reading lands in — so the card does not
+   change height as the pointer crosses a chart. */
+.drawer-card .hist .spark-key {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 2px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 10px;
+  color: #8a8a8a;
+}
+
+.drawer-card .hist .spark-key .sw {
+  width: 8px;
+  height: 2px;
+  border-radius: 1px;
+}
+
+/* The gap before the next entry's swatch: without it a two-series key reads as
+   one run of text. */
+.drawer-card .hist .spark-key .sw:not(:first-child) {
+  margin-left: 6px;
+}
+
 .drawer-card .ctrls button,
 .drawer-card .ctrls select {
   padding: 3px 7px;
@@ -949,6 +1057,21 @@ body.paused #pauseOverlay {
   left: calc(-1px - var(--rail-pad));
   width: 1px;
   background: #0c0c0c;
+}
+
+/* The refine chain, for a tag that entered the map with no tag in view: the link
+   is where it is being corrected from rather than where it came from, so it is
+   drawn as inferred — dashed and dimmer — the same standing an inferred wall has
+   against a tagged one on the map. Only the rail and its elbow change; the
+   last-child mask is per container and needs nothing. */
+.tag-kids.chained {
+  border-left-style: dashed;
+  border-left-color: #2a2a2a;
+}
+
+.tag-kids.chained > .tag-node::before {
+  border-top-style: dashed;
+  border-top-color: #2a2a2a;
 }
 
 /* A long chain must not squeeze a card to a sliver — the drawer is narrow.

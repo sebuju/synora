@@ -88,6 +88,13 @@ const signaling = connectSignaling('viewer', {
       updatePoseLabel(msg.clientId, msg);
       return;
     }
+    // The answer to the open tag card's own request. Straight through: which
+    // card is open, and whether this is still the tag it asked about, is the
+    // panel's to know.
+    if (msg.type === 'tag-history') {
+      clientsPanel.setTagHistory(msg);
+      return;
+    }
     // A client whose ARCore tracking dropped stops sending poses entirely, so
     // without this it simply fades out of the roster and the room views as if
     // it had been unplugged. It is still there and still connected; it just
@@ -705,6 +712,10 @@ const clientsPanel = createClientsPanel(drawerEl, {
   onRename: (clientId, name) => signaling.send({ type: 'device-rename', clientId, name }),
   onTagHover: setHoveredTag,
   onTagRemove: forgetMarker,
+  // What a tag has been doing, asked for by the card that is open. The panel
+  // decides when — it is the only thing that knows which card that is — and the
+  // answer goes straight back to it.
+  onTagHistory: (id) => signaling.send({ type: 'tag-history', id }),
 });
 // Open by default: the drawer is the only place that lists a client which has no
 // tile, so starting closed hides exactly the clients worth knowing about.
