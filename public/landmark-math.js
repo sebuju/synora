@@ -26,10 +26,44 @@ const LM_PM = typeof require === 'function' ? require('./pose-math.js') : global
 const CLUSTER_M = 0.05;
 // Below this the split-arc test is noise-dominated and says nothing.
 const MIN_OBS = 12;
-// Measured floor, and not a round number chosen for looks: at a 59 deg arc a
-// genuinely fixed point still showed 6.7 mm of noise-driven split gap, and at
-// 16 deg it showed 62.9 mm. Below 60 deg no honest call is possible either way.
-const MIN_ARC_DEG = 60;
+// How much of an arc a track must be seen through before it can be judged.
+//
+// This was 60, on a measurement of the split-arc test *in isolation*: at a 59
+// deg arc a genuinely fixed point showed 6.7 mm of noise-driven split gap and at
+// 16 deg it showed 62.9 mm, so below 60 deg that test alone cannot call it
+// either way. That is still true, and it is no longer the whole story — the
+// forward-backward check on the client now removes the drifting tracks upstream
+// (measured: 8.8% of tracks described a fixed point before it, 97% after), the
+// solve's RANSAC trims what still gets through, and a wrong anchor is dropped by
+// the staleness gate. The arc gate was carrying a load that has since been taken
+// off it.
+//
+// So it was swept end to end — anchors built from half a recorded walk, camera
+// localized from the other half with the tag pose withheld — across five
+// sessions:
+//
+//   session   60 deg                    40 deg                    30 deg
+//   16:35     124 · 184/245 · 47 mm     149 · 195/245 · 31 mm     184 · 203/245 · 32 mm
+//   16:51      65 · 151/256 · 36 mm     123 · 151/256 · 35 mm     160 · 224/256 · 42 mm
+//   18:22      33 ·  81/111 · 65 mm      90 ·  81/111 · 41 mm     105 ·  81/111 · 38 mm
+//   19:24      86 ·  56/267 · 31 mm     113 ·  57/267 · 58 mm     152 ·  57/267 · 45 mm
+//   23:28      21 ·  60/468 · 28 mm      55 · 106/468 · 29 mm      90 · 114/468 · 26 mm
+//
+// Anchor supply rises 1.3-2.7x, coverage rises or holds on every session, and
+// the median error is a wash — it moves both ways by ~15 mm, which is inside the
+// session-to-session spread. Supply is what is actually scarce: MIN_ANCHORS_FOR
+// _FIX is a cliff at 15, and the 23:28 walk had *21* anchors at 60 deg, so a
+// third of its map going missing was the difference between localizing 60 frames
+// and 106.
+//
+// The honest cost is the tail: worst-case position grew on three of the five
+// (151 -> 371, 369 -> 467, 334 -> 369 mm) while shrinking on the others. 40 deg
+// rather than 30 because that is where supply is bought without pushing further
+// into a tail nothing downstream measures for us.
+//
+// In walking terms this is the difference that matters to whoever is holding the
+// phone: at 2 m, 60 deg is a 2.0 m sidestep and 40 deg is 1.37 m.
+const MIN_ARC_DEG = 40;
 // The gap at the widest window must be this many times smaller than at the
 // narrowest. Measured separation: genuine points collapse ~35x, viewpoint-
 // dependent ones ~1.9x.
@@ -182,7 +216,9 @@ function unwrapAzimuths(obs, P) {
 // width, because the *trend* is the signal — see qualifyTrack.
 function splitArc(obs, P) {
   const rows = unwrapAzimuths(obs, P);
-  const span = rows[rows.length - 1].az - rows[0].az;
+  const az0 = rows[0].az;
+  const az1 = rows[rows.length - 1].az;
+  const span = az1 - az0;
   const mid = (rows[0].az + rows[rows.length - 1].az) / 2;
   const out = [];
   for (const width of [20, 40, 60, 80, 120, 180, 360]) {
@@ -196,7 +232,11 @@ function splitArc(obs, P) {
     out.push({ width: Math.round(Math.min(width, actual)), n: win.length, gap: dist3(a, b) * 1000 });
     if (width >= span) break;
   }
-  return { span, rows: out };
+  // The interval itself, not just its width. A caller telling someone where to
+  // walk needs to know which *end* of the covered arc they are standing at —
+  // the width alone cannot say whether the next step should be left or right.
+  // Unwrapped, so az1 >= az0 and the pair may run past ±180.
+  return { span, az0, az1, rows: out };
 }
 
 // Does this track describe a fixed 3D point? Returns { ok, P, ... } and, when
@@ -224,19 +264,150 @@ function qualifyTrack(obs, opts = {}) {
   if (!P || !P.every(Number.isFinite)) return { ok: false, reason: 'no-triangulation' };
   const sa = splitArc(obs, P);
   if (!sa.rows.length) return { ok: false, reason: 'no-windows' };
-  if (sa.span < minArcDeg) return { ok: false, reason: 'narrow-arc', P, span: sa.span };
+  // Computed before the narrow-arc exit, not after it. Every rejection that has
+  // a point at all now reports how well that point explains the track, because
+  // the callers that *display* candidates use `err` to tell an estimate from a
+  // triangulation that landed beside the camera — and without it here, every
+  // narrow-arc candidate looked unusable and was dropped. That silently limited
+  // both the candidate layer and the walk guidance to tracks already past the
+  // arc gate, which are exactly the ones neither has anything to say about.
+  const err = rms(P, obs);
+
+  // The narrow-arc case carries its interval too: this is *the* case the
+  // guidance reads, since a candidate that has not qualified is almost always
+  // one that has not been walked around far enough yet.
+  if (sa.span < minArcDeg) {
+    return {
+      ok: false, reason: 'narrow-arc', P, n: obs.length, err,
+      span: sa.span, az0: sa.az0, az1: sa.az1,
+    };
+  }
 
   const first = sa.rows[0];
   const last = sa.rows[sa.rows.length - 1];
-  const err = rms(P, obs);
   const out = {
-    P, n: obs.length, span: sa.span, err, first: first.gap, last: last.gap, ok: false,
+    P, n: obs.length, span: sa.span, az0: sa.az0, az1: sa.az1, err,
+    first: first.gap, last: last.gap, ok: false,
   };
   if (!(err < maxRmsPx)) return { ...out, reason: 'rms' };
   if (!(last.gap < first.gap / splitCollapse || last.gap < splitFloorMm)) {
     return { ...out, reason: 'no-collapse' };
   }
   return { ...out, ok: true, reason: null };
+}
+
+// Camera pose from matched landmarks, by seeded refinement with the outliers
+// trimmed off. Returns { p, q, rms, inliers, n } or null.
+//
+// Why this shape rather than a RANSAC. A landmark solve only ever happens
+// *just after* the client had a pose — that is the whole feature: the tags go
+// out of view and this carries on from where they left off — so a seed within a
+// frame or two of the answer is always available, and each solve seeds the
+// next. That changes what the solver has to do:
+//
+//   - It does not have to find the basin, only to stay in it. Landmarks are
+//     bearing-only and tend towards one wall, which is the weak PnP
+//     configuration; a seedless solve on 4-5 of them was measured at 1781 mm
+//     and 56.63 deg, and the 56 deg is the mirror flip. A seeded refinement
+//     cannot flip: it converges to the local minimum it started next to.
+//   - It does have to reject outliers, which tags did not need — corner
+//     detections are gated hard upstream, but an optical-flow track drifts onto
+//     its neighbour, slides along an edge, or lands on something that moved,
+//     and nothing upstream can see that.
+//
+// So: a RANSAC, with solvePose standing in for the minimal solver a RANSAC
+// normally needs. That substitution is only sound *because* of the seed —
+// solvePose is a local refiner and cannot find a basin on its own, but started
+// next to the answer and given a handful of correspondences it converges to a
+// usable hypothesis, which is all a RANSAC round asks of it.
+//
+// Fitting the whole set first and trimming what disagrees does not work here,
+// and the failure is worth recording: the first fit is dragged by the very
+// outliers it is meant to expose, so the residuals it is trimmed on are already
+// corrupted. Measured against cv.solvePnPRansac at 16 anchors with 15% of
+// tracks displaced, trim-from-a-full-fit gave a median of 69 mm where the
+// RANSAC gave 1 mm.
+//
+// Iteration count is small because the seed makes every hypothesis a good one:
+// at 30% contamination and 6-point subsets, a clean subset turns up in ~12% of
+// draws, so ~40 rounds is already well past 99% confidence.
+const TRIM_PX = 5;
+const RANSAC_ROUNDS = 48;
+const RANSAC_SUBSET = 6;
+// Hypotheses only need to be close enough to count inliers with; the winner is
+// refined properly afterwards. A full refine per hypothesis is most of the cost
+// of this function for none of the accuracy.
+const HYPOTHESIS_ITER = 15;
+
+// Deterministic, so a replay of the same journal produces the same answer twice
+// — the whole point of replay is comparing runs, and a solver that wandered
+// between them would make every comparison noise. Seeded from the problem
+// itself rather than from a clock for the same reason.
+function lcg(seedInt) {
+  let s = (seedInt >>> 0) || 1;
+  return () => {
+    s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+    return s / 4294967296;
+  };
+}
+
+function solveLandmarkPose(objPts, imgPts, K, seed, opts = {}) {
+  const n = objPts.length;
+  const minPoints = opts.minPoints ?? RANSAC_SUBSET;
+  const trimPx = opts.trimPx ?? TRIM_PX;
+  if (!seed || n < minPoints) return null;
+
+  const residualsUnder = (pose) => objPts.map((X, i) => {
+    const q = reproject(X, { K, pose });
+    return q ? Math.hypot(q[0] - imgPts[i][0], q[1] - imgPts[i][1]) : Infinity;
+  });
+  const countIn = (res) => {
+    let c = 0;
+    for (const v of res) if (v <= trimPx) c++;
+    return c;
+  };
+
+  // Seeded from the count and the first correspondence: same problem, same
+  // draws.
+  const rand = lcg(n * 7919 + Math.round((imgPts[0][0] + imgPts[0][1]) * 16));
+  const subsetSize = Math.min(RANSAC_SUBSET, n);
+
+  let bestPose = null;
+  let bestCount = -1;
+  let bestRms = Infinity;
+  for (let round = 0; round < RANSAC_ROUNDS; round++) {
+    // Partial Fisher-Yates over an index list: sampling with replacement would
+    // hand solvePose a degenerate subset.
+    const idx = objPts.map((_, i) => i);
+    for (let k = 0; k < subsetSize; k++) {
+      const j = k + Math.floor(rand() * (n - k));
+      [idx[k], idx[j]] = [idx[j], idx[k]];
+    }
+    const pick = idx.slice(0, subsetSize);
+    const sol = LM_PM.solvePose(pick.map((i) => objPts[i]), pick.map((i) => imgPts[i]),
+      K, seed, { maxIter: HYPOTHESIS_ITER });
+    if (!sol) continue;
+    const res = residualsUnder(sol);
+    const count = countIn(res);
+    if (count > bestCount || (count === bestCount && sol.rms < bestRms)) {
+      bestCount = count;
+      bestRms = sol.rms;
+      bestPose = sol;
+    }
+  }
+  if (!bestPose) return null;
+
+  // Local optimization: refit on everything the winning hypothesis agrees with,
+  // which is what turns a minimal-subset fit into an accurate one.
+  const res = residualsUnder(bestPose);
+  const obj = [];
+  const img = [];
+  for (let i = 0; i < n; i++) {
+    if (res[i] <= trimPx) { obj.push(objPts[i]); img.push(imgPts[i]); }
+  }
+  if (obj.length < minPoints) return null;
+  const refined = LM_PM.solvePose(obj, img, K, bestPose) ?? bestPose;
+  return { ...refined, inliers: obj.length, n };
 }
 
 // Several tracks routinely sit on one physical feature, so a raw count
@@ -254,7 +425,8 @@ function clusterAnchors(list, m = CLUSTER_M) {
 if (typeof module !== 'undefined') {
   module.exports = {
     undistort, rayOf, solve3, triangulate, reproject, azimuthOf, rms, dist3,
-    unwrapAzimuths, splitArc, qualifyTrack, clusterAnchors,
+    unwrapAzimuths, splitArc, qualifyTrack, clusterAnchors, solveLandmarkPose,
     CLUSTER_M, MIN_OBS, MIN_ARC_DEG, SPLIT_COLLAPSE, SPLIT_FLOOR_MM, MAX_RMS_PX,
+    TRIM_PX,
   };
 }
