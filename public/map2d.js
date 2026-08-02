@@ -302,6 +302,65 @@ function createMap2dView(canvas, mode = 'top', {
   const pairShown = (p) =>
     !pairsFocusOnly || (focusId !== null && (p.a.id === focusId || p.b.id === focusId));
 
+  // Which way round a pair's right-angle elbow turns. The decomposition can
+  // corner at either of the rectangle's two free vertices and the two say the
+  // same thing — the same two lengths, the same claim — so the choice is free,
+  // and is spent on keeping the legs out of the walls. A leg drawn through a
+  // wall reads as a distance a tape could be stretched along, which is the one
+  // thing these legs are for.
+  //
+  // Settled when the map or the walls change rather than per frame: tags glide
+  // to their positions and walls ease with them, so an elbow re-picked every
+  // frame would flip back and forth for the length of the glide.
+  const pairElbows = new Map();   // pair key -> corner at (a's across, b's up)
+  // Tags are mounted on the walls, so a leg leaves its tag from the very plane
+  // it must not be counted against. Both ends are pulled in before the test.
+  const ELBOW_END_TRIM_M = 0.15;
+
+  // Proper crossing only: two legs meeting a wall end-on at a shared point are
+  // touching it, not running along it.
+  const turn = (ox, oy, ux, uy, vx, vy) => (ux - ox) * (vy - oy) - (uy - oy) * (vx - ox);
+  function segsCross(ax, ay, bx, by, cx, cy, dx, dy) {
+    return (turn(cx, cy, dx, dy, ax, ay) > 0) !== (turn(cx, cy, dx, dy, bx, by) > 0)
+      && (turn(ax, ay, bx, by, cx, cy) > 0) !== (turn(ax, ay, bx, by, dx, dy) > 0);
+  }
+
+  function chooseElbows() {
+    pairElbows.clear();
+    // An elevation draws a wall as the face of it, not as a footprint, so there
+    // is no second way past one to pick.
+    if (elevation) return;
+    const segs = walls.filter((s) => !s.dead).map((s) => [...s.ta, ...s.tb]);
+    if (!segs.length) return;
+    for (const pair of pairs) {
+      // The positions the map arrived with, not the gliding ones — see above.
+      const [ax, ay] = proj(pair.a.p);
+      const [bx, by] = proj(pair.b.p);
+      const crossings = (ex, ey) => {
+        let n = 0;
+        for (const [p, q, trimP] of [[[ax, ay], [ex, ey], true], [[ex, ey], [bx, by], false]]) {
+          const len = Math.hypot(q[0] - p[0], q[1] - p[1]);
+          // A stub shorter than the two trims is not drawn long enough to read
+          // as running anywhere.
+          if (len <= ELBOW_END_TRIM_M * 2) continue;
+          const t = ELBOW_END_TRIM_M / len;
+          // Only the tag end of each leg is pulled in; the corner is out in the
+          // room and a wall through it is a wall the leg really does cross.
+          const x1 = trimP ? p[0] + (q[0] - p[0]) * t : p[0];
+          const y1 = trimP ? p[1] + (q[1] - p[1]) * t : p[1];
+          const x2 = trimP ? q[0] : q[0] - (q[0] - p[0]) * t;
+          const y2 = trimP ? q[1] : q[1] - (q[1] - p[1]) * t;
+          for (const s of segs) if (segsCross(x1, y1, x2, y2, s[0], s[1], s[2], s[3])) n++;
+        }
+        return n;
+      };
+      // Ties keep the corner the view has always turned: with no wall to
+      // separate them the two elbows are equally good, and one of them being
+      // the default is what stops the pick wandering as walls come and go.
+      if (crossings(ax, by) < crossings(bx, ay)) pairElbows.set(pairKey(pair), true);
+    }
+  }
+
   function distToSeg(x, y, x1, y1, x2, y2) {
     const dx = x2 - x1;
     const dy = y2 - y1;
@@ -1067,13 +1126,16 @@ function createMap2dView(canvas, mode = 'top', {
         * Math.min(markers.get(a.id)?.fade ?? 1, markers.get(b.id)?.fade ?? 1);
       if (legAlpha <= 0.01) continue;
       ctx.globalAlpha = legAlpha;
-      // The elbow: b's across-screen axis, a's up-screen one. Built off this
-      // view's own pair rather than off a fixed component, or a projection that
-      // does not keep x draws its corner on top of one of the tags.
+      // The elbow: by default b's across-screen axis and a's up-screen one, the
+      // other way round where that is the corner that keeps the legs out of the
+      // walls (see chooseElbows). Built off this view's own axis pair rather
+      // than off a fixed component, or a projection that does not keep x draws
+      // its corner on top of one of the tags.
       const [ax, ay] = px(ap);
       const [bx, by] = px(bp);
       const elbow = ap.slice();
-      elbow[axisA] = bp[axisA];
+      if (pairElbows.get(key)) elbow[axisB] = bp[axisB];
+      else elbow[axisA] = bp[axisA];
       const [cx, cy] = px(elbow);
       // A chain link is not a distance worth tape-measuring, it is where this
       // tag's position came from — drawn differently so the two are not read as
@@ -1435,6 +1497,7 @@ function createMap2dView(canvas, mode = 'top', {
       for (const [id, m] of markers) {
         if (!live.has(id)) m.dead = true;
       }
+      chooseElbows();
       schedule();
     },
 
@@ -1645,6 +1708,9 @@ function createMap2dView(canvas, mode = 'top', {
         out.push(s);
       }
       walls = out;
+      // The walls are half of what decides which way each pair's elbow turns,
+      // and they arrive on their own schedule.
+      chooseElbows();
       schedule();
     },
 
