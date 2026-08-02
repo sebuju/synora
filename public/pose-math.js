@@ -300,6 +300,53 @@ function transformPoint(t, v) {
   return [r[0] + t.p[0], r[1] + t.p[1], r[2] + t.p[2]];
 }
 
+// Where the pixels of one frame land in the next under camera *rotation* alone:
+// the homography K R Kinv, with R the rotation carrying the earlier camera's
+// axes onto the later one's. Translation is left out on purpose — it is the
+// only part of the motion that needs the scene depth, which nothing here knows,
+// and at walking speed over one frame interval it displaces a pixel by far less
+// than rotation does.
+//
+// `qPrev`/`qCur` are camera orientations in any one shared frame (which one does
+// not matter, only their relative rotation does), `K` the camera model of the
+// image the pixels are measured in. Returns a row-major 3x3, or null when the
+// model is unusable.
+function rotationWarp(qPrev, qCur, K) {
+  if (!qPrev || !qCur || !(K?.fx > 0) || !(K?.fy > 0)) return null;
+  const rel = quatNormalize(quatMul(quatConj(qCur), qPrev));
+  // Columns of R are the rotated basis vectors.
+  const c0 = quatRotate(rel, [1, 0, 0]);
+  const c1 = quatRotate(rel, [0, 1, 0]);
+  const c2 = quatRotate(rel, [0, 0, 1]);
+  const R = [
+    c0[0], c1[0], c2[0],
+    c0[1], c1[1], c2[1],
+    c0[2], c1[2], c2[2],
+  ];
+  // M = R * Kinv, with Kinv = [[1/fx,0,-cx/fx],[0,1/fy,-cy/fy],[0,0,1]].
+  const M = [];
+  for (let r = 0; r < 3; r++) {
+    const a = R[r * 3];
+    const b = R[r * 3 + 1];
+    const c = R[r * 3 + 2];
+    M.push(a / K.fx, b / K.fy, c - a * K.cx / K.fx - b * K.cy / K.fy);
+  }
+  // H = K * M.
+  return [
+    K.fx * M[0] + K.cx * M[6], K.fx * M[1] + K.cx * M[7], K.fx * M[2] + K.cx * M[8],
+    K.fy * M[3] + K.cy * M[6], K.fy * M[4] + K.cy * M[7], K.fy * M[5] + K.cy * M[8],
+    M[6], M[7], M[8],
+  ];
+}
+
+// Apply a row-major 3x3 to a pixel. Null when the point maps behind the camera,
+// where there is no image position to predict.
+function applyWarp(H, u, v) {
+  const w = H[6] * u + H[7] * v + H[8];
+  if (!(w > 1e-9)) return null;
+  return [(H[0] * u + H[1] * v + H[2]) / w, (H[3] * u + H[4] * v + H[5]) / w];
+}
+
 // Camera pose from 3D-2D correspondences: Levenberg-damped Gauss-Newton over
 // six parameters, minimising reprojection error in pixels. This exists because
 // the server has no OpenCV and needs to solve PnP against the corners of
@@ -485,5 +532,6 @@ if (typeof module !== 'undefined') {
     se3Invert, se3Identity, transformPoint, quatFromTo, solvePose,
     matFromRvec, rvecFromMat, matMul3, mirrorRvecGuesses,
     tagPlaneAgreement, CLIP_PLANE_M, CLIP_PARALLEL_COS,
+    rotationWarp, applyWarp,
   };
 }

@@ -53,9 +53,15 @@ const IDLE_SCAN_MS = 350;
 // Tracking runs downscaled where detection deliberately does not: a rescaled
 // frame is a rescaled camera model and tag corners are refined at native
 // resolution on purpose, but a tracked feature is only ever a correspondence.
-// Measured, more clean pixels lose to fewer: 720p at 1 Mbps localized to 58 mm
-// where 1080p at 1.5 Mbps managed 125 mm. 720 is the operating point, not a
-// compromise.
+//
+// This was briefly dropped to 560 on the theory that a smaller image would both
+// cost less and turn the same physical motion into fewer tracking pixels, so
+// fewer frames would exceed what optical flow can follow. The theory did not
+// survive measurement: on matched windows of the same walk, retention was
+// identical (97% median, 98% on frames under 50 px of motion) at both widths.
+// It bought nothing, so it stays where it was — corner positions are localized
+// in tracking pixels and their full-frame error scales with the reciprocal, so
+// the wider image is the more precise one at equal retention.
 const TRACK_WIDTH = 720;
 const TRACK_MAX_CORNERS = 300;
 const TRACK_QUALITY = 0.01;      // Shi-Tomasi default; not independently tuned
@@ -66,10 +72,41 @@ const TRACK_RESEED_EVERY = 5;
 // points the survey has anyway.
 const TRACK_TAG_MASK_PAD = 24;
 const TRACK_LK_WIN = 21;
-const TRACK_LK_LEVELS = 3;
 // A point on the frame edge is half-visible and drifts; drop it rather than
 // carry a corner that is really the picture ending.
 const TRACK_EDGE_PX = 2;
+// Forward-backward round-trip tolerance — see follow(). Proportional to how far
+// the point actually moved, with a floor and a ceiling.
+//
+// A flat sub-pixel tolerance is wrong here, and measurably so. At this cadence a
+// walking phone carries a feature 50-150 px between frames, and the round trip
+// then misses by more than a pixel from interpolation and the aperture problem
+// alone, with no drift involved at all. A flat 1 px threshold therefore does not
+// select against drift, it selects against *motion* — measured on a real
+// session, the surviving tracks had a median camera baseline of 5.9 cm over
+// 6.7 s, i.e. only the near-stationary ones lived, and a stationary track can
+// never accumulate the viewing arc a landmark is qualified on.
+//
+// Scaling with displacement keeps the test where it belongs: a point that
+// barely moved must come back almost exactly, one that swept across the frame
+// is allowed a few percent of that sweep.
+const TRACK_FB_MIN_PX = 1;
+const TRACK_FB_FRAC = 0.04;
+const TRACK_FB_CAP_PX = 4;
+// Pyramid levels for the flow. Raised from 3 with the same measurement in mind:
+// three levels resolve about 21 * 2^3 px of displacement, which a walking phone
+// exceeds, and a track that outruns the pyramid is lost exactly when it was
+// about to become useful.
+const TRACK_LK_LEVELS = 4;
+// A predicted point further outside the picture than this is not carried into
+// the flow: the seed would be a guess about pixels that do not exist, and the
+// point's previous position is the better of two bad starts. Sized on the
+// search window, since a seed that far out has no overlap with the image left
+// to lock onto anyway.
+const TRACK_WARP_SLACK_PX = TRACK_LK_WIN;
+// OpenCV's own default. Named only because passing the flags argument means
+// passing this one too — the binding takes them positionally.
+const LK_MIN_EIG = 1e-4;
 
 function createDetectCore() {
   let cv = null;
@@ -592,6 +629,24 @@ function createFeatureTracker(cv, source, opts = {}) {
   // landmark, it *invents* one, by averaging two different physical points.
   let generation = 1;
   let cycles = 0;
+  // Per-call diagnostics — see follow(). `moved` is the median inter-frame
+  // displacement in tracking pixels, which is the number that decides whether
+  // optical flow can work at this cadence at all.
+  let drops = { status: 0, edge: 0, fb: 0 };
+  let movedSum = 0;
+  let movedN = 0;
+  // How far the rotation prediction said the points would move, against `moved`
+  // below, which is how far they actually did. The two being close is what says
+  // the seed is doing its job; a large `moved` with a near-zero `pred` says the
+  // camera pose is not reaching here at all, which is otherwise invisible.
+  let predSum = 0;
+  let predN = 0;
+  // The camera orientation and model of the frame prevGray came from. Kept here
+  // rather than handed in per call because the prediction has to relate *the
+  // frame the tracker last kept* to this one, and the caller does not know which
+  // one that was — a frame the detector skipped would silently make the caller's
+  // idea of "previous" a frame older than the pixels being tracked from.
+  let prevView = null;
 
   // The picture changed underneath us (camera switch, resume, new track), so
   // every id in flight now means something else. `nextId` deliberately keeps
@@ -600,6 +655,7 @@ function createFeatureTracker(cv, source, opts = {}) {
   function reset() {
     prevGray?.delete();
     prevGray = null;
+    prevView = null;
     live = [];
     cycles = 0;
     generation++;
@@ -624,6 +680,31 @@ function createFeatureTracker(cv, source, opts = {}) {
     return mask;
   }
 
+  // The rotation prediction, expressed in the pixels the tracker actually works
+  // in. The camera model the caller supplies describes the *full frame* — the
+  // same convention every intrinsic in this codebase follows — while the points
+  // live in the downscaled grab, so the homography is conjugated by the grab's
+  // own scale and offset rather than the camera model being rescaled. A rescaled
+  // camera model would be a second description of the camera, and the one thing
+  // this file is careful about is that exactly one coordinate space leaves it.
+  //
+  // Null whenever anything is missing: no view from the caller, no view stored
+  // for the previous frame, or a model that cannot be inverted. Prediction is an
+  // optimisation, never a requirement — /client has no rotation source at all
+  // and tracks perfectly well without one.
+  function warpFor(prev, cur, grabbed) {
+    if (!prev || !cur) return null;
+    const H = rotationWarp(prev.q, cur.q, cur.K);
+    if (!H) return null;
+    const s = grabbed.scale ?? 1;
+    const x = grabbed.rect?.x ?? 0;
+    const y = grabbed.rect?.y ?? 0;
+    // S: full-frame -> tracking pixels. Sinv the other way.
+    const S = [s, 0, -x * s, 0, s, -y * s, 0, 0, 1];
+    const Sinv = [1 / s, 0, x, 0, 1 / s, y, 0, 0, 1];
+    return matMul3(S, matMul3(H, Sinv));
+  }
+
   function pointsMat(list) {
     const flat = new Float32Array(list.length * 2);
     for (let i = 0; i < list.length; i++) {
@@ -633,40 +714,136 @@ function createFeatureTracker(cv, source, opts = {}) {
     return cv.matFromArray(list.length, 1, cv.CV_32FC2, flat);
   }
 
-  function follow(gray, w, h) {
+  // Follow the live set into this frame, and check the answer by tracking it
+  // straight back again.
+  //
+  // The backward pass is not optional polish, it is what makes a track mean
+  // anything. Lucas-Kanade always returns a position and reports `status = 1`
+  // for it; on a repeating texture, a soft edge or an occlusion boundary that
+  // position slides a little each frame, and after a few seconds the track sits
+  // on different content entirely while still looking perfectly healthy.
+  // Nothing downstream can see it happen — triangulation just quietly stops
+  // describing a fixed point.
+  //
+  // Measured on a real room session before this existed: of 3447 tracks with
+  // enough sightings to judge, 304 (8.8%) reproduced a single 3D point; the
+  // rest reprojected at hundreds to tens of thousands of pixels. Their viewing
+  // arcs looked *wide*, which was the tell — a triangulation with no answer
+  // lands the point next to the camera, and the bearing to something a few
+  // centimetres away swings through most of a circle as the phone moves.
+  //
+  // Tracking back and requiring the round trip to return to where it started is
+  // the standard cure and the only one that costs no accuracy: a point that
+  // drifted forward does not come back.
+  // Where the live set is expected to land this frame, from the camera rotation
+  // alone (see rotationWarp). Returns the seed positions in tracking pixels, or
+  // null when there is nothing to predict from.
+  //
+  // This is the answer to the churn ceiling, and the ceiling is the thing that
+  // decides whether a track ever lives long enough to be triangulated: measured,
+  // retention is 97% below 50 px of inter-frame motion and collapses to ~20%
+  // above 100 px, and those frames are ~15% of a normal walk. What LK is being
+  // asked to do on them is find a displacement larger than its pyramid resolves,
+  // starting from the assumption that the point did not move — and rotation is
+  // most of that displacement, which the phone already knows and was not being
+  // told.
+  function predictInto(p1, Ht, w, h) {
+    let sum = 0;
+    let n = 0;
+    for (let k = 0; k < live.length; k++) {
+      const q = applyWarp(Ht, live[k].u, live[k].v);
+      // Outside the picture by more than the search window: the prediction is
+      // about pixels that are not there, so start from where the point was and
+      // let the flow (and the edge test) decide.
+      const usable = q && Number.isFinite(q[0]) && Number.isFinite(q[1])
+        && q[0] > -TRACK_WARP_SLACK_PX && q[1] > -TRACK_WARP_SLACK_PX
+        && q[0] < w + TRACK_WARP_SLACK_PX && q[1] < h + TRACK_WARP_SLACK_PX;
+      const u = usable ? q[0] : live[k].u;
+      const v = usable ? q[1] : live[k].v;
+      p1.data32F[k * 2] = u;
+      p1.data32F[k * 2 + 1] = v;
+      if (usable) {
+        sum += Math.hypot(u - live[k].u, v - live[k].v);
+        n++;
+      }
+    }
+    return n ? sum / n : 0;
+  }
+
+  function follow(gray, w, h, Ht) {
     const p0 = pointsMat(live);
-    const p1 = new cv.Mat();
+    const p1 = Ht ? pointsMat(live) : new cv.Mat();
+    const pBack = new cv.Mat();
     const st = new cv.Mat();
+    const stBack = new cv.Mat();
     const errM = new cv.Mat();
+    const errBack = new cv.Mat();
     try {
-      cv.calcOpticalFlowPyrLK(prevGray, gray, p0, p1, st, errM,
-        winSize, opts.levels ?? TRACK_LK_LEVELS, criteria);
+      const levels = opts.levels ?? TRACK_LK_LEVELS;
+      if (Ht) {
+        predSum += predictInto(p1, Ht, w, h) * live.length;
+        predN += live.length;
+      }
+      cv.calcOpticalFlowPyrLK(prevGray, gray, p0, p1, st, errM, winSize, levels,
+        criteria, Ht ? cv.OPTFLOW_USE_INITIAL_FLOW : 0, LK_MIN_EIG);
+      // The backward pass is deliberately *not* seeded, even though the seed for
+      // it is sitting right there in `live`. Starting it at the answer it is
+      // supposed to find independently is starting it at zero error: it would
+      // return that seed and every track would pass the round trip, which is the
+      // one check keeping drifted tracks out of the map.
+      cv.calcOpticalFlowPyrLK(gray, prevGray, p1, pBack, stBack, errBack,
+        winSize, levels, criteria);
+      // Why points are lost, not just how many. A track set can churn itself to
+      // nothing three entirely different ways — the flow gives up, the point
+      // leaves the frame, or the round trip disagrees — and they call for
+      // opposite fixes, so guessing between them is worse than useless.
       const kept = [];
       for (let k = 0; k < live.length; k++) {
-        if (!st.data[k]) continue;
+        if (!st.data[k] || !stBack.data[k]) { drops.status++; continue; }
         const u = p1.data32F[k * 2];
         const v = p1.data32F[k * 2 + 1];
         if (!(u > TRACK_EDGE_PX && v > TRACK_EDGE_PX
-          && u < w - TRACK_EDGE_PX && v < h - TRACK_EDGE_PX)) continue;
+          && u < w - TRACK_EDGE_PX && v < h - TRACK_EDGE_PX)) { drops.edge++; continue; }
+        // Where the round trip landed against where it set off, judged against
+        // how far the point moved getting there.
+        const fb = Math.hypot(pBack.data32F[k * 2] - live[k].u,
+          pBack.data32F[k * 2 + 1] - live[k].v);
+        const moved = Math.hypot(u - live[k].u, v - live[k].v);
+        const tol = Math.min(TRACK_FB_CAP_PX,
+          Math.max(TRACK_FB_MIN_PX, moved * TRACK_FB_FRAC));
+        movedSum += moved;
+        movedN++;
+        if (!(fb <= tol)) { drops.fb++; continue; }
         kept.push({ id: live[k].id, u, v });
       }
       live = kept;
     } finally {
       p0.delete();
       p1.delete();
+      pBack.delete();
       st.delete();
+      stBack.delete();
       errM.delete();
+      errBack.delete();
     }
   }
 
   // Tracks die constantly — occlusion, leaving frame, drift — so without a
   // top-up the set decays to nothing within seconds of starting.
+  //
+  // `maxCorners` is a ceiling on the *live set*, not on what one top-up adds.
+  // Asking goodFeaturesToTrack for the full count and appending all of it grows
+  // the set past the cap — measured at 401 live points against a cap of 300,
+  // and every one of them is paid for again in the next LK pass and in every
+  // pose message.
   function reseed(gray, boxes, scale) {
+    const room = maxCorners - live.length;
+    if (room <= 0) return;
     const found = new cv.Mat();
     try {
-      cv.goodFeaturesToTrack(gray, found, maxCorners, quality, minDist,
+      cv.goodFeaturesToTrack(gray, found, room, quality, minDist,
         buildMask(gray.cols, gray.rows, boxes, scale), 3, false, 0.04);
-      for (let k = 0; k < found.rows; k++) {
+      for (let k = 0; k < found.rows && live.length < maxCorners; k++) {
         const u = found.data32F[k * 2];
         const v = found.data32F[k * 2 + 1];
         // Do not stack a second track on a point already being followed: two
@@ -688,7 +865,13 @@ function createFeatureTracker(cv, source, opts = {}) {
     // result. Returns points in full-frame pixels — the same discipline the
     // ROI scan applies to tag corners, so only one coordinate space ever leaves
     // this file — or null if the frame could not be read.
-    async track(frame, boxes = []) {
+    //
+    // `view` is optional: `{ q, K }`, the camera's orientation for this frame in
+    // whatever frame the caller is consistent about, and the full-frame camera
+    // model. Given one, the flow is seeded with where rotation alone says each
+    // point went (see warpFor); without one it starts from where the point was,
+    // which is what /client does — it has no rotation source.
+    async track(frame, boxes = [], view = null) {
       const t0 = performance.now();
       const grabbed = await source.luma(frame, null);
       if (!grabbed) return null;
@@ -702,7 +885,16 @@ function createFeatureTracker(cv, source, opts = {}) {
         // different picture, so start over rather than follow them into it.
         reset();
       }
-      if (prevGray && live.length) follow(gray, w, h);
+      drops = { status: 0, edge: 0, fb: 0 };
+      movedSum = 0;
+      movedN = 0;
+      predSum = 0;
+      predN = 0;
+      const before = live.length;
+      if (prevGray && live.length) {
+        follow(gray, w, h, warpFor(prevView, view, grabbed));
+      }
+      const followed = live.length;
       if (cycles % reseedEvery === 0 || live.length < maxCorners / 3) {
         reseed(gray, boxes, scale);
       }
@@ -710,10 +902,23 @@ function createFeatureTracker(cv, source, opts = {}) {
 
       prevGray?.delete();
       prevGray = gray.clone();
+      prevView = view;
 
       return {
         gen: generation,
         ms: performance.now() - t0,
+        // What happened to the set this cycle: how many were carried in, how
+        // many survived, why the rest did not, and how far they moved. Churn is
+        // the thing that decides whether a track ever lives long enough to be
+        // triangulated, and none of it is visible from the point list alone.
+        churn: {
+          in: before,
+          kept: followed,
+          seeded: live.length - followed,
+          ...drops,
+          moved: movedN ? Math.round(movedSum / movedN) : 0,
+          pred: predN ? Math.round(predSum / predN) : null,
+        },
         points: live.map((p) => ({
           id: p.id,
           u: p.u / scale + grabbed.rect.x,

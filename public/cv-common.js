@@ -494,16 +494,57 @@ function evenRect(rect, fw, fh) {
 // Only the requested rectangle is converted: on an ROI scan that is a small
 // crop of a 1920-row frame, and colour conversion over the whole frame to throw
 // most of it away was the largest avoidable cost on this path.
-function createRgbaLumaSource(cv) {
+// `maxWidth` caps the width of the Mat returned, as on the canvas source and
+// for the same consumer: the feature tracker wants a small image and nothing
+// else. Here the downscale is a cv.resize after conversion rather than a free
+// GPU blit, because these pixels never touch a canvas — still far cheaper than
+// tracking at native resolution, and the tracker is the only caller that asks.
+// One source serves both consumers on this path — the detector, which wants a
+// crop at native resolution, and the feature tracker, which wants the whole
+// frame small. It has to, and the measurement is why: the RGBA copy is 6.6 MB
+// with a row-by-row flip, and doing it twice per frame put the tracker at a
+// median of 117 ms on a real phone, which dropped the effective rate to 3-5 Hz,
+// which let the camera move 100+ px between frames, which is exactly where
+// optical flow stops holding on. The duplicated copy was paying for its own
+// failure.
+//
+// So the fill is keyed on the pixel buffer: the second call in a frame passes
+// the same Uint8Array and skips straight to conversion. Grays are cached per
+// requested size rather than in one slot, because the two consumers ask for
+// different sizes and a single slot would reallocate on every call — which was
+// the original reason for giving them separate sources.
+function createRgbaLumaSource(cv, { maxWidth = 0 } = {}) {
   let rgba = null;
-  let gray = null;
   let rw = 0;
   let rh = 0;
-  let gw = 0;
-  let gh = 0;
+  let filledFrom = null;   // the pixel buffer already copied in
+  // One slot per *role* rather than a cache keyed by size. A size-keyed cache
+  // with any eviction policy can throw away a Mat the current call is still
+  // about to write into — which is exactly what happened: the tracker fetched
+  // its output buffer, then fetching the full-frame intermediate evicted it,
+  // and the resize wrote into freed memory. The tracker caught the throw, shut
+  // itself off for the session, and the only symptom was a line quietly missing
+  // from the overlay.
+  //
+  // Three slots is all this needs, and none of them can collide: the detector
+  // asks at native size, the tracker asks scaled, and the intermediate belongs
+  // to the scaled path alone.
+  let grayNative = null;   // unscaled returns (the detector's crop or full frame)
+  let grayFull = null;     // full-frame intermediate, scaled path only
+  let graySmall = null;    // scaled returns (the tracker)
+
+  function sized(mat, w, h) {
+    if (mat && mat.cols === w && mat.rows === h) return mat;
+    mat?.delete();
+    return new cv.Mat(h, w, cv.CV_8UC1);
+  }
 
   return {
-    luma(image, rect) {
+    // `opts.maxWidth` overrides the instance default, so one source can serve a
+    // detector that wants native resolution and a tracker that wants a small
+    // image, in the same frame, without copying the pixels twice.
+    luma(image, rect, opts = {}) {
+      const cap = opts.maxWidth ?? maxWidth;
       const { data, w: fw, h: fh, flipY } = image;
       if (!fw || !fh || !data) return null;
       if (rw !== fw || rh !== fh) {
@@ -511,33 +552,60 @@ function createRgbaLumaSource(cv) {
         rgba = new cv.Mat(fh, fw, cv.CV_8UC4);
         rw = fw;
         rh = fh;
+        filledFrom = null;
       }
-      const row = fw * 4;
-      if (flipY) {
-        for (let y = 0; y < fh; y++) {
-          rgba.data.set(data.subarray((fh - 1 - y) * row, (fh - y) * row), y * row);
+      if (filledFrom !== data) {
+        const row = fw * 4;
+        if (flipY) {
+          for (let y = 0; y < fh; y++) {
+            rgba.data.set(data.subarray((fh - 1 - y) * row, (fh - y) * row), y * row);
+          }
+        } else {
+          rgba.data.set(data);
         }
-      } else {
-        rgba.data.set(data);
+        filledFrom = data;
       }
       const r = rect ? evenRect(rect, fw, fh) : { x: 0, y: 0, w: fw, h: fh };
-      if (gw !== r.w || gh !== r.h) {
-        gray?.delete();
-        gray = new cv.Mat(r.h, r.w, cv.CV_8UC1);
-        gw = r.w;
-        gh = r.h;
-      }
       const whole = r.x === 0 && r.y === 0 && r.w === fw && r.h === fh;
+      const scaled = cap && r.w > cap;
+      // Convert straight into the size that is wanted: a downscaling caller had
+      // been converting the whole frame and then shrinking it, which is the
+      // expensive half of the work done at full resolution for nothing.
+      const dw = scaled ? cap : r.w;
+      const dh = scaled ? Math.max(1, Math.round(r.h * (dw / r.w))) : r.h;
       const src = whole ? rgba : rgba.roi(new cv.Rect(r.x, r.y, r.w, r.h));
-      cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+      let gray;
+      if (scaled) {
+        // Convert first, shrink second — and it is worth saying why, because the
+        // other order looks cheaper and is not. Shrinking in colour means
+        // INTER_AREA averaging four channels at full resolution; converting
+        // first throws three of them away before any of that work happens.
+        // Measured on an 860x1920 frame down to 720: 26.7 ms the colour-first
+        // way against 9.3 ms this way.
+        grayFull = sized(grayFull, r.w, r.h);
+        graySmall = sized(graySmall, dw, dh);
+        gray = graySmall;
+        cv.cvtColor(src, grayFull, cv.COLOR_RGBA2GRAY);
+        // INTER_AREA rather than INTER_LINEAR (4.8 ms) on purpose: this is a
+        // downscale of nearly 2x and linear sampling aliases, which puts noise
+        // straight into the corners the tracker is about to follow.
+        cv.resize(grayFull, gray, new cv.Size(dw, dh), 0, 0, cv.INTER_AREA);
+      } else {
+        grayNative = sized(grayNative, dw, dh);
+        gray = grayNative;
+        cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+      }
       if (!whole) src.delete();
-      return { mat: gray, rect: r, scale: 1 };
+      return { mat: gray, rect: r, scale: dw / r.w };
     },
     dispose() {
       rgba?.delete();
-      gray?.delete();
-      rgba = gray = null;
-      rw = rh = gw = gh = 0;
+      grayNative?.delete();
+      grayFull?.delete();
+      graySmall?.delete();
+      rgba = grayNative = grayFull = graySmall = null;
+      rw = rh = 0;
+      filledFrom = null;
     },
   };
 }

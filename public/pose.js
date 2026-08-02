@@ -48,27 +48,6 @@ const posePipeline = (() => {
   let busy = false;
   let lastDetect = 0;
 
-  // Landmark feature tracking, off unless asked for. It is switched here rather
-  // than through the server's pose config because it is a measurement build's
-  // toggle, not a room setting: it costs CPU on the client and a few KB per
-  // message on the signaling socket, and nothing consumes it yet.
-  const trackFeatures = (() => {
-    const q = new URLSearchParams(location.search).get('landmarks');
-    if (q !== null) {
-      try {
-        localStorage.setItem('streamer-landmarks', q === '1' || q === 'true' ? '1' : '0');
-      } catch {
-        // Private mode; the query parameter still governs this load.
-      }
-      return q === '1' || q === 'true';
-    }
-    try {
-      return localStorage.getItem('streamer-landmarks') === '1';
-    } catch {
-      return false;
-    }
-  })();
-  let lastTracked = null;
 
 
   const statsEl = document.getElementById('poseStats');
@@ -91,10 +70,7 @@ const posePipeline = (() => {
   // Results, from whichever thread produced them.
 
   function publishPose(res) {
-    // Undefined rather than null when tracking is off: JSON.stringify drops an
-    // undefined field entirely, so a client without landmarks publishes the
-    // byte-identical message it published before this existed.
-    const K = res.points ? intrinsicsAt(res.w, res.h) : undefined;
+    const K = intrinsicsAt(res.w, res.h);
     signaling.send({
       type: 'pose',
       t: clockSync.synced ? clockSync.at(res.at) : null,
@@ -110,15 +86,17 @@ const posePipeline = (() => {
       tags: res.tags,
       points: res.points,
       gen: res.gen,
-      // The camera model, for the landmark solver: tag poses are solved here,
-      // but a landmark is only a pixel until the server has a K to turn it into
-      // a bearing, and the server has no access to this client's calibration.
-      // Sent on every message rather than tracked for changes — it is four
-      // numbers and a coefficient vector, a mid-session resolution switch is
-      // normal, and a stale camera model biases every landmark silently.
-      intr: K ? {
-        fx: K.fx, fy: K.fy, cx: K.cx, cy: K.cy, dist: K.dist,
-      } : undefined,
+      // The camera model. Tag poses are solved on this side, but the server
+      // needs one too — to turn a landmark pixel into a bearing, and for the
+      // survey's joint multi-tag PnP — and it has no access to this client's
+      // stored calibration.
+      //
+      // Sent on every message, unconditionally. Tracking when it changed would
+      // be false economy at six numbers, a mid-session resolution switch is
+      // normal, and a stale camera model biases everything it touches in
+      // silence. It was briefly conditional, and the cost of that was the joint
+      // PnP quietly never running.
+      intr: K && { fx: K.fx, fy: K.fy, cx: K.cx, cy: K.cy, dist: K.dist },
     });
     updateStats(res);
   }
@@ -226,7 +204,6 @@ const posePipeline = (() => {
       timeOrigin: performance.timeOrigin,
       markerSizeM: config.markerSizeM,
       poseRateMs: config.poseRateMs,
-      trackFeatures,
     });
     return worker;
   }
@@ -255,10 +232,8 @@ const posePipeline = (() => {
       canvasSource ??= createCanvasLumaSource(core.cv);
       // The tracker's own source, at its own width — see createFeatureTracker
       // for why it cannot share the detector's.
-      if (trackFeatures) {
-        tracker ??= createFeatureTracker(core.cv,
-          createCanvasLumaSource(core.cv, { maxWidth: TRACK_WIDTH }));
-      }
+      tracker ??= createFeatureTracker(core.cv,
+        createCanvasLumaSource(core.cv, { maxWidth: TRACK_WIDTH }));
       core.setMarkerSize(config.markerSizeM);
     })().finally(() => {
       coreStarting = null;
