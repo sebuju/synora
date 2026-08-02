@@ -11,36 +11,20 @@
     <a class="home" href="/" title="Back to start">Dashboard</a>
     <span id="status" class="grow">connecting…</span>
     <span id="syncLabel"></span>
-    <!-- Views | room overlays | room-data wipes | the drawer. -->
+    <!-- Views | room overlays | the drawer. Nothing here destroys anything —
+         the two wipes live in the drawer, beside the tag list they empty. -->
     <button id="sceneBtn" class="toggle">3D</button>
     <button id="map2dBtn" class="toggle">Top</button>
-    <button id="sideBtn" class="toggle">Side</button>
+    <!-- The two elevations differ only in which room axis runs across the
+         screen; the axis gizmo in each one's corner says which. -->
+    <button id="sideBtn" class="toggle" title="Elevation across x">Side</button>
+    <button id="frontBtn" class="toggle" title="Elevation across z">Front</button>
     <span class="sep"></span>
     <button id="poseBtn" class="toggle">Pose</button>
     <button id="wallsBtn" class="toggle">Walls</button>
-    <span class="sep"></span>
-    <!-- The two wipes read as one pair: the same strike over the thing being
-         forgotten, a surveyed tag and a carved cell. -->
-    <button id="clearTagsBtn" class="icon-btn compact" type="button" title="Clear tags" aria-label="Clear tags">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
-           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <path d="M4 8V5.5A1.5 1.5 0 0 1 5.5 4H8"/>
-        <path d="M16 4h2.5A1.5 1.5 0 0 1 20 5.5V8"/>
-        <path d="M20 16v2.5a1.5 1.5 0 0 1-1.5 1.5H16"/>
-        <path d="M8 20H5.5A1.5 1.5 0 0 1 4 18.5V16"/>
-        <rect x="9" y="9" width="6" height="6"/>
-        <path d="M3.5 20.5l17-17"/>
-      </svg>
-    </button>
-    <button id="clearCarveBtn" class="icon-btn compact" type="button" title="Clear carve" aria-label="Clear carve">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
-           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <rect x="4" y="4" width="16" height="16" rx="1.5"/>
-        <path d="M12 4v16"/>
-        <path d="M4 12h16"/>
-        <path d="M3.5 20.5l17-17"/>
-      </svg>
-    </button>
+    <button id="landmarksBtn" class="toggle" title="Landmark anchors">Anchors</button>
+    <button id="candidatesBtn" class="toggle"
+      title="Tracked features that have not qualified yet, shaded by how much of the qualifying viewing arc each has been seen through">Candidates</button>
     <span class="sep"></span>
     <button id="drawerBtn" class="icon-btn compact" type="button" title="Drawer" aria-label="Drawer">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
@@ -59,16 +43,47 @@
         <div id="maps2d">
           <canvas id="map2d"></canvas>
           <canvas id="mapSide"></canvas>
+          <canvas id="mapFront"></canvas>
         </div>
         <div id="roomStats"></div>
       </div>
     </div>
     <div id="drawer">
-      <!-- Controls for what the drawer itself holds: the composite below, and
-           the audio of the feeds it shows. Both were in the header, where they
-           were reachable while the only thing they act on was hidden. The panel
-           appends the roster and the tags after these, so they stay at the top. -->
+      <!-- Controls for what the drawer itself holds: the composite below, the
+           audio of the feeds it shows, and the two wipes that forget the survey
+           and the carve the tag list under here is made of. All were in the
+           header, where they sat among the view toggles — a row of things that
+           change what is drawn, with two that destroy what it is drawn from. The
+           panel appends the roster and the tags after these, so they stay at the
+           top. -->
       <div id="drawerTools">
+        <!-- The two wipes read as one pair: the same strike over the thing being
+             forgotten, a surveyed tag and a carved cell. Red before they are
+             even reached for — the two-click arming says "this one, now", the
+             colour says "these two are not like the others". Held at the far end
+             of the row from the controls that only change what is shown, so the
+             pointer never passes over one on its way to the other. -->
+        <button id="clearTagsBtn" class="icon-btn compact danger" type="button" title="Clear tags" aria-label="Clear tags">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M4 8V5.5A1.5 1.5 0 0 1 5.5 4H8"/>
+            <path d="M16 4h2.5A1.5 1.5 0 0 1 20 5.5V8"/>
+            <path d="M20 16v2.5a1.5 1.5 0 0 1-1.5 1.5H16"/>
+            <path d="M8 20H5.5A1.5 1.5 0 0 1 4 18.5V16"/>
+            <rect x="9" y="9" width="6" height="6"/>
+            <path d="M3.5 20.5l17-17"/>
+          </svg>
+        </button>
+        <button id="clearCarveBtn" class="icon-btn compact danger" type="button" title="Clear carve" aria-label="Clear carve">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="4" y="4" width="16" height="16" rx="1.5"/>
+            <path d="M12 4v16"/>
+            <path d="M4 12h16"/>
+            <path d="M3.5 20.5l17-17"/>
+          </svg>
+        </button>
+        <span class="grow"></span>
         <button id="combinedBtn" class="icon-btn compact" type="button" title="Camera composite" aria-label="Camera composite">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
                stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">

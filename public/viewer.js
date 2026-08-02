@@ -2,6 +2,10 @@
 
 const grid = document.getElementById('grid');
 const muteBtn = document.getElementById('muteBtn');
+// The two halves of the dashboard below the header, held because both are
+// disabled wholesale when another dashboard takes the viewer slot.
+const stageEl = document.getElementById('stage');
+const drawerEl = document.getElementById('drawer');
 
 // clientId -> { pc, tile, video, label, camBtn }
 const devices = new Map();
@@ -23,6 +27,11 @@ const LOST_STALE_MS = 3500;
 let soundOn = false;
 let vcamAvailable = false;
 let vcamClientId = null;
+// Another dashboard took the single viewer slot. Held because the reason a
+// socket closed is not visible from the close itself, and reconnecting is
+// exactly the wrong response here: it would take the slot straight back off
+// whoever just claimed it, forever.
+let displaced = false;
 
 const signaling = connectSignaling('viewer', {
   onOpen() {
@@ -30,7 +39,9 @@ const signaling = connectSignaling('viewer', {
     updateStatus();
   },
   onClose() {
-    setStatus('signaling lost, reconnecting…');
+    setStatus(displaced
+      ? 'another dashboard took over — reload this page to take it back'
+      : 'signaling lost, reconnecting…');
     // Everything known about the clients came over this socket; none of it
     // survives it. The server re-sends the roster on reconnect.
     roster.clear();
@@ -40,6 +51,27 @@ const signaling = connectSignaling('viewer', {
     refreshClientsPanel();
   },
   async onMessage(msg) {
+    // Arrives just before the server closes this socket. Closing it from here
+    // is what stops the reconnect — connectSignaling's close() is the only way
+    // to tell it a close was expected.
+    if (msg.type === 'viewer-taken') {
+      displaced = true;
+      // Everything still on screen — the survey, the walls, the tag cards — is
+      // now a photograph of the room rather than a view of it, and nothing will
+      // ever update it again. Greyed so it cannot be read as live; the status
+      // line alone was one line against a full-colour dashboard.
+      document.body.classList.add('displaced');
+      // And inert, not merely grey: every control in there talks over a socket
+      // that is gone, so a click would be silently swallowed — forgetting a tag
+      // or pausing a client would look like it had worked. `inert` rather than
+      // pointer-events, because it takes the keyboard too. The header stays
+      // live: the view toggles are local, and the status line in it is what
+      // says how to get the dashboard back.
+      stageEl.inert = true;
+      drawerEl.inert = true;
+      signaling.close();
+      return;
+    }
     if (clockSync.handle(msg)) return;
     // Everything that describes the room — the survey, the carved floor, the
     // walls — goes straight to the renderers through the shared feed.
@@ -274,8 +306,11 @@ const combinedBtn = document.getElementById('combinedBtn');
 const sceneBtn = document.getElementById('sceneBtn');
 const map2dBtn = document.getElementById('map2dBtn');
 const sideBtn = document.getElementById('sideBtn');
+const frontBtn = document.getElementById('frontBtn');
 const poseBtn = document.getElementById('poseBtn');
 const wallsBtn = document.getElementById('wallsBtn');
+const landmarksBtn = document.getElementById('landmarksBtn');
+const candidatesBtn = document.getElementById('candidatesBtn');
 const clearTagsBtn = document.getElementById('clearTagsBtn');
 const clearCarveBtn = document.getElementById('clearCarveBtn');
 
@@ -291,6 +326,7 @@ confirmButton(clearCarveBtn, () => signaling.send({ type: 'walls-clear' }), {
 const sceneCanvas = document.getElementById('scene');
 const map2dCanvas = document.getElementById('map2d');
 const mapSideCanvas = document.getElementById('mapSide');
+const mapFrontCanvas = document.getElementById('mapFront');
 const maps2d = document.getElementById('maps2d');
 const roomViews = document.getElementById('roomViews');
 const backdrop = document.getElementById('backdrop');
@@ -324,9 +360,14 @@ function setHoveredTag(id) {
 }
 const mapOpts = { onMarkerHover: setHoveredTag };
 const map2dView = createMap2dView(map2dCanvas, 'top', mapOpts);
+// The two elevations are the same view from a quarter turn apart: 'side' keeps
+// x across the screen, 'front' keeps z. A tag seen edge-on in one is seen
+// face-on in the other, so between them every wall in the room has a view that
+// shows its height honestly.
 const mapSideView = createMap2dView(mapSideCanvas, 'side', mapOpts);
+const mapFrontView = createMap2dView(mapFrontCanvas, 'front', mapOpts);
 // All room views consume identical updates.
-const roomViewList = [sceneView, map2dView, mapSideView];
+const roomViewList = [sceneView, map2dView, mapSideView, mapFrontView];
 // The room messages reach the views through here, the same way they reach the
 // XR client's own map.
 const roomFeed = createRoomFeed(roomViewList);
@@ -556,7 +597,8 @@ function drawCombined() {
 // The combined canvas is not one of these — it lives in the drawer.
 let show3d = true;
 let show2d = true;      // top-down floor plan
-let showSide = false;   // side elevation (height)
+let showSide = false;   // elevation across x (height)
+let showFront = false;  // elevation across z (height), the other quarter turn
 // Not a view of its own but how all of them draw a client: on, the reported
 // pose with the uncertainty circle around it; off, only the circle, with the
 // heading anchored on its centre.
@@ -566,6 +608,11 @@ let showPoseMarker = false;
 // layer only exists where evidence was accepted, so an empty room draws
 // nothing rather than noise.
 let showWalls = true;
+let showLandmarks = true;
+// Off by default, unlike the anchors: candidates are numerous, transient and
+// mostly never become anything, so they are a diagnostic someone asks for
+// ("why is nothing qualifying?") rather than part of the room.
+let showCandidates = false;
 
 // ---------------------------------------------------------------------------
 // One description of a client, merged from everything that knows part of one:
@@ -609,7 +656,7 @@ function clientInfo(id) {
 // toward the room from the anchor wall), pitch positive looking up.
 const roomStats = document.getElementById('roomStats');
 setInterval(() => {
-  if (!show3d && !show2d && !showSide) {
+  if (!show3d && !show2d && !showSide && !showFront) {
     roomStats.textContent = '';
     return;
   }
@@ -651,7 +698,7 @@ setInterval(() => {
 // client can do to itself is drivable from here; the client owns the behaviour
 // and reports back what it actually did, so nothing here is optimistic.
 const drawerBtn = document.getElementById('drawerBtn');
-const clientsPanel = createClientsPanel(document.getElementById('drawer'), {
+const clientsPanel = createClientsPanel(drawerEl, {
   onControl: (clientId, action, value) =>
     signaling.send({ type: 'control', clientId, action, value }),
   onVcam: (clientId, on) => setVcam(on ? clientId : null),
@@ -665,7 +712,8 @@ let showDrawer = true;
 
 function refreshClientsPanel() {
   if (!showDrawer) return;
-  clientsPanel.update(clientIds().map(clientInfo), roomFeed.getMarkerMap());
+  clientsPanel.update(clientIds().map(clientInfo), roomFeed.getMarkerMap(),
+    roomFeed.getLandmarks());
 }
 
 // Recording byte counts and pose ages move on their own; the roster message
@@ -673,16 +721,21 @@ function refreshClientsPanel() {
 setInterval(refreshClientsPanel, 400);
 
 function refreshViews() {
-  const room = show3d || show2d || showSide;
+  const room = show3d || show2d || showSide || showFront;
   combinedBtn.classList.toggle('on', combinedActive);
   sceneBtn.classList.toggle('on', show3d);
   map2dBtn.classList.toggle('on', show2d);
   sideBtn.classList.toggle('on', showSide);
+  frontBtn.classList.toggle('on', showFront);
   drawerBtn.classList.toggle('on', showDrawer);
   poseBtn.classList.toggle('on', showPoseMarker);
   wallsBtn.classList.toggle('on', showWalls);
+  landmarksBtn.classList.toggle('on', showLandmarks);
+  candidatesBtn.classList.toggle('on', showCandidates);
   roomViewList.forEach((v) => v.setShowPose(showPoseMarker));
   roomViewList.forEach((v) => v.setLayer?.('walls', showWalls));
+  roomViewList.forEach((v) => v.setLayer?.('landmarks', showLandmarks));
+  roomViewList.forEach((v) => v.setLayer?.('candidates', showCandidates));
   clientsPanel.setActive(showDrawer);
   refreshClientsPanel();
   // The backdrop hides the tile grid behind a full-bleed view. The combined
@@ -693,12 +746,14 @@ function refreshViews() {
   combined.style.display = combinedActive ? 'block' : '';
   roomViews.classList.toggle('active', room);
   sceneCanvas.classList.toggle('active', show3d);
-  maps2d.classList.toggle('active', show2d || showSide);
+  maps2d.classList.toggle('active', show2d || showSide || showFront);
   map2dCanvas.classList.toggle('active', show2d);
   mapSideCanvas.classList.toggle('active', showSide);
+  mapFrontCanvas.classList.toggle('active', showFront);
   sceneView.setActive(show3d);
   map2dView.setActive(show2d);
   mapSideView.setActive(showSide);
+  mapFrontView.setActive(showFront);
   if (camsVisible()) drawCombined();
   else {
     syncLabel.textContent = '';
@@ -722,8 +777,11 @@ const viewToggles = [
   { key: 'scene', btn: sceneBtn, get: () => show3d, set: (v) => { show3d = v; } },
   { key: 'top', btn: map2dBtn, get: () => show2d, set: (v) => { show2d = v; } },
   { key: 'side', btn: sideBtn, get: () => showSide, set: (v) => { showSide = v; } },
+  { key: 'front', btn: frontBtn, get: () => showFront, set: (v) => { showFront = v; } },
   { key: 'pose', btn: poseBtn, get: () => showPoseMarker, set: (v) => { showPoseMarker = v; } },
   { key: 'walls', btn: wallsBtn, get: () => showWalls, set: (v) => { showWalls = v; } },
+  { key: 'landmarks', btn: landmarksBtn, get: () => showLandmarks, set: (v) => { showLandmarks = v; } },
+  { key: 'candidates', btn: candidatesBtn, get: () => showCandidates, set: (v) => { showCandidates = v; } },
   // Key stays 'clients' although the button no longer is: it names a stored
   // value, and renaming it would read every existing viewer's saved layout as
   // "not stored" and reopen the drawer on someone who closed it.

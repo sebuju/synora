@@ -1,10 +1,17 @@
 'use strict';
 
-// Orthographic 2D room views, one renderer for both projections:
-//   'top'  — the floor plan, x-z plane (y collapsed)
-//   'side' — the elevation, x-y plane (z collapsed), y drawn upward
+// Orthographic 2D room views, one renderer for all three projections:
+//   'top'   — the floor plan, x-z plane (y collapsed)
+//   'side'  — an elevation, x-y plane (z collapsed), y drawn upward
+//   'front' — the other elevation, z-y plane (x collapsed), y drawn upward
 // Same data feeds as the 3D scene — markers and client poses — rendered
 // with plain canvas 2D. Viewport auto-fits whatever exists.
+//
+// A view is described by the pair of room axes it keeps, and everything that
+// differs between them is derived from that pair — a wall between two elevations
+// differs only in which room axis runs across the screen, and asking which mode
+// is running at each such spot is how the first elevation ended up with its own
+// half-copies of code the floor plan already had.
 
 // `raf` is injectable because the XR client draws this map from inside an
 // immersive-AR session, where the page's own requestAnimationFrame is not
@@ -14,6 +21,26 @@
 // and below what an Android renderer will refuse to allocate.
 const MAX_BACKING_PX = 4e6;
 
+// The room-axis gizmo: arm length, the gap from the end of an arm to its
+// letter, half a line of text, and the inset of the whole thing from the bottom
+// left corner, all in screen pixels. Fixed size rather than `ROOM_AXIS_LEN_M` on
+// the world scale — pinned to the corner it is no longer a ruler standing at the
+// origin, and a half-metre arm shrinks to nothing on a map zoomed out to a whole
+// flat. The letter is pushed a flat gap past the end rather than a fraction of
+// the arm: a fraction leaves it sitting on the line it belongs to, since the
+// text is centred on the point it is given and half its height reaches back over
+// the stroke. The three lengths add up to how far the gizmo reaches from its
+// elbow, which is what the corner is measured against.
+// Each view by the pair of room axes it keeps: the one running across the
+// screen and the one running up it. The whole difference between the three
+// projections.
+const VIEW_AXES = { top: [0, 2], side: [0, 1], front: [2, 1] };
+
+const AXIS_GIZMO_PX = 26;
+const AXIS_GIZMO_LABEL_PX = 14;
+const AXIS_GIZMO_TEXT_PX = 7;
+const AXIS_GIZMO_PAD = 12;
+
 function createMap2dView(canvas, mode = 'top', { onMarkerHover, raf, maxPixels } = {}) {
   const ctx = canvas.getContext('2d');
   const nextFrame = raf || ((cb) => requestAnimationFrame(cb));
@@ -21,15 +48,28 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover, raf, maxPixels }
   // compositor to lift a full-screen layer over camera passthrough every frame
   // — can buy sharpness back down. See MAX_BACKING_PX.
   const maxBackingPx = maxPixels || MAX_BACKING_PX;
-  // Projection of a room-frame point onto this view's two axes; the second
-  // axis is drawn downward for the floor plan and upward for the elevation.
-  const proj = mode === 'side'
-    ? (p) => [p[0], p[1]]
-    : (p) => [p[0], p[2]];
-  const orient = mode === 'side' ? -1 : 1;
+  // The two room axes this view keeps, across the screen and up it.
+  const [axisA, axisB] = VIEW_AXES[mode] || VIEW_AXES.top;
+  const elevation = axisB === 1;
+  // Projection of a room-frame point onto those two axes; the second axis is
+  // drawn downward for the floor plan and upward for an elevation.
+  const proj = (p) => [p[axisA], p[axisB]];
+  const orient = elevation ? -1 : 1;
+  // Wall segments carry their footprint as [x, z] pairs, so the room axis
+  // running across an elevation indexes into them one place lower than it does
+  // into a position.
+  const segA = axisA === 2 ? 1 : 0;
 
   let active = false;
   let markerMap = null;
+  // Screen pixels along the bottom and left edges that the page has covered with
+  // chrome of its own — the XR client's button row sits over the canvas, and on
+  // a turned overlay the phone's status bar runs along one of these edges. The
+  // corner gizmo is the one thing drawn against the canvas edge rather than
+  // against the room, so it is the one thing that has to know. The page owns
+  // both numbers because only the page can see what it put there.
+  let chromeBottomPx = 0;
+  let chromeLeftPx = 0;
   // On: dot at the reported pose. Off (default): the pose point is hidden and
   // everything anchors on the uncertainty circle's centre instead — the circle
   // is the steadier claim, and sometimes it is the only one wanted.
@@ -56,6 +96,26 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover, raf, maxPixels }
   // fixed dot marks the circle's centre — the heading line has to visibly
   // start from somewhere. Screen-space: it is a marker, not a measurement.
   const RING_DOT_PX = 3;
+  // Smaller than anything else on the map that means something, on purpose.
+  const LANDMARK_DOT_PX = 1.4;
+  // A candidate is not a landmark: it is one track's current guess at where a
+  // feature is, and most of them never become anything. Drawn as an open ring
+  // rather than a dot so the two never read as the same class of thing at a
+  // glance, and dimmer again than the anchors are.
+  const CANDIDATE_DOT_PX = 2.2;
+  // How far a candidate's arc has to have come before it is drawn at full
+  // strength. Faint means barely seen, solid means nearly an anchor — which is
+  // the whole reason to draw candidates at all, since the number of them says
+  // nothing and their progress says everything.
+  const CANDIDATE_MIN_ALPHA = 0.18;
+  // The guidance. Deliberately a colour nothing else on the map uses: it is an
+  // instruction, not a thing in the room, and it must not read as a tag, a
+  // client or a wall. White would be the hover halo; a client colour would say
+  // "this belongs to that client".
+  const GUIDE_CSS = '#ffd166';
+  const GUIDE_RING_M = 0.35;
+  const GUIDE_RING_MIN_PX = 9;
+  const GUIDE_HEAD_PX = 9;
   const HOVER_MS = 120;
   let rafPending = false;
   let lastFrameAt = 0;
@@ -96,6 +156,25 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover, raf, maxPixels }
   let nextWallKey = 1;
   let showWalls = true;
   let wallsAlpha = 1;
+  // Per-client landmark anchors: clientId -> [[x,y,z], ...]. Points only, and
+  // drawn as such — a landmark has no orientation, no extent and no identity
+  // worth a label, and it is a great deal less trustworthy than a surveyed tag.
+  // The whole point of the styling below is that the two can never be confused.
+  let landmarks = [];
+  let showLandmarks = true;
+  let landmarksAlpha = 1;
+  // Candidates ride the same message but a separate toggle: there are an order
+  // of magnitude more of them than anchors and they move as they are refined, so
+  // a reader who wants to see the map the survey has settled on wants them off,
+  // and one asking why nothing is qualifying wants only them.
+  let showCandidates = false;
+  let candidatesAlpha = 0;
+  // Where to walk next, as the server worked it out for this client (see
+  // `guide` in landmarks.js). Only the phone sets one — it is an instruction to
+  // the person holding the camera, and an instruction on the dashboard would be
+  // addressed to someone who cannot follow it.
+  let guide = null;
+  let guideAlpha = 0;
   // The dark backdrop and the 1 m grid it carries: everything that is only
   // there to be drawn *on*. Turned off, the canvas is cleared instead of
   // filled, so whatever is behind it shows through — on the XR client that is
@@ -298,6 +377,96 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover, raf, maxPixels }
       }
     }
     return true;
+  }
+
+  // The guidance, drawn as the ground to cover rather than as a label about it.
+  //
+  // Everything here is built from *room* points and pushed through the view's
+  // own projection, never from screen-space trigonometry: this renderer serves
+  // three projections and a rotating phone screen, and an arc computed in
+  // pixels would be right in exactly one of them.
+  //
+  // The azimuth convention is the survey's (`azimuthOf` in landmark-math.js):
+  // atan2(x - Px, z - Pz), so a point at azimuth A and radius r sits at
+  // (Px + r sin A, Pz + r cos A). Two definitions of that would put the arrow
+  // on the wrong side of the room, which is the one error that would be
+  // actively misleading rather than merely unhelpful.
+  function drawGuide(px, g, alpha) {
+    const rad = (deg) => deg * Math.PI / 180;
+    const at = (A, r) => [g.p[0] + r * Math.sin(rad(A)), g.p[1], g.p[2] + r * Math.cos(rad(A))];
+    ctx.globalAlpha = alpha * 0.9;
+    ctx.strokeStyle = GUIDE_CSS;
+    ctx.fillStyle = GUIDE_CSS;
+    ctx.lineWidth = 2;
+    ctx.lineCap = 'round';
+
+    // The target itself: a ring on the ground under the cluster, sized in world
+    // metres so it reads as a place rather than as a screen decoration.
+    const [tx, ty] = px(g.p);
+    const ringPx = Math.max(GUIDE_RING_MIN_PX, GUIDE_RING_M * shown.scale);
+    ctx.setLineDash([]);
+    ctx.beginPath();
+    ctx.arc(tx, ty, ringPx, 0, Math.PI * 2);
+    ctx.stroke();
+
+    if (g.mode === 'arc') {
+      // From where they stand to where the arc becomes wide enough, swept the
+      // way the server said — `dir` is not recoverable from the endpoints,
+      // since either way round joins them and one of the two re-walks ground
+      // the track already has.
+      let delta = ((g.to - g.from) % 360 + 360) % 360;
+      if (g.dir < 0) delta -= 360;
+      const steps = Math.max(8, Math.ceil(Math.abs(delta) / 6));
+      ctx.beginPath();
+      for (let i = 0; i <= steps; i++) {
+        const [x, y] = px(at(g.from + delta * (i / steps), g.radius));
+        if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+      }
+      ctx.stroke();
+      // Arrowhead at the far end, built from the last step of the sweep so it
+      // points along the walk in whatever projection this is.
+      const end = px(at(g.from + delta, g.radius));
+      const before = px(at(g.from + delta * (1 - 1 / steps), g.radius));
+      arrowHead(end, before, alpha);
+    } else if (g.mode === 'closer') {
+      // Straight at it, from where they were standing when the server worked
+      // this out. Dashed, because the line is a route and not a measurement.
+      const from = px(g.at);
+      ctx.setLineDash([6, 5]);
+      ctx.beginPath();
+      ctx.moveTo(from[0], from[1]);
+      ctx.lineTo(tx, ty);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      arrowHead([tx, ty], from, alpha);
+    } else {
+      // Dwell: nowhere to go, so nothing points anywhere. A second ring just
+      // outside the first says "this one, keep it in view" without implying a
+      // direction the person does not need to walk in.
+      ctx.globalAlpha = alpha * 0.45;
+      ctx.beginPath();
+      ctx.arc(tx, ty, ringPx + 5, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+    ctx.lineCap = 'butt';
+  }
+
+  // A head at `tip`, opening away from `tail`. Screen space on purpose: this is
+  // the one part that is decoration rather than geometry, and it should be the
+  // same size however far the map is zoomed out.
+  function arrowHead(tip, tail, alpha) {
+    const a = Math.atan2(tip[1] - tail[1], tip[0] - tail[0]);
+    const wing = 0.45;
+    ctx.globalAlpha = alpha;
+    ctx.beginPath();
+    ctx.moveTo(tip[0], tip[1]);
+    ctx.lineTo(tip[0] - GUIDE_HEAD_PX * Math.cos(a - wing),
+      tip[1] - GUIDE_HEAD_PX * Math.sin(a - wing));
+    ctx.lineTo(tip[0] - GUIDE_HEAD_PX * Math.cos(a + wing),
+      tip[1] - GUIDE_HEAD_PX * Math.sin(a + wing));
+    ctx.closePath();
+    ctx.fill();
   }
 
   function draw(now) {
@@ -526,6 +695,9 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover, raf, maxPixels }
 
     poseMix = animFade(poseMix, showPose, dt);
     wallsAlpha = animFade(wallsAlpha, showWalls, dt);
+    landmarksAlpha = animFade(landmarksAlpha, showLandmarks, dt);
+    candidatesAlpha = animFade(candidatesAlpha, showCandidates, dt);
+    guideAlpha = animFade(guideAlpha, !!guide, dt);
     backdropAlpha = animFade(backdropAlpha, showBackdrop, dt);
     pairsAlpha = animFade(pairsAlpha, showPairs, dt);
     // Eased the short way round, or turning past the wrap point sends the whole
@@ -564,9 +736,9 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover, raf, maxPixels }
         grow((floor.minIx + floor.w) * floor.cellM, (floor.minIz + floor.h) * floor.cellM);
       }
       for (const seg of walls) {
-        if (mode === 'side') {
-          grow(seg.a[0], seg.y0);
-          grow(seg.b[0], seg.y1);
+        if (elevation) {
+          grow(seg.a[segA], seg.y0);
+          grow(seg.b[segA], seg.y1);
         } else {
           grow(seg.a[0], seg.a[1]);
           grow(seg.b[0], seg.b[1]);
@@ -632,6 +804,17 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover, raf, maxPixels }
       ctx.rotate(viewRot);
       ctx.translate(-w / 2, -h / 2);
     }
+    // Screen point -> the turned-space point that lands on it: the inverse of
+    // the transform above, for the few things that belong to the canvas rather
+    // than to the room and still have to be drawn in this space.
+    const unturn = (sx, sy) => {
+      if (!turned) return [sx, sy];
+      const c = Math.cos(viewRot);
+      const s = Math.sin(viewRot);
+      const dx = sx - w / 2;
+      const dy = sy - h / 2;
+      return [w / 2 + dx * c + dy * s, h / 2 - dx * s + dy * c];
+    };
 
     // Attested free space, under everything: it is the claim the rest of the
     // drawing stands on. Only the floor plan can show it — the side view has
@@ -683,26 +866,56 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover, raf, maxPixels }
     ctx.font = '12px ui-monospace, monospace';
     ctx.textAlign = 'center';
 
-    // Room axes at the origin, in the 3D scene's colours and at its length, so
-    // the cross reads as the same object in every view. Only the two axes this
-    // projection keeps are drawn — the collapsed one would be a dot at the
-    // origin claiming to be a direction.
-    const axes = mode === 'side' ? [0, 1] : [0, 2];
-    ctx.lineWidth = 2;
-    for (const k of axes) {
+    // Room axes as a corner gizmo, in the 3D scene's colours. Not at the room
+    // origin: that is wherever the anchor tag happens to be, so it pans and
+    // zooms off screen with everything else, while "which way is x" is wanted
+    // at every viewport. Pinned to the bottom left instead, still turned with
+    // the map — the arm directions are taken from the projection, so they point
+    // where the room does. Only the two axes this projection keeps are drawn —
+    // the collapsed one would be a dot claiming to be a direction.
+    const axes = [axisA, axisB];
+    const [ox, oy] = px([0, 0, 0]);
+    // Direction only — the length is the gizmo's, not the world's.
+    const arms = axes.map((k) => {
       const end = [0, 0, 0];
-      end[k] = ROOM_AXIS_LEN_M;
-      const [ox, oy] = px([0, 0, 0]);
+      end[k] = 1;
       const [ex, ey] = px(end);
+      const len = Math.hypot(ex - ox, ey - oy) || 1;
+      return { k, ux: (ex - ox) / len, uy: (ey - oy) / len };
+    });
+    // Anchored by its bounding box, not by its elbow: the arms point wherever
+    // the room does, so on a heading-up map any of them can be the one reaching
+    // for an edge, and an elbow at a fixed inset pushes that one off screen. The
+    // box is measured in *screen* space — the arms are about to be drawn through
+    // the context's rotation — and its bottom left is what is pinned, so the
+    // gizmo sits on the bottom edge whatever it is doing inside.
+    const reach = AXIS_GIZMO_PX + AXIS_GIZMO_LABEL_PX + AXIS_GIZMO_TEXT_PX;
+    const cosR = Math.cos(viewRot);
+    const sinR = Math.sin(viewRot);
+    let boxMinX = 0;
+    let boxMaxY = 0;
+    for (const a of arms) {
+      boxMinX = Math.min(boxMinX, (a.ux * cosR - a.uy * sinR) * reach);
+      boxMaxY = Math.max(boxMaxY, (a.ux * sinR + a.uy * cosR) * reach);
+    }
+    // Drawn in the turned space the rest of this block lives in (labels are
+    // queued in that space and straighten themselves one at a time), so the
+    // elbow is carried back through the rotation rather than the context being
+    // unturned and turned again around it.
+    const [gx, gy] = unturn(AXIS_GIZMO_PAD + chromeLeftPx - boxMinX,
+      h - AXIS_GIZMO_PAD - chromeBottomPx - boxMaxY);
+    ctx.lineWidth = 2;
+    for (const { k, ux, uy } of arms) {
       ctx.strokeStyle = roomAxisColorCss(k);
       ctx.beginPath();
-      ctx.moveTo(ox, oy);
-      ctx.lineTo(ex, ey);
+      ctx.moveTo(gx, gy);
+      ctx.lineTo(gx + ux * AXIS_GIZMO_PX, gy + uy * AXIS_GIZMO_PX);
       ctx.stroke();
-      // Pushed a further tenth along its own direction, so the letter sits off
-      // the end of the arm rather than on top of the other one's.
-      const [lx, ly] = px(end.map((v) => v * 1.25));
-      queueLabel(`axis:${k}`, ROOM_AXIS_NAMES[k], lx, ly + 4, roomAxisColorCss(k));
+      // Past the end of the arm along its own direction, so the letter sits off
+      // the end rather than on the stroke or on top of the other one's.
+      const lp = AXIS_GIZMO_PX + AXIS_GIZMO_LABEL_PX;
+      queueLabel(`axis:${k}`, ROOM_AXIS_NAMES[k],
+        gx + ux * lp, gy + uy * lp + 4, roomAxisColorCss(k));
     }
 
     // Wall segments. Top: the wall seen edge-on, a stroke from end to end.
@@ -714,9 +927,9 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover, raf, maxPixels }
         // attests or one it has stopped attesting, and half of it fading is
         // not a state the data has.
         ctx.globalAlpha = wallsAlpha * seg.fade;
-        if (mode === 'side') {
-          const [x1, yA] = toPx(Math.min(seg.a[0], seg.b[0]), seg.y0);
-          const [x2, yB] = toPx(Math.max(seg.a[0], seg.b[0]), seg.y1);
+        if (elevation) {
+          const [x1, yA] = toPx(Math.min(seg.a[segA], seg.b[segA]), seg.y0);
+          const [x2, yB] = toPx(Math.max(seg.a[segA], seg.b[segA]), seg.y1);
           const top = Math.min(yA, yB);
           const bot = Math.max(yA, yB);
           if (seg.inferred) ctx.setLineDash([7, 5]);
@@ -797,11 +1010,14 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover, raf, maxPixels }
         * Math.min(markers.get(a.id)?.fade ?? 1, markers.get(b.id)?.fade ?? 1);
       if (legAlpha <= 0.01) continue;
       ctx.globalAlpha = legAlpha;
-      // The elbow: b's first axis, a's second. Whichever component the mode
-      // collapses is never read, so one corner serves both projections.
+      // The elbow: b's across-screen axis, a's up-screen one. Built off this
+      // view's own pair rather than off a fixed component, or a projection that
+      // does not keep x draws its corner on top of one of the tags.
       const [ax, ay] = px(ap);
       const [bx, by] = px(bp);
-      const [cx, cy] = px([bp[0], ap[1], ap[2]]);
+      const elbow = ap.slice();
+      elbow[axisA] = bp[axisA];
+      const [cx, cy] = px(elbow);
       // A chain link is not a distance worth tape-measuring, it is where this
       // tag's position came from — drawn differently so the two are not read as
       // the same claim.
@@ -827,6 +1043,56 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover, raf, maxPixels }
     }
     ctx.globalAlpha = 1;
     ctx.setLineDash([]);
+
+    // Landmark anchors, under the tags and everything else that carries a
+    // claim: a small dot in the owning client's colour, no label, no ring, no
+    // extent. They are per-session, are thrown away whenever the tracker
+    // resets, and are a good deal less trustworthy than a surveyed tag — so
+    // they are drawn as the faintest thing on the map that is still legible,
+    // and nothing about them reads as a measurement.
+    // The instruction, under everything that describes the room: it is the one
+    // thing here that is not a measurement, and it must never be mistaken for
+    // one. Drawn before the tags and the anchors so it sits behind them.
+    if (guideAlpha > 0.01 && guide) drawGuide(px, guide, guideAlpha);
+
+    // Candidates first, so an anchor sitting on one is drawn over its own ring
+    // rather than under it — that is the moment the reader is looking for.
+    if (candidatesAlpha > 0.01 && landmarks.length) {
+      ctx.lineWidth = 1;
+      // One colour for every client's candidates, and not their own: see
+      // ROOM_CANDIDATE_COLOR. A candidate is not yet anybody's landmark.
+      ctx.strokeStyle = roomCandidateColorCss();
+      for (const c of landmarks) {
+        if (!c.candidates?.length) continue;
+        for (const k of c.candidates) {
+          const [x, y] = px(k.p);
+          // Arc progress, not confidence: a candidate at 55° is one that has
+          // been looked at from nearly enough angles, not one that is nearly
+          // right. Floored so a barely-seen feature still marks its place.
+          const t = Math.min(1, (k.span || 0) / ROOM_LANDMARK_ARC_DEG);
+          ctx.globalAlpha = candidatesAlpha * (CANDIDATE_MIN_ALPHA + 0.5 * t);
+          ctx.beginPath();
+          ctx.arc(x, y, CANDIDATE_DOT_PX, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    if (landmarksAlpha > 0.01 && landmarks.length) {
+      for (const c of landmarks) {
+        if (!c.anchors?.length) continue;
+        ctx.fillStyle = roomClientColorCss(c.clientId);
+        ctx.globalAlpha = landmarksAlpha * 0.45;
+        for (const p of c.anchors) {
+          const [x, y] = px(p);
+          ctx.beginPath();
+          ctx.arc(x, y, LANDMARK_DOT_PX, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+      ctx.globalAlpha = 1;
+    }
 
     // Markers: a stroke along the tag's x axis, projected.
     const half = (markerMap?.sizeM || 0.15) / 2;
@@ -1311,9 +1577,27 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover, raf, maxPixels }
       schedule();
     },
 
+    setLandmarks(next) {
+      landmarks = next || [];
+      schedule();
+    },
+
+    // The walk to do next, or null for "nothing worth saying" — which is the
+    // common answer and must draw nothing rather than the last instruction.
+    setGuide(next) {
+      guide = next || null;
+      schedule();
+    },
+
     setLayer(name, on) {
       if (name === 'walls') {
         showWalls = on;
+        schedule();
+      } else if (name === 'landmarks') {
+        showLandmarks = on;
+        schedule();
+      } else if (name === 'candidates') {
+        showCandidates = on;
         schedule();
       } else if (name === 'backdrop') {
         showBackdrop = on;
@@ -1322,6 +1606,20 @@ function createMap2dView(canvas, mode = 'top', { onMarkerHover, raf, maxPixels }
         showPairs = on;
         schedule();
       }
+    },
+
+    // How far in from the bottom and left edges the corner gizmo has to start,
+    // in CSS pixels, because the page has drawn something of its own over those
+    // strips. Nothing else in the map moves: the room fills the canvas it was
+    // given, and a tag under a button is still in the right place — the gizmo is
+    // the only thing whose position means "the corner of the screen".
+    setChromeInset({ bottom = 0, left = 0 } = {}) {
+      const b = Math.max(0, bottom);
+      const l = Math.max(0, left);
+      if (b === chromeBottomPx && l === chromeLeftPx) return;
+      chromeBottomPx = b;
+      chromeLeftPx = l;
+      schedule();
     },
 
     // Turn the map so this room-frame direction points up the screen, or null

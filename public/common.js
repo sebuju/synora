@@ -389,15 +389,20 @@ function setStatus(text) {
   document.getElementById('status').textContent = text;
 }
 
-// Age of an instant in one-character units, one decimal: 3.2s, 1.5m, 2.0h,
-// 1.1d. Every panel that shows how stale something is uses this one, so a
-// figure means the same thing wherever it is read.
+// Age of an instant in three-letter units, one decimal: 3.2 sec, 1.5 min,
+// 2.0 hrs, 1.1 day. Every panel that shows how stale something is uses this
+// one, so a figure means the same thing wherever it is read. Spelt out and
+// spaced because these sit among metres on the same lines, where a bare `m`
+// reads as either.
 function fmtAge(ms) {
   const s = ms / 1000;
-  if (s < 60) return `${s.toFixed(1)}s`;
-  if (s < 3600) return `${(s / 60).toFixed(1)}m`;
-  if (s < 86400) return `${(s / 3600).toFixed(1)}h`;
-  return `${(s / 86400).toFixed(1)}d`;
+  // Non-breaking: the drawer is narrow and these sit at the end of a wrapped
+  // line, where an ordinary space drops the unit onto a line of its own.
+  const u = ' ';   // NBSP
+  if (s < 60) return `${s.toFixed(1)}${u}sec`;
+  if (s < 3600) return `${(s / 60).toFixed(1)}${u}min`;
+  if (s < 86400) return `${(s / 3600).toFixed(1)}${u}hrs`;
+  return `${(s / 86400).toFixed(1)}${u}day`;
 }
 
 // Screen blanking. A capture device runs for hours with a wake lock holding the
@@ -542,7 +547,6 @@ function confirmButton(el, onConfirm, { armedTitle = 'Click again to confirm', o
 // How a pose message's camera model should be described and how loudly. Both
 // the client overlay and the dashboard tile report this, from the same wire
 // fields, so the wording cannot drift between them.
-//
 // Level maps to the shared .warn/.bad classes: a model that was rotated or
 // rescaled from another resolution is not wrong so much as unverified at the
 // resolution in use, and those tiers are exactly where an orientation change
@@ -593,16 +597,23 @@ function roomClientColor(id) {
   return ROOM_CLIENT_COLORS[id % ROOM_CLIENT_COLORS.length];
 }
 
-function roomClientColorCss(id) {
-  return `#${roomClientColor(id).toString(16).padStart(6, '0')}`;
+// With an alpha, the same colour as a wash rather than a mark: the drawer tints
+// a card's background with the owning client's colour instead of striping its
+// edge, and a tint has to be built from the one palette entry rather than being
+// a second, hand-picked colour that drifts from it.
+function roomClientColorCss(id, alpha = null) {
+  const c = roomClientColor(id);
+  if (alpha === null) return `#${c.toString(16).padStart(6, '0')}`;
+  return `rgba(${(c >> 16) & 255}, ${(c >> 8) & 255}, ${c & 255}, ${alpha})`;
 }
 
 // Room axes, indexed the way a position is: x, y, z. Near three.js's own
 // AxesHelper defaults, and the helper is told them explicitly rather than left
 // on its defaults — the 2D views and the drawer read the same three numbers,
 // and an axis that is red in one view and blue in another is worse than no
-// colour at all. `ROOM_AXIS_LEN_M` is the helper's length, so the 2D cross is
-// the same size as the 3D one and reads as the same object.
+// colour at all. `ROOM_AXIS_LEN_M` is the helper's length in the 3D scene only,
+// where the cross stands at the room origin and is a ruler; the 2D views pin
+// theirs to a corner at a fixed pixel size instead (`AXIS_GIZMO_PX`).
 // x and z are pulled off their pure primaries: #0000ff is the darkest colour a
 // screen can make and #ff0000 the most saturated, and the ordinates printed in
 // them were, respectively, unreadable and glaring on the drawer's near-black
@@ -622,6 +633,33 @@ function roomTagColorCss(id) {
   return `hsl(${(id * 137.5) % 360}, 62%, 40%)`;
 }
 const ROOM_POSE_STALE_MS = 2000;
+
+// The viewing arc a tracked feature has to be seen through before it can become
+// an anchor. Mirrored from MIN_ARC_DEG in landmark-math.js, which no page loads
+// — the server sends each candidate's measured arc, this is only what it is
+// measured against. Here rather than in either page because both the XR
+// overlay's landmark line and the maps' candidate shading read it, and a
+// candidate that looked nearly ready on one and barely started on the other
+// would be worse than showing neither.
+const ROOM_LANDMARK_ARC_DEG = 40;
+
+// Candidates get a colour of their own rather than a dimmer version of the
+// client's. A client colour is an *identity* — the same hue carries that
+// client's dot, its anchors and its drawer cards — and using it for tracks that
+// may never become anything says "this client has these landmarks" when the
+// truth is "this client is working on these". A neutral grey belongs to nobody
+// and reads as provisional, which is exactly what a candidate is.
+//
+// Deliberately not amber: that is the guidance and the walls module's deduced
+// class, both of which mean "inferred, act on it". Nor any client hue, nor the
+// anchor tag's gold.
+const ROOM_CANDIDATE_COLOR = 0x9aa4ad;
+
+function roomCandidateColorCss(alpha = null) {
+  if (alpha === null) return `#${ROOM_CANDIDATE_COLOR.toString(16).padStart(6, '0')}`;
+  const c = ROOM_CANDIDATE_COLOR;
+  return `rgba(${(c >> 16) & 255}, ${(c >> 8) & 255}, ${c & 255}, ${alpha})`;
+}
 
 // Green head-on sliding to red as the view of a tag gets oblique — pose
 // quality falls off hard past ~60°.

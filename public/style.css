@@ -17,6 +17,48 @@ body {
   flex-direction: column;
 }
 
+/* Scrollbars, in the page's own palette rather than the platform's. The default
+   is a light widget on a dark page and it is the brightest thing on screen —
+   next to the drawer, whose whole job is to stay behind the room views.
+
+   Both syntaxes, and they are not redundant: the standard properties are what
+   Firefox reads, ::-webkit-scrollbar is what gives Chromium a track thin enough
+   and a thumb with corners. The track is transparent on purpose — these bars sit
+   on three different backgrounds (#0c0c0c drawer, #111 tile grid, #1c1c1c
+   cards), and a fixed track colour would be a stripe of the wrong grey on two of
+   them. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #3a3a3a transparent;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #3a3a3a;
+  border-radius: 5px;
+  /* Inset by a transparent border so the thumb reads as a slim pill with air
+     around it rather than a bar wedged against the content. */
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #4e4e4e;
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
 /* Every page: one fixed-height topnav, content below it. The home link is
    always the first element. */
 header {
@@ -63,10 +105,11 @@ header .home:hover {
   flex: 1;
 }
 
-/* Gap between header button groups. Space rather than a rule: with a row of
-   icon buttons the drawn line was one more vertical stroke among the glyphs,
-   and grouping reads better from the emptiness alone. */
-header .sep {
+/* Gap between button groups, in the header and in the drawer's tool row alike.
+   Space rather than a rule: with a row of icon buttons the drawn line was one
+   more vertical stroke among the glyphs, and grouping reads better from the
+   emptiness alone. */
+.sep {
   flex-shrink: 0;
   width: 8px;
 }
@@ -109,35 +152,80 @@ header.tight {
   display: none;
 }
 
+/* One control surface for the whole app. A button is a pane of smoked glass: a
+   translucent fill over a blurred backdrop, a hairline, a lit top edge and a
+   shadow under it. That is what the XR overlay's HUD controls already were, and
+   they had to be — over the camera passthrough a control has to read against
+   whatever the lens happens to be pointed at, and only a translucent fill does
+   that at any brightness. The dashboard's own buttons sit over video tiles and
+   the room views, which is the same problem, so there is one description of a
+   control rather than two that drift.
+   What genuinely differs by surface is the *fill*, and only the fill: over dark
+   chrome a control has to lift off its background (a light film), over the
+   passthrough it has to hold contrast against a bright one (a dark pill). So
+   the fills are tokens and the XR overlay re-points them; everything else —
+   geometry, lighting, every state — is inherited and cannot diverge. */
+:root {
+  --btn-fill: rgba(255, 255, 255, 0.065);
+  --btn-fill-hover: rgba(255, 255, 255, 0.11);
+  --btn-fill-press: rgba(0, 0, 0, 0.28);
+  --btn-line: rgba(255, 255, 255, 0.12);
+  --btn-line-hover: rgba(255, 255, 255, 0.2);
+  /* The chrome's green at the fill's own translucency — an opaque on-state
+     would be the only solid thing in a row of glass. */
+  --btn-on: rgba(35, 141, 74, 0.72);
+  --btn-on-hover: rgba(44, 168, 90, 0.85);
+  --btn-on-line: rgba(90, 200, 130, 0.5);
+  --btn-danger: rgba(150, 45, 40, 0.55);
+  --btn-danger-hover: rgba(184, 60, 53, 0.8);
+  --btn-confirm: rgba(200, 42, 36, 0.92);
+  --btn-radius: 6px;
+}
+
 button,
 select {
-  background: #2d2d2d;
-  color: #eee;
+  background: var(--btn-fill);
+  color: #f2f2f2;
   /* Barely off the fill: the shape reads from its background, and a brighter
      edge turned a row of icon buttons into a row of boxes. The on-state keeps
      its own brighter border — that one is meant to be seen. */
-  border: 1px solid #383838;
-  border-radius: 6px;
+  border: unset;
+  border-radius: var(--btn-radius);
+  /* The fill is translucent, so the blur is what stops a busy backdrop — a
+     video tile, the room map — showing through as legible detail behind the
+     label. It only reaches page pixels; the XR passthrough is composited behind
+     the whole overlay and nothing in the page can touch it, which is why the
+     fill and not the blur carries the contrast there. */
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
   padding: 4px 9px;
   font-size: 14px;
   cursor: pointer;
   /* What the faded border stopped carrying: a lit top edge and a shadow under
      the bottom one, so the control still reads as raised off the chrome. */
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.07), 0 1px 2px rgba(0, 0, 0, 0.45);
+  box-shadow: rgba(0, 0, 0, 0.45) 0px 2px 10px, rgba(255, 255, 255, 0.05) 0px 1px 0px inset;
+}
+
+/* The popup is drawn by the UA outside the page, where a translucent fill has
+   nothing behind it and the blur does not apply — left inheriting, the options
+   render as dark text on near-white. */
+select option {
+  background: #1f1f21;
+  color: #eee;
 }
 
 /* :disabled is excluded because nothing else marks one — a disabled button is
    drawn exactly like a live one here, so lighting it under the pointer would be
    the only signal it gives, and it would be the wrong one. */
 button:hover:not(:disabled) {
-  background: #363636;
-  border-color: #4a4a4a;
+  background: var(--btn-fill-hover);
+  border-color: var(--btn-line-hover);
 }
 
 /* Pressed inverts the lighting rather than only darkening the fill. */
 button:active:not(:disabled) {
-  background: #3a3a3a;
-  box-shadow: inset 0 2px 3px rgba(0, 0, 0, 0.5);
+  background: var(--btn-fill-press);
+  box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.5);
 }
 
 /* Toggle-on state, shared by the client's icon buttons, the dashboard's
@@ -146,8 +234,9 @@ button:active:not(:disabled) {
    or the two on-states drift to different greens. */
 button.active,
 .icon-btn.on {
-  background: #1d5c2e;
-  border-color: #2e8b47;
+  background: var(--btn-on);
+  border-color: var(--btn-on-line);
+  color: #fff;
 }
 
 /* An on button must answer the pointer too, and it comes after the plain hover
@@ -155,8 +244,15 @@ button.active,
    instead of grey. */
 button.active:hover:not(:disabled),
 .icon-btn.on:hover:not(:disabled) {
-  background: #24713a;
-  border-color: #3aa459;
+  background: var(--btn-on-hover);
+  border-color: var(--btn-on-line);
+}
+
+/* Pressing an on button must stay green, or the press reads as the toggle
+   dropping back to off under the pointer. */
+button.active:active:not(:disabled),
+.icon-btn.on:active:not(:disabled) {
+  background: var(--btn-on-hover);
 }
 
 /* Text toggles show their state as a dot instead of on/off wording. */
@@ -212,15 +308,34 @@ button.toggle.on::before {
   height: 12px;
 }
 
+/* A button that forgets something, marked as one before it is ever pressed. The
+   fill carries it, the same way the on-state does — a red glyph on the chrome
+   fill reads as a coloured icon, which is what every other icon in these rows
+   is. Darker than the armed red below: this says "not like the ones beside it",
+   and the arming has to still be visibly louder than it. */
+.danger {
+  background: var(--btn-danger);
+  border-color: rgba(216, 90, 82, 0.45);
+  color: #f3d3d0;
+}
+
+.danger:hover:not(:disabled) {
+  background: var(--btn-danger-hover);
+  border-color: rgba(230, 110, 100, 0.65);
+  color: #fff;
+}
+
 /* Armed by `confirmButton`: this click was the first of two, and the next one
    forgets something. Red is the whole signal, so it overrides the hover and the
    active fills too — a hovered armed button that went grey would read as having
-   dropped back to idle under the pointer that armed it. */
+   dropped back to idle under the pointer that armed it. An armed danger button
+   carries both classes; these selectors name the element as well, so they outrank
+   `.danger` above without depending on which of the two was written first. */
 button.confirm,
 button.confirm:hover:not(:disabled),
 button.confirm:active:not(:disabled) {
-  background: #a5231f;
-  border-color: #d8443e;
+  background: var(--btn-confirm);
+  border-color: rgba(240, 110, 100, 0.8);
   color: #fff;
 }
 
@@ -524,10 +639,11 @@ body.paused #pauseOverlay {
 
 /* The drawer's own controls, above the composite they act on. In the header
    they were reachable while the drawer was shut, i.e. while the canvas they
-   toggle was not on screen at all. */
+   toggle was not on screen at all. The row is split by a `.grow` spacer rather
+   than by an alignment on the container: the two ends are two groups, and one of
+   them destroys data. */
 #drawerTools {
   display: flex;
-  justify-content: flex-end;
   gap: 6px;
   margin-bottom: 8px;
 }
@@ -573,8 +689,8 @@ body.paused #pauseOverlay {
   display: block;
 }
 
-/* The two 2D projections stack vertically and split the pane when both are
-   on. */
+/* The three 2D projections stack vertically and split the pane between however
+   many are on. */
 #maps2d.active {
   display: flex;
   flex-direction: column;
@@ -586,7 +702,7 @@ body.paused #pauseOverlay {
 
 #maps2d canvas {
   display: none;
-  flex: 1 1 50%;
+  flex: 1 1 0;
   min-height: 0;
   width: 100%;
 }
@@ -595,7 +711,11 @@ body.paused #pauseOverlay {
   display: block;
 }
 
-#maps2d canvas.active + canvas.active {
+/* The general sibling combinator, not the adjacent one: the divider belongs
+   between two *shown* views, and a hidden one still sits between them in the
+   document — with the middle projection off, the adjacent rule matched nothing
+   and the pair below it ran together. */
+#maps2d canvas.active ~ canvas.active {
   border-top: 1px solid #333;
 }
 
@@ -632,7 +752,7 @@ body.paused #pauseOverlay {
     min-width: 0;
   }
 
-  #maps2d canvas.active + canvas.active {
+  #maps2d canvas.active ~ canvas.active {
     border-top: 0;
     border-left: 1px solid #333;
   }
@@ -781,6 +901,81 @@ body.paused #pauseOverlay {
 .drawer-card .ctrls select {
   padding: 3px 7px;
   font-size: 12px;
+}
+
+/* The survey chain, drawn as the nesting itself: a tag's card sits inside its
+   parent's node, so the rails are one left border per level and no depth is
+   ever computed. What this shows that the card's own `n hops out` cannot is
+   depth read *across* cards — which branch of the room carries the most
+   accumulated error, at a glance. */
+.tag-node {
+  position: relative;
+}
+
+.tag-kids {
+  /* The elbow and the last-child mask are positioned off this one figure, so a
+     narrower indent cannot detach them from the rail they belong to. */
+  --rail-pad: 13px;
+  margin-left: 11px;
+  /* The rail leaves the parent card's own bottom edge rather than starting
+     below its margin — a line that begins in mid-air does not read as coming
+     out of the card it belongs to. The padding puts the gap back inside. */
+  margin-top: -8px;
+  padding-top: 8px;
+  padding-left: var(--rail-pad);
+  border-left: 1px solid #333;
+}
+
+/* The elbow into each child, level with its title row and reaching all the way
+   to the card's left edge: the line has to touch the thing it points at. */
+.tag-kids > .tag-node::before {
+  content: '';
+  position: absolute;
+  top: 17px;
+  left: calc(0px - var(--rail-pad));
+  width: var(--rail-pad);
+  border-top: 1px solid #333;
+}
+
+/* The run ends at the last child rather than trailing past it: the rail is the
+   parent's border, so the only way to stop it is to cover what is left of it
+   below the elbow. `bottom: -1px` so it also swallows the border's own last
+   pixel row. Drawer background, not the card's — it covers the gutter. */
+.tag-kids > .tag-node:last-child::after {
+  content: '';
+  position: absolute;
+  top: 18px;
+  bottom: -1px;
+  left: calc(-1px - var(--rail-pad));
+  width: 1px;
+  background: #0c0c0c;
+}
+
+/* A long chain must not squeeze a card to a sliver — the drawer is narrow.
+   Past five levels the indent stops growing and the rails alone carry the
+   depth. */
+.tag-kids .tag-kids .tag-kids .tag-kids .tag-kids {
+  --rail-pad: 6px;
+  margin-left: 0;
+}
+
+/* Another dashboard took the single viewer slot: what is drawn is the last
+   thing that arrived and nothing will refresh it. Greyed rather than hidden —
+   the survey is still worth reading, it just is not live, and the axis colours
+   and the green room text are exactly what would say otherwise. The header
+   keeps its colour: the status line there is the one live thing left, and it is
+   what says how to get the dashboard back. Faded into rather than switched: the
+   dashboard is otherwise unchanged at that instant, so a hard cut reads as a
+   render glitch instead of as the room draining of colour. */
+#stage,
+#drawer {
+  transition: filter 600ms ease, opacity 600ms ease;
+}
+
+body.displaced #stage,
+body.displaced #drawer {
+  filter: grayscale(1);
+  opacity: 0.75;
 }
 
 /* Client roster overlaying the room views. */

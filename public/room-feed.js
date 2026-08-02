@@ -28,6 +28,9 @@ function poseUncertainty(msg) {
 
 function createRoomFeed(views) {
   let markerMap = null;
+  let landmarks = [];
+  // clientId -> the tag ids its last *detection* reported. See applyPose.
+  const seenTags = new Map();
 
   return {
     // True if the message was a room message and has been applied. A page with
@@ -48,6 +51,14 @@ function createRoomFeed(views) {
         views.forEach((v) => v.setWalls?.(msg.walls));
         return true;
       }
+      // The per-client anchor cloud. Sent whole, so a client whose anchors were
+      // dropped says so by appearing with fewer — the renderers replace rather
+      // than merge.
+      if (msg.type === 'landmarks') {
+        landmarks = msg.clients;
+        views.forEach((v) => v.setLandmarks?.(msg.clients));
+        return true;
+      }
       return false;
     },
 
@@ -56,12 +67,20 @@ function createRoomFeed(views) {
     // reads the rest of it for the tile label.
     applyPose(clientId, msg) {
       if (!msg.room?.pose) return;
-      const seen = (msg.tags || []).map((t) => t.id);
+      // A carry report has no detection behind it, so its empty tag list is not
+      // a statement that nothing is in view — it is the absence of a look. The
+      // client sends several of them between detections, and treating each as
+      // "no tags" made the sight lines to the tags blink out and back two or
+      // three times a second. What is still true is whatever the last actual
+      // detection said, so that is what stands.
+      if (!msg.carry) seenTags.set(clientId, (msg.tags || []).map((t) => t.id));
+      const seen = seenTags.get(clientId) || [];
       views.forEach((v) =>
         v.updateClient(clientId, msg.room.pose, seen, poseUncertainty(msg)));
     },
 
     removeClient(clientId) {
+      seenTags.delete(clientId);
       views.forEach((v) => v.removeClient(clientId));
     },
 
@@ -70,6 +89,13 @@ function createRoomFeed(views) {
     // which survey they are showing.
     getMarkerMap() {
       return markerMap;
+    },
+
+    // The anchor clouds as they last arrived, for the drawer. Held here for the
+    // same reason the marker map is: the views and the panel must not be able
+    // to disagree about which collection they are showing.
+    getLandmarks() {
+      return landmarks;
     },
   };
 }
