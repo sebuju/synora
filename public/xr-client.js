@@ -24,8 +24,11 @@ const overlayText = document.getElementById('overlayText');
 const blankBtn = document.getElementById('blankBtn');
 const mapCanvas = document.getElementById('mapCanvas');
 const camCanvas = document.getElementById('camCanvas');
+const overlayRot = document.getElementById('overlayRot');
+const overlayBtns = document.getElementById('overlayBtns');
+const exitBtn = document.getElementById('exitBtn');
 const mapBtn = document.getElementById('mapBtn');
-const minimalBtn = document.getElementById('minimalBtn');
+const transparentBtn = document.getElementById('transparentBtn');
 const headingBtn = document.getElementById('headingBtn');
 
 // There are no devtools on a phone, and a script that throws while wiring
@@ -37,7 +40,26 @@ window.addEventListener('error', (ev) => {
     `error: ${ev.message} (${(ev.filename || '').split('/').pop()}:${ev.lineno})`;
 });
 
-const POSE_INTERVAL_MS = 100;      // tag detection + pose report
+const POSE_INTERVAL_MS = 100;      // how often detection is *attempted*
+// How often this client reports where it is, which is no longer the same thing.
+//
+// Detection costs 300 ms a frame on this phone (tag scan plus feature tracking),
+// so tying the report to it dropped the report rate to 3/s — measured, against
+// 6.4/s before feature tracking existed. Two things broke that nobody connected
+// to it at the time:
+//
+//   - The room views ease toward the last reported pose, so at 3/s the client's
+//     dot moves in visible steps. The animation was never the problem; its input
+//     was.
+//   - `trackJitter` needs 8 samples inside a 1500 ms window — 5.3/s — so the
+//     steadiness measurement simply stopped existing (93% of good frames carried
+//     one at 6.4/s, 5% at 3/s). That is what shut the landmark gate for three
+//     whole sessions (see the note on landmarkGate).
+//
+// ARCore has a pose every single frame, and the *carry* report costs nothing to
+// produce: no camera read, no scan, no tracking. So the report runs on its own
+// clock and detection results ride on whichever report they are ready for.
+const CARRY_INTERVAL_MS = 100;
 
 let session = null;
 // Identifies this ARCore session to the server. Its frame's origin is wherever
@@ -55,12 +77,32 @@ let core = null;
 // The server's declared printed marker size, held until the detector exists.
 let markerSizeM = 0.15;
 let lumaSource = null;
+// Landmark feature tracking on the on-page fallback only; on the worker path
+// the tracker lives over there with the detector.
+let pageTracker = null;
 let readCanvas = null;
 let readCtx = null;
 let pixels = null;
 let lastPose = 0;
+// When anything was last reported, by either path. Detection reports reset it,
+// so a carry only goes out when a detection has not just covered it.
+let lastReport = 0;
+// The camera model of the most recent frame that was actually read. A carry
+// report describes the same camera — it just has nothing new to say about what
+// is in front of it — and the server keys the stored model on the size.
+let lastIntr = null;
+// The freshest ARCore pose the frame loop has seen, in CV convention. A
+// detection report is built from the pose of the frame it *read*, which by the
+// time it is sent is 300 ms old — a third of a second of walking. This is what
+// goes alongside it so the dashboard can draw where the phone is rather than
+// where it was.
+let lastXrNow = null;
 let frames = 0;
 let lastTags = [];
+let lastTrack = null;
+// Set when the worker reports the tracker shut itself off. Sticky for the
+// session: it does not get a second chance, so neither should the message.
+let trackFailed = null;
 let roomPose = null;
 let busy = false;
 // What ARCore actually handed over, reported rather than assumed: the camera
@@ -98,6 +140,10 @@ const signaling = connectSignaling('client', {
     if (roomFeed.handle(msg)) return;
     if (msg.type === 'room-pose') {
       roomPose = msg;
+      // Where to walk next, drawn on the map this page is already carrying
+      // around the room. Null clears it — "nothing worth saying" is the common
+      // answer and must not leave the last instruction standing.
+      mapView.setGuide(msg.guide || null);
       // The map's rotation comes from the same fix the overlay reports, so the
       // two can never disagree about which way this phone is pointing.
       applyHeading();
@@ -165,10 +211,98 @@ const MAP_FRAME_MS = 16;
 const CHIP_INTERVAL_MS = 200;
 let chipAt = 0;
 
+// `track N pts` is this phone's own tracker; `anchors`/`arc` are the server's
+// map, which arrives on room-pose. Either half can be missing — the tracker
+// before the first frame, the server state before the first report — and the
+// line says only what it actually knows.
+function landmarkLine() {
+  // Both of these used to be an empty string, which is the one thing this line
+  // must never be: a tracker that shut itself off and a tracker that was never
+  // asked to run look identical when the answer is silence.
+  if (trackFailed) return `landmarks OFF — ${trackFailed}\n`;
+  if (!lastTrack && !roomPose?.landmarks) return 'landmarks — no tracker output yet\n';
+  const lm = roomPose?.landmarks;
+  // Two lines, because this is a phone: what the tracker is doing, then what
+  // survived and what the room has made of it.
+  const c = lastTrack?.churn;
+  const first = [];
+  if (lastTrack) first.push(`track ${lastTrack.n}pts ${Math.round(lastTrack.ms)}ms`);
+  // Churn, when there is any: how many of the previous set survived this frame
+  // and how far they moved. A track has to live a second or two to be worth
+  // anything, and when it does not, this is the only thing on the phone that
+  // says so.
+  // `pred` beside `moved` is how the rotation seed is read: the two tracking
+  // close together says the flow was started next to the answer, a large `moved`
+  // against a near-zero `pred` says the camera orientation is not reaching the
+  // tracker at all — which is silent otherwise, since an unseeded flow is not an
+  // error, only a worse one.
+  if (c?.in) {
+    first.push(`kept ${c.kept}/${c.in} · moved ${c.moved}px`
+      + (c.pred == null ? '' : `/pred ${c.pred}`));
+  }
+
+  const second = [];
+  // Which stage is killing them — the flow giving up, points leaving frame, or
+  // the round-trip check. They call for opposite fixes, so the split matters
+  // more than the total.
+  if (c?.in) second.push(`drop lk${c.status} edge${c.edge} fb${c.fb}`);
+  if (lm) {
+    second.push(`${lm.anchors} anchor${lm.anchors === 1 ? '' : 's'}`);
+    // Against the threshold while it matters, on its own once it does not: a
+    // target already met is not information.
+    second.push(lm.anchors ? `arc ${lm.arc}°` : `arc ${lm.arc}/${ROOM_LANDMARK_ARC_DEG}°`);
+  }
+  return [first.join(' · '), second.join(' · '), guideLine()]
+    .filter(Boolean).join('\n') + '\n';
+}
+
+// The instruction, in words, beside the same instruction drawn on the map. Both
+// because they answer different questions: the map says *where*, the line says
+// *what* and how far off it is — and the map is off in `off` mode, where this
+// line is the only thing left.
+//
+// Written as something to do, not as a state to interpret. "22/60°" is a
+// readout; "walk around it" is an instruction, and this page is read by someone
+// walking a room, usually at arm's length and moving.
+function guideLine() {
+  const g = roomPose?.guide;
+  if (!g) return '';
+  const what = `${g.n} corner${g.n === 1 ? '' : 's'} at ${g.dist} m`;
+  if (g.mode === 'closer') return `→ get closer: ${what}`;
+  if (g.mode === 'arc') return `→ walk around it: ${what}, ${g.need}° more`;
+  return `→ keep it in view: ${what}, ${g.span}° seen`;
+}
+
 function chipDue(now) {
   if (now - chipAt < CHIP_INTERVAL_MS) return false;
   chipAt = now;
   return true;
+}
+
+// The overlay is the only diagnostic surface this page has, and it can only be
+// read by holding the phone — which is the one thing you cannot do while
+// walking the room it is describing. So every update is also reported to the
+// server, which appends it to a file: what the phone showed, when, without
+// anyone having to be looking at it.
+//
+// One helper because there are two places that write the overlay (the
+// tracking-lost line and the full report), and a second copy of the reporting
+// would silently cover only one of them — which would be the wrong one, since
+// the lost case is the one nobody is watching.
+const OVERLAY_REPORT_MS = 1000;
+// -Infinity, not 0: the first overlay is the one worth having — it is what the
+// screen said before anyone could pick the phone up, and a session that fails
+// on startup never gets a second one.
+let lastOverlayReport = -Infinity;
+
+function setOverlay(text) {
+  overlayText.textContent = text;
+  // Reported far more slowly than it is drawn: the overlay refreshes five times
+  // a second and nothing in it changes meaningfully that fast.
+  const now = performance.now();
+  if (now - lastOverlayReport < OVERLAY_REPORT_MS) return;
+  lastOverlayReport = now;
+  signaling.send({ type: 'client-overlay', text });
 }
 let mapFrameAt = 0;
 const mapRaf = (cb) => {
@@ -192,11 +326,17 @@ const mapRaf = (cb) => {
 const MAP_MAX_PX = 1.2e6;
 const mapView = createMap2dView(mapCanvas, 'top', { raf: mapRaf, maxPixels: MAP_MAX_PX });
 const roomFeed = createRoomFeed([mapView]);
+// On here where the dashboard has it off by default. This is the page being
+// carried around the room, and the candidates are the only thing that says
+// *where* to orbit next — on the dashboard they are a diagnostic, here they are
+// the instruction. No button: the phone's overlay is already at its limit, and
+// there is nothing to decide.
+mapView.setLayer('candidates', true);
 
 // off -> the AR passthrough alone, as before; split -> map over the lower half;
 // full -> map over the passthrough entirely. One button cycles them.
 //
-// Full by default, and with `minimal` below that is the whole screen showing
+// Full by default, and with `transparent` below that is the whole screen showing
 // the room over the passthrough rather than instead of it — the reason this
 // page draws a map at all. It is a preference, not a state: it survives a
 // session ending, and only the *subscription* follows what can actually be
@@ -215,12 +355,12 @@ const CAM_PREVIEW_PX = 180;   // backing store; CSS decides the drawn size
 const camCtx = camCanvas.getContext('2d');
 
 // Shown only where the passthrough is genuinely hidden: full screen *and* not
-// minimal. In split mode the real thing is on screen above the map, and with
-// the backdrop off the map is transparent and the passthrough is already the
-// background — a small copy of it in the corner is then just clutter over
+// transparent. In split mode the real thing is on screen above the map, and
+// with the backdrop off the map is see-through and the passthrough is already
+// the background — a small copy of it in the corner is then just clutter over
 // itself. Both toggles feed this, so neither can decide it alone.
 function updateCamInset() {
-  camCanvas.classList.toggle('on', mapMode === 'full' && !minimal);
+  camCanvas.classList.toggle('on', mapMode === 'full' && !transparent);
 }
 
 // The overlay's rotation is cancelled here, not inherited. The map is a drawing
@@ -248,6 +388,40 @@ function drawCamPreview(image) {
   camCtx.setTransform(1, 0, 0, 1, 0, 0);
 }
 
+// The map's axis gizmo is pinned to the bottom left corner of the canvas, and
+// both of those edges are covered by something at one rotation or another. The
+// canvas is inside the turned box, so a corner of it is a different corner of
+// the phone at every quarter turn — which is why moving the close box in CSS
+// did nothing for the gizmo: one is positioned in the page, the other is
+// painted inside the canvas, and neither can see the other.
+//
+// Bottom: the button row, upright. The buttons are over the map (they are the
+// only way out of a full-screen one), so the gizmo has to start above them.
+// Measured rather than declared — the row's height moves with the labels the map
+// itself brings in and with the gesture bar's inset. Turned sideways the buttons
+// are a column down the right-hand edge and the bottom of the canvas is clear
+// again, so it goes back to nothing.
+//
+// Left: the status bar, at rot90 only. Android draws it along the phone's
+// physical top edge however the page is turned, and that edge is this box's left
+// at rot90 — the same strip the close box had to be pushed clear of, so its own
+// offset is what the gizmo clears too rather than a second copy of the number.
+// At rot270 the physical top is the box's right-hand edge and the gizmo's corner
+// is nowhere near it. rot180 (phone upside down) puts the status bar along the
+// bottom, where the button row's own inset already covers it.
+//
+// `offsetTop`/`offsetLeft` rather than client rects: the container carries the
+// screen rotation and a rect would come back turned with it.
+function updateMapInset() {
+  const sideways = screenRotDeg === 90 || screenRotDeg === 270;
+  mapView.setChromeInset({
+    bottom: sideways || !overlayBtns.offsetHeight
+      ? 0
+      : overlayRot.clientHeight - overlayBtns.offsetTop,
+    left: screenRotDeg === 90 ? exitBtn.offsetLeft : 0,
+  });
+}
+
 // The one setter. The button and the dashboard's `control` both land here, so
 // the two cannot mean different things, and it is also what subscribes: the
 // server sends the room only to a client that reports it is drawing one.
@@ -257,8 +431,10 @@ function setMapMode(mode) {
   mapCanvas.classList.toggle('full', mapMode === 'full');
   updateCamInset();
   mapBtn.classList.toggle('active', mapMode !== 'off');
-  minimalBtn.classList.toggle('on', mapMode !== 'off');
+  transparentBtn.classList.toggle('on', mapMode !== 'off');
   headingBtn.classList.toggle('on', mapMode !== 'off');
+  // After the visibility toggles above, since they are what changes the row.
+  updateMapInset();
   // Stopped when it is off screen: it runs a frame loop of its own, and the
   // detector on this page is already the expensive thing in the session.
   // Only ever drawn inside a session: outside one the overlay is not composited
@@ -274,7 +450,7 @@ function setMapMode(mode) {
 // passthrough, so the map reads as a HUD on the room rather than as a picture
 // beside it. The legs are a measurement to check a survey against a tape — the
 // dashboard's job, not something to read while walking a room.
-let minimal = true;
+let transparent = true;
 
 // Which way is down, asked of ARCore rather than of the browser. The phone's
 // orientation lock is deliberate and stays on, so the layout is portrait
@@ -306,6 +482,9 @@ function updateScreenRotation(orientation) {
   if (snapped === screenRotDeg) return;
   screenRotDeg = snapped;
   for (const r of [90, 180, 270]) overlay.classList.toggle(`rot${r}`, snapped === r);
+  // The buttons move to the other edge with the turn, so what the gizmo has to
+  // clear changes with it.
+  updateMapInset();
 }
 
 // Heading up: the map turns and the client marker holds still, rather than the
@@ -328,11 +507,11 @@ function setHeading(on) {
   applyHeading();
 }
 
-function setMinimal(on) {
-  minimal = on;
-  minimalBtn.classList.toggle('active', minimal);
-  mapView.setLayer('backdrop', !minimal);
-  mapView.setLayer('pairs', !minimal);
+function setTransparent(on) {
+  transparent = on;
+  transparentBtn.classList.toggle('active', transparent);
+  mapView.setLayer('backdrop', !transparent);
+  mapView.setLayer('pairs', !transparent);
   updateCamInset();
 }
 
@@ -489,6 +668,7 @@ async function start() {
     return;
   }
   sessionId = crypto.randomUUID();
+  trackReset = true;
   await gl.makeXRCompatible();
   session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
   binding = new XRWebGLBinding(session, gl);
@@ -510,6 +690,9 @@ async function start() {
   if (!ensureDetectWorker()) await ensureCore();
 
   overlay.classList.add('on');
+  // Nothing in the overlay has a layout box until it is displayed, so the
+  // measurement taken at load was of a hidden element and read zero.
+  updateMapInset();
   session.addEventListener('end', () => {
     overlay.classList.remove('on');
     setStatus('session ended');
@@ -575,9 +758,9 @@ function onFrame(t, frame) {
     // is the difference that matters — with a camera image the tags still fix
     // the position outright, without one nothing can be detected at all.
     if (chipDue(now)) {
-      overlayText.textContent =
+      setOverlay(
         `LOST ${(lostMs / 1000).toFixed(1)}s${blindView ? '' : ' · no cam'}\n`
-        + `tags ${lastTags.length ? lastTags.map((x) => x.id).join(' ') : 'none'}`;
+        + `tags ${lastTags.length ? lastTags.map((x) => x.id).join(' ') : 'none'}`);
     }
     return;
   }
@@ -588,6 +771,7 @@ function onFrame(t, frame) {
     trackingLostSince = 0;
   }
   const view = pose.views[0];
+  lastXrNow = cvPose(pose.transform);
   updateScreenRotation(pose.transform.orientation);
   // Detection is far too expensive for every frame, and is a re-entrant
   // hazard — one at a time, on its own schedule.
@@ -598,15 +782,19 @@ function onFrame(t, frame) {
     // matters as the thing the camera image's aspect gets compared against.
     detectAndReport(view, pose, viewportOf(layer, view)).finally(() => { busy = false; });
   }
+  // Between detections: where ARCore says the camera is, and nothing else.
+  sendCarry(pose, now);
 
   // Five short lines, in the order they are read while walking a room: where,
   // what the camera is, what it sees, where that puts you, how steady it is.
+  // Plus landmarks, which is the one line that is a *task* rather than a
+  // readout — see landmarkLine.
   // Every field here is one that cannot be read anywhere else on the phone —
   // the explanations that used to sit beside them are in this file's comments,
   // which is where a sentence belongs.
   if (!chipDue(now)) return;
   const p = pose.transform.position;
-  overlayText.textContent =
+  setOverlay(
     `xr ${p.x.toFixed(2)} ${p.y.toFixed(2)} ${p.z.toFixed(2)}`
     // The step before tracking is lost outright: ARCore still has an
     // orientation but is guessing the position. Poses taken here are worth
@@ -623,6 +811,16 @@ function onFrame(t, frame) {
       ? lastTags.map((x) => `${x.id}@${x.err.toFixed(1)}px/`
         + `${Math.hypot(x.tvec[0], x.tvec[1], x.tvec[2]).toFixed(1)}m`).join(' ')
       : 'none'}\n`
+    // Landmarks, both halves on one line: what this phone is tracking right now
+    // (its own cost, which nothing else can see) and what the server has made of
+    // it (the map, which this phone cannot see).
+    //
+    // The arc is the number worth walking to. Anchors qualify on how wide a
+    // viewing arc a feature has been seen through, which is the one thing the
+    // person holding the phone controls — so it is shown against the threshold
+    // it has to beat, and it is the difference between knowing to orbit a spot
+    // and concluding the feature is broken.
+    + landmarkLine()
     + (roomPose?.pose
       ? `room ${roomPose.pose.p.map((v) => v.toFixed(2)).join(' ')} · ${roomPose.quality}`
       : 'room —')
@@ -635,7 +833,7 @@ function onFrame(t, frame) {
     + (roomPose?.jitter
       ? `\nsteady ${roomPose.jitter.movedMm}/${roomPose.jitter.jitterMm} mm`
       : '\nsteady —')
-    + ` · ${frames}f`;
+    + ` · ${frames}f`);
 }
 
 // A view from the 'viewer' space is not part of the render state's view list,
@@ -664,6 +862,10 @@ let detectWorker = null;
 let detectWorkerFailed = false;
 let detectSeq = 0;
 let detectPending = null;
+// Set when a session starts, cleared on the frame that carries it to the
+// worker: a new session is a new picture, and the tracker's ids have to stop
+// meaning what they meant in the last one.
+let trackReset = false;
 
 function failDetectWorker() {
   detectWorker?.terminate();
@@ -686,6 +888,12 @@ function ensureCore() {
     await core.ensureReady();
     core.setMarkerSize(markerSizeM);
     lumaSource = createCanvasLumaSource(core.cv);
+    // The tracker's own source, at its own width — see createFeatureTracker for
+    // why it cannot share the detector's. Built here so the fallback collects
+    // what the worker path collects; a landmark map that depended on which
+    // thread happened to be detecting would be untraceable.
+    pageTracker = createFeatureTracker(core.cv,
+      createCanvasLumaSource(core.cv, { maxWidth: TRACK_WIDTH }));
     return core;
   })().catch((err) => {
     setStatus(`detector failed: ${err.message}`);
@@ -712,6 +920,17 @@ function ensureDetectWorker() {
     const msg = ev.data;
     if (msg.type === 'fatal') {
       failDetectWorker();
+      return;
+    }
+    if (msg.type === 'track-failed') {
+      // Landmarks are gone for this session; detection is not, so the worker
+      // stays exactly where it is. Recorded rather than only announced: the
+      // status line is behind the immersive session, so the one place this can
+      // actually be read is the overlay — and a tracker that shuts itself off
+      // used to show up as a line quietly missing, which is indistinguishable
+      // from a line that was never enabled.
+      trackFailed = msg.message || 'tracker error';
+      setStatus(`feature tracking failed; landmarks off (${trackFailed})`);
       return;
     }
     if (msg.type !== 'xr-result') return;
@@ -758,6 +977,13 @@ async function detectAndReport(view, pose, viewport) {
     pose, intr, w: camera.width, h: camera.height,
     t: clockSync.synced ? clockSync.at(performance.now()) : null,
   };
+  // The camera's orientation this frame, for the feature tracker's flow seed.
+  // Session-frame and CV-axis, which is the frame the intrinsics describe; only
+  // the rotation *between* two frames is used, so the frame it is expressed in
+  // cancels as long as it is the same one both times. Null when ARCore has no
+  // world track — then there is nothing to predict from and the tracker starts
+  // each point from where it was.
+  const camView = pose ? { q: cvPose(pose.transform).q } : null;
   // The inset is the only reason the page ever looks at these pixels again, and
   // it costs a full-frame flip and raster, so it is done only when it is on.
   if (camCanvas.classList.contains('on')) {
@@ -773,8 +999,9 @@ async function detectAndReport(view, pose, viewport) {
     meta.seq = ++detectSeq;
     worker.postMessage({
       type: 'xr-frame', seq: meta.seq, buf,
-      w: meta.w, h: meta.h, flipY: true, intr,
+      w: meta.w, h: meta.h, flipY: true, intr, view: camView, reset: trackReset,
     }, [buf]);
+    trackReset = false;
     // The caller's `busy` guard is what keeps one frame in flight at a time, and
     // it releases on this promise — so it has to outlive the post and resolve
     // when the worker answers, not when the message is sent.
@@ -790,14 +1017,79 @@ async function detectAndReport(view, pose, viewport) {
   if (!core.hasIntrinsics(meta.w, meta.h)) core.setIntrinsics(meta.w, meta.h, intr);
   const image = pixelsToCanvas(meta.w, meta.h);
   const res = await core.detect(lumaSource, image, meta.w, meta.h, performance.now());
+  if (!res) return;
+  if (pageTracker) {
+    if (trackReset) {
+      pageTracker.reset();
+      trackReset = false;
+    }
+    try {
+      const tracked = await pageTracker.track(image, res.boxes,
+        camView ? { q: camView.q, K: intr } : null);
+      res.points = tracked?.points.map((p) => ({
+        id: p.id,
+        u: Math.round(p.u * 100) / 100,
+        v: Math.round(p.v * 100) / 100,
+      }));
+      res.gen = tracked?.gen;
+      res.trackMs = tracked?.ms;
+    } catch {
+      // Landmarks are gone; tags are not.
+      pageTracker.dispose();
+      pageTracker = null;
+      setStatus('feature tracking failed; landmarks off');
+    }
+  }
   reportDetection(meta, res);
+}
+
+// A report with no detection behind it: ARCore's pose, and an explicit statement
+// that nothing was looked at.
+//
+// `scanned: null` is that statement, and it is load-bearing rather than tidy.
+// The walls module reads it as a failed frame grab and refuses the report
+// outright, which is exactly right here — a *missing* `scanned` means "an older
+// client that always swept the whole frame", so an omitted field would let a
+// carry frame be read as "the detector looked everywhere and saw no tags" and
+// deposit negative evidence for tags that were never checked for. `tags: []`
+// alone would not save it; the pair is what makes this safe.
+//
+// The rest of the pipeline needs no changes and gets none: the survey already
+// treats a tag-less `xr-pose` as ARCore carrying the fix (`quality: 'tracked'`),
+// and `maintainLandmarks` returns immediately on a report with no points.
+function sendCarry(pose, now) {
+  // Nothing has described this camera yet, so there is nothing to report it as.
+  if (!lastIntr || !camInfo) return;
+  if (now - lastReport < CARRY_INTERVAL_MS) return;
+  lastReport = now;
+  signaling.send({
+    type: 'xr-pose',
+    sid: sessionId,
+    xr: cvPose(pose.transform),
+    source: 'xr',
+    carry: true,
+    t: clockSync.synced ? clockSync.at(now) : null,
+    w: camInfo.w,
+    h: camInfo.h,
+    intrinsics: lastIntr,
+    tags: [],
+    mode: null,
+    scanned: null,
+  });
 }
 
 // Both paths end here: the detector's result plus what the page knew when the
 // frame was taken. One report, one place, whichever thread did the work.
 function reportDetection(meta, res) {
   if (!res) return;
+  // A detection report covers this tick, so no carry follows it — the two
+  // together are what make the rate steady rather than lumpy.
+  lastReport = performance.now();
+  lastIntr = meta.intr;
   lastTags = res.tags || [];
+  lastTrack = res.points
+    ? { n: res.points.length, ms: res.trackMs ?? 0, churn: res.churn ?? null }
+    : null;
   const common = {
     t: meta.t,
     w: meta.w,
@@ -811,6 +1103,14 @@ function reportDetection(meta, res) {
     // at nothing.
     mode: res.mode,
     scanned: res.scanned,
+    // Tracked features, when landmark collection is on. `intrinsics` above is
+    // already the camera model the server needs to turn one into a bearing, so
+    // unlike /client this path has nothing extra to send for it.
+    points: res.points,
+    gen: res.gen,
+    // Journalled with the report, so churn is measurable after the fact rather
+    // than only while someone is watching the phone.
+    churn: res.churn,
   };
   // With a world pose the server can tie ARCore's frame to the room and carry
   // the position between sightings; without one it gets the observations on
@@ -820,20 +1120,59 @@ function reportDetection(meta, res) {
   signaling.send(meta.pose
     ? {
       type: 'xr-pose', sid: sessionId, xr: cvPose(meta.pose.transform),
+      // Where the tags were seen from, and where the phone is now. Detection
+      // takes ~300 ms, so by the time this is sent `xr` describes a position a
+      // third of a second down the walk — right for the tags, wrong for the
+      // dot on the dashboard. See alignXr.
+      xrNow: lastXrNow,
       source: 'xr', ...common,
     }
     : { type: 'pose', calibrated: true, source: 'xr', ...common });
 }
 
 startBtn.onclick = start;
+// Nothing to tear down here: `end` is requested and the session's own end
+// handler does the rest, which is also the path the system back gesture and a
+// headset's own exit take. Doing it here as well would be a second teardown
+// that could run in a different order than that one.
+// `pointerup`, not `click`: a click needs the press and the release to land on
+// the same element with next to no travel between them, and this is a small
+// target on a phone being held up at arm's length — the hand moves, the release
+// lands a few pixels off, and the tap is silently dropped. A touch pointer gets
+// implicit capture on press, so its pointerup is delivered here however far the
+// finger drifted. Not `pointerdown` like the chip: this one ends the session,
+// and a press that turns out to be the start of a swipe should not.
+// The guard is what that capture costs — the release is delivered here whether
+// or not it happened over the button, so where it happened has to be asked.
+exitBtn.addEventListener('pointerup', (ev) => {
+  ev.preventDefault();
+  const over = document.elementFromPoint(ev.clientX, ev.clientY);
+  if (over === exitBtn) session?.end();
+});
 blankBtn.onclick = () => blank.toggle();
 mapBtn.onclick = () =>
   setMapMode(MAP_MODES[(MAP_MODES.indexOf(mapMode) + 1) % MAP_MODES.length]);
-minimalBtn.onclick = () => setMinimal(!minimal);
+transparentBtn.onclick = () => setTransparent(!transparent);
+// Tap the chip to fold it to one line, tap again for the rest. `pointerdown`
+// rather than `click`: it is the one event a finger, a mouse and a stylus all
+// raise exactly once, where touchstart plus the synthesized click that follows
+// it would toggle twice per tap. preventDefault stops that synthesized click
+// and the text selection a press-and-hold would otherwise start. The state is
+// the class on the element — nothing else on the page reads it.
+overlayText.addEventListener(
+  window.PointerEvent ? 'pointerdown' : 'touchstart',
+  (ev) => {
+    ev.preventDefault();
+    overlayText.classList.toggle('collapsed');
+  });
+// The Android navigation bar comes and goes under the session; the overlay is
+// sized in dvh and its safe-area inset follows, so the strip the buttons cover
+// is not the same one it was.
+window.addEventListener('resize', updateMapInset);
 headingBtn.onclick = () => setHeading(!headingUp);
 setHeading(headingUp);
 // Both defaults applied once at load, so the buttons and the renderer start out
 // agreeing with the variables above.
-setMinimal(minimal);
+setTransparent(transparent);
 setMapMode(mapMode);
 probe();

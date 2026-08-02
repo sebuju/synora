@@ -63,6 +63,24 @@
       background: rgba(0,0,0,0.72); border-radius: 6px; padding: 10px;
       font-family: ui-monospace, monospace; font-size: 10px; color: #eee;
       white-space: pre-line;
+      cursor: pointer;
+      -webkit-tap-highlight-color: transparent;
+    }
+    /* Tapped, the chip folds down to its first line: it is five lines of
+       diagnostics sitting over the map this screen exists to draw, and it is not
+       wanted at full height all the time. The first line stays rather than the
+       whole thing going — it is also the target that brings the rest back, and a
+       chip that vanished outright would leave nothing to aim at. The max-height
+       is the fallback for a UA without -webkit-line-clamp: same one line, only
+       without the ellipsis saying so. */
+    #overlayText.collapsed {
+      display: -webkit-box;
+      -webkit-box-orient: vertical;
+      -webkit-line-clamp: 1;
+      overflow: hidden;
+      max-height: calc(1.2em + 12px);
+      padding: 6px 8px;
+      opacity: 0.8;
     }
     /* Turned sideways the chip goes to the top right. The 56px above is the
        punch-hole camera, which is on the portrait top edge and nowhere near
@@ -120,8 +138,8 @@
       position: absolute;
       left: 8px; right: 8px;
       bottom: calc(env(safe-area-inset-bottom, 0px) + 16px);
-      display: flex; justify-content: space-between; align-items: flex-end;
-      gap: 10px;
+      display: flex; align-items: flex-end;
+      gap: 6px;
     }
     /* Turned sideways they stack down the right-hand edge instead: the bottom
        of a landscape screen is where Android's own bars sit, and a row of
@@ -131,13 +149,114 @@
       left: auto; right: 8px;
       top: 8px; bottom: 8px;
       /* Bottom of the column, not the middle: the chip now has the top of this
-         same edge, and centred buttons reached up into it. */
-      flex-direction: column; justify-content: flex-end; align-items: flex-end;
+         same edge, and centred buttons reached up into it.
+         `stretch` is what makes the column one width — the box is shrink-wrapped
+         to its widest child, and every button then fills it. */
+      flex-direction: column; justify-content: flex-end; align-items: stretch;
     }
-    #overlayBtns button { padding: 5px 9px; font-size: 11px; }
+    /* Bottom up: Blank, Map, then the two the map brings with it. The map-only
+       buttons appear and disappear under the user's thumb, and anchored from the
+       bottom of the column they push nothing that was already there — Map and
+       Blank keep the exact spot they had before the map was turned on. The
+       min-width does the same for the width: the column is sized by its widest
+       child, so without it the whole column would narrow as `Transparent` left. */
+    #overlay.rot90 #overlayBtns button,
+    #overlay.rot270 #overlayBtns button {
+      flex: 0 0 auto;
+      min-width: 84px;
+    }
+    #overlay.rot90 #headingBtn, #overlay.rot270 #headingBtn { order: 1; }
+    #overlay.rot90 #transparentBtn, #overlay.rot270 #transparentBtn { order: 2; }
+    #overlay.rot90 #mapBtn, #overlay.rot270 #mapBtn { order: 3; }
+    #overlay.rot90 #blankBtn, #overlay.rot270 #blankBtn { order: 4; }
+    /* One share of the row each, so the labels differing in length does not make
+       one control a bigger target than another. The close box shares the look:
+       one description of a HUD control, whatever it is anchored to. */
+    /* The look is style.css's — one description of a control for the whole app.
+       What is set here is what the passthrough changes about it: the fill goes
+       from a light film (which lifts a control off dark chrome) to a dark pill
+       (which holds contrast against a bright camera image), and the pressed fill
+       has to go *lighter* for the same reason. The blur only reaches page
+       pixels — the map canvas under it — since the passthrough is composited
+       behind the whole overlay and nothing here can touch it, so on this page
+       the fill is what carries the contrast on its own.
+       No border: at this size a hairline on every one of a tight row of pills
+       read as a row of boxes rather than as controls. */
+    #overlayBtns {
+      --btn-fill: rgba(22, 22, 24, 0.62);
+      --btn-fill-hover: rgba(40, 40, 44, 0.68);
+      --btn-fill-press: rgba(70, 70, 74, 0.72);
+      --btn-line: transparent;
+      --btn-line-hover: transparent;
+      --btn-on-line: transparent;
+      --btn-radius: 2px;
+    }
+    #overlayBtns button, #exitBtn {
+      flex: 1 1 0; min-width: 0;
+      padding: 6px 6px;
+      /* Same monospace as the diagnostic chip above them — this overlay is an
+         instrument panel, not chrome. */
+      font-family: ui-monospace, monospace;
+      font-size: 9px;
+    }
+    /* Out of the session, back to the page with the Start button on it. Anchored
+       on its own rather than given a place in the button row: the row is the
+       overlay's own controls, all of them about what is being drawn, while this
+       one leaves — and a fifth equal column would not fit `Transparent` across a
+       phone at this size anyway. It takes the corner diagonally opposite the
+       chip in both orientations, which is also where a close box is looked for
+       and the furthest thing on screen from the thumb resting on the row. */
+    /* The one control here that is not a pane of glass: no fill, no edge, no
+       shadow, and no blur either — a blurred pane with nothing filling it is
+       still a visible square. It is a mark on the passthrough rather than a
+       button on a panel, which is what a close box is, and it is the reason it
+       does not take the overlay's fill tokens. The drop shadow is then the only
+       thing holding it against a bright camera image, and does the job the fill
+       does everywhere else. */
+    #exitBtn {
+      position: absolute; z-index: 40;
+      /* Level with the chip, and past the punch-hole camera for the same
+         reason — see #overlayText. */
+      top: calc(env(safe-area-inset-top, 0px) + 56px);
+      right: 8px;
+      flex: none;
+      /* Box and mark are sized separately: the ✕ is 16px, the target it sits in
+         the middle of is a finger wide. Nothing is drawn on the box, so it can
+         be as big as a touch needs without looking it. */
+      width: 46px; height: 46px;
+      padding: 0; line-height: 1;
+      font-size: 16px;
+      /* No double-tap zoom to wait for, and no chance of the press being taken
+         for the start of a pan. */
+      touch-action: manipulation;
+      background: transparent;
+      box-shadow: none;
+      backdrop-filter: none;
+      -webkit-backdrop-filter: none;
+      text-shadow: 0 1px 3px rgba(0, 0, 0, 0.85);
+    }
+    /* Nothing to darken, so the press shows as the mark itself fading. */
+    #exitBtn:active {
+      opacity: 0.55;
+    }
+    /* Turned sideways the chip moves to the top right, so this moves to the
+       opposite end of the same edge. The two turns are not mirror images here:
+       Android keeps drawing its status bar along the phone's *physical* top edge
+       whatever the page's orientation lock says, and that edge is this box's
+       left at rot90 and its right at rot270. At a flat 8px the close box sat
+       under the clock and the battery — measured on the device. The offset is
+       taken from the safe-area *top* inset for the same reason: the insets
+       describe the unturned screen, so top is the one that means "status bar"
+       however far this box has been turned. */
+    #overlay.rot90 #exitBtn {
+      right: auto; left: calc(env(safe-area-inset-top, 0px) + 48px); top: 8px;
+    }
+    #overlay.rot270 #exitBtn {
+      left: auto; right: calc(env(safe-area-inset-top, 0px) + 48px); top: 8px;
+    }
     /* Only while there is a map for them to act on. */
-    #minimalBtn, #headingBtn { display: none; }
-    #minimalBtn.on, #headingBtn.on { display: block; }
+    #transparentBtn, #headingBtn { display: none; }
+    #transparentBtn.on, #headingBtn.on { display: block; }
   </style>
 </head>
 <body>
@@ -155,9 +274,10 @@
       <canvas id="mapCanvas"></canvas>
       <canvas id="camCanvas"></canvas>
       <div id="overlayText"></div>
+      <button id="exitBtn" type="button" title="End the XR session">✕</button>
       <div id="overlayBtns">
         <button id="mapBtn" type="button">Map</button>
-        <button id="minimalBtn" type="button">Minimal</button>
+        <button id="transparentBtn" type="button">Transparent</button>
         <button id="headingBtn" type="button">Heading</button>
         <button id="blankBtn" type="button">Blank</button>
       </div>
