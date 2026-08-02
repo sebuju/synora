@@ -19,6 +19,7 @@ No build step, no app install: vanilla JS served as static files. A client is an
 - [Landmarks](#landmarks)
 - [Room views](#room-views)
 - [Devices and calibration](#devices-and-calibration)
+- [Server settings](#server-settings)
 - [Streaming](#streaming)
 - [Frame sync](#frame-sync)
 - [Client roster and remote control](#client-roster-and-remote-control)
@@ -50,7 +51,7 @@ There is no test suite, linter, or build step. Verification is manual: start the
 
 **Room setup.**
 
-1. Print tags from `/markers`. Tag edge must be exactly 150 mm including the black border (`markerSizeM` in `server.js`); a scale error there multiplies every distance in the room frame. A screen showing `/digital` also works as a tag.
+1. Print tags from `/markers`. Tag edge must be exactly 150 mm including the black border; a scale error there multiplies every distance in the room frame. Measure a printed one — "fit to page" silently returns 150 mm at about 142 mm — and set the real figure in **Server settings** (the dashboard drawer, or the size field on `/markers` itself). It is shown in the dashboard header and persisted server-side. A screen showing `/digital` also works as a tag.
 2. Mount tags on the walls, several per room, ideally not all coplanar — tags on two different walls are what removes the planar PnP ambiguity (see below).
 3. Calibrate each client at `/calibrate`. Intrinsics are stored per lens and per resolution on the server under the device's id. Uncalibrated clients are flagged `calibrated:false` end to end and are refused the survey.
 4. Walk the room with `/xr-client` (or `/client`). The first clean tag becomes the room origin; the rest promote into the map as they are seen alongside known ones.
@@ -185,6 +186,20 @@ Calibration is why. Fifteen careful ChArUco captures used to live in `localStora
 
 Intrinsics always describe the **full frame** — crops offset corners, they never rescale the camera model — and are stored per lens and resolution with rotation-aware and scale-aware fallbacks. Calibrating at the resolution you stream at beats the linear rescale.
 
+## Server settings
+
+The knobs that belong to the *room* rather than to a device, in the dashboard drawer under **Server settings**, persisted in `pose-settings.json` and applied without a restart. The schema lives in `settings.js` and is sent to the dashboard, which builds the form from it — a new setting appears there with its label, bounds, units and help text without touching the viewer.
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| Tag size | 150 mm | Printed tag edge, the room's only metric datum. **Clears the survey, the carve and the landmarks** — every tag position was measured at the old scale. |
+| Detection interval | 100 ms | How often a client attempts a tag detection. Pushed to every connected client at once. |
+| Landmarks | on | Server-side master switch for the feature. Off, it forgets the anchors it had; the phone has its own toggle for the tracker's per-frame cost. |
+| Wall carving | on | Whether accepted pose reports carve free space. Off, the grid stops growing but is kept — the wipe that throws it away is its own control. |
+| Pose journal | on | Whether observations are recorded to `recordings/*.pose.jsonl`. This is what the replay harnesses re-run, so it is on by default. |
+
+Tag size is also settable from `/markers` (the page that prints the sheet, which has no dashboard socket) and is shown in the dashboard header: every distance on that page scales by it, and a wrong one is invisible in all of them — the room simply comes out uniformly too big. A change made from either place reaches the other immediately. `GET`/`POST /api/settings` is the same path for anything without a page open.
+
 ## Streaming
 
 N clients ↔ server ↔ 1 dashboard. Live media never touches the server.
@@ -285,6 +300,7 @@ survey.js              marker map, joint PnP, localization, pose filter
 walls.js               free-space carve, wall inference, negative evidence
 landmarks.js           in-session feature anchors
 devices.js             device registry: settings, calibration, fingerprints
+settings.js            persisted server settings: schema, store, validation
 replay-*.js            offline measurement harnesses
 fetch-vendor.js        downloads opencv.js / three.js
 public/
@@ -317,6 +333,7 @@ public/vendor/         fetched opencv.js / three.js               (gitignored)
 markers.json           surveyed marker map                        (gitignored)
 walls.json             carved occupancy grid + sight lines        (gitignored)
 devices.json           per-device settings + camera calibration   (gitignored)
+pose-settings.json     persisted server settings                  (gitignored)
 ```
 
 Conventions: dates/times are 24-hour `dd/mm/yy`, formatted only by the helpers in `server.js` — no `toLocaleString`. Comments explain why, not what. Shared client/viewer logic lives in `common.js`; shared CV definitions in `cv-common.js`; transform math in `pose-math.js`.
@@ -336,7 +353,7 @@ Conventions: dates/times are 24-hour `dd/mm/yy`, formatted only by the helpers i
 | Tags move when the client is turned | The symptom the above two exist to make visible. `/calibrate` in both orientations. |
 | Tags detected but no room fix | No surveyed tag in view. The survey grows from the anchor: show a known and an unknown tag together, repeatedly. |
 | A tag sits visibly wrong in the map | Mirror branch. It heals as the tag is re-observed; if the tag was physically knocked it re-seeds itself in ~30 sightings. If the *anchor* moved, nothing can detect it — remove the anchor and re-survey. |
-| Distances uniformly wrong | Printed tag size ≠ 150 mm. Reprint at exact scale or adjust `markerSizeM`. |
+| Distances uniformly wrong | Printed tag size ≠ the configured size (shown in the dashboard header). Reprint at exact scale, or measure the sheet and set **Tag size** in Server settings. |
 | Walls appear across a doorway | Every mapped tag asserts wall for a radius around it — the weakest evidence in the module. Look *through* the opening from several viewpoints; a quorum of sight lines cuts the segment. |
 | Amber cells where nothing is | Deduced occupancy from blocked rays — a person standing there does this honestly. It clears when the space is re-carved free. |
 | Positioning features absent at startup | `npm run fetch-vendor` not run; the startup log names what is missing. |

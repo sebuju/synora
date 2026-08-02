@@ -9,9 +9,14 @@
 // answer, so a client that refuses an action never leaves a button lying about
 // its state.
 //
-// Cards are updated in place rather than rebuilt. Rebuilding on every tick
-// would close the resolution dropdown the instant it was opened and make every
-// button flicker under the pointer.
+// Nothing here is rebuilt — every list is matched against what is already on
+// screen and moved (syncKeyed in common.js), the same rule the room views
+// follow in anim.js. This panel repaints four times a second and the marker map
+// under it is replaced several times a second while a survey is being walked,
+// so a rebuild would close the resolution dropdown the instant it was opened,
+// throw away the canvases a tag's history is drawn on, drop a two-click
+// confirmation halfway through, and make it impossible to select a line of the
+// readout for long enough to copy it.
 
 const PANEL_RESOLUTIONS = ['480p', '720p', '1080p', '1440p', '4K'];
 
@@ -26,8 +31,23 @@ const PANEL_POSE_STALE_MS = 2000;
 const CARD_TINT_ALPHA = 0.13;
 
 function createClientsPanel(el,
-  { onControl, onVcam, onRename, onTagHover, onTagOpen, onTagRemove, onTagHistory }) {
+  { onControl, onVcam, onRename, onHover, onTagOpen, onTagRemove, onTagHistory }) {
   const cards = new Map();   // clientId -> card DOM
+
+  // Pointing at a card here points at the same entity in the room views, and
+  // vice versa. Reported, never applied: what is hot is the viewer's to
+  // decide, or a card and the map would each hold their own answer and
+  // disagree the moment the pointer moved between them. One shape for every
+  // card family — { kind: 'tag' | 'client' | 'region', id }.
+  //
+  // `id` identifies the *card*, and nothing else may be smuggled into it: it is
+  // what the dashboard compares hovers by, so two cards sharing one id are one
+  // entity and light as one. Anything a room view needs in order to draw the
+  // hover at its own coarser grain rides in `extra` instead.
+  function hoverable(root, kind, id, extra = null) {
+    root.onpointerenter = () => onHover?.({ kind, id, ...extra });
+    root.onpointerleave = () => onHover?.(null);
+  }
 
   function button(label, title) {
     const b = document.createElement('button');
@@ -49,6 +69,7 @@ function createClientsPanel(el,
   function buildCard(id) {
     const root = document.createElement('div');
     root.className = 'drawer-card';
+    hoverable(root, 'client', id);
 
     const head = document.createElement('div');
     head.className = 'head';
@@ -117,16 +138,20 @@ function createClientsPanel(el,
     const pose = toggle('Tags', 'pose', id, 'Marker tracking — off makes it a plain camera');
     const paused = toggle('Pause', 'paused', id, 'Freeze the feed; the recording stays open');
     const blank = toggle('Blank', 'blank', id, 'Black out the screen to save battery');
+    // XR only — the tracker cost lives on the phone, so this drives the
+    // phone's own switch and, like every control here, renders only what the
+    // client reports back.
+    const lm = toggle('Landmarks', 'landmarks', id,
+      'Landmark collection — off saves most of the phone\'s per-frame cost');
     const flip = button('Flip', 'Switch between the front and rear camera');
     const rec = button('New rec', 'Close the current recording and start the next');
     rec.onclick = () => onControl(id, 'record', true);
-    ctrls.append(res, mic, pose, paused, blank, flip, rec);
+    ctrls.append(res, mic, pose, paused, blank, lm, flip, rec);
 
     root.append(head, lines, ctrls);
-    clientsEl.append(root);
     return {
       root, name, rename, kind, lines, vcamBtn,
-      res, mic, pose, paused, blank, flip, rec,
+      res, mic, pose, paused, blank, lm, flip, rec,
       deviceName: null,
     };
   }
@@ -147,7 +172,14 @@ function createClientsPanel(el,
     if (info.paused) bits.push('PAUSED');
     if (info.blank) bits.push('screen blank');
     if (!info.pose) bits.push('tags off');
+    if (info.landmarks === false) bits.push('landmarks off');
     out.push(bits.join(' · '));
+    // Reconnaissance, XR only: which WebXR features the session granted.
+    // plane-detection or anchors turning up here is ARCore offering geometry
+    // the CV pipeline currently computes by hand.
+    if (info.kind === 'xr' && info.xrFeatures?.length) {
+      out.push(`xr: ${info.xrFeatures.join(' ')}`);
+    }
 
     if (info.lostMs !== null) {
       out.push(`NO ARCORE TRACK ${fmtAge(info.lostMs)} — tags only`);
@@ -198,19 +230,16 @@ function createClientsPanel(el,
     const fresh = info.poseAge !== null && info.poseAge < PANEL_POSE_STALE_MS;
     card.root.classList.toggle('gone', !info.live && !fresh);
 
-    const lines = statusLines(info);
     // Only the room line is coloured, and only while it is fresh: a stale
     // position reading in the same green as a live one is the one thing this
     // panel must not do.
-    card.lines.replaceChildren();
-    lines.forEach((text, i) => {
-      const div = document.createElement('div');
-      div.textContent = text;
-      if (i === 0 && (info.paused || info.blank)) div.className = 'warn';
-      if (text.startsWith('NO ARCORE TRACK')) div.className = 'bad';
-      if (text.startsWith('room ') && info.poseAge < PANEL_POSE_STALE_MS) div.className = 'room';
-      card.lines.append(div);
-    });
+    syncTextRows(card.lines, statusLines(info).map((text, i) => ({
+      text,
+      cls: i === 0 && (info.paused || info.blank) ? 'warn'
+        : text.startsWith('NO ARCORE TRACK') ? 'bad'
+          : text.startsWith('room ') && info.poseAge < PANEL_POSE_STALE_MS ? 'room'
+            : '',
+    })));
 
     // An XR client has no mic, no recorder and no resolution to pick, and its
     // tag detection is the entire point of the page — offering those controls
@@ -219,6 +248,10 @@ function createClientsPanel(el,
     for (const c of [card.res, card.mic, card.pose, card.paused, card.flip, card.rec]) {
       c.style.display = full ? '' : 'none';
     }
+    // The landmark switch is the XR page's; a client that never reported the
+    // state (old build, capture client) gets no button rather than a lying one.
+    card.lm.style.display = info.kind === 'xr' && info.landmarks !== null
+      && info.landmarks !== undefined ? '' : 'none';
     card.vcamBtn.style.display = full && info.vcamAvailable ? '' : 'none';
     card.vcamBtn.classList.toggle('on', !!info.vcam);
 
@@ -227,6 +260,7 @@ function createClientsPanel(el,
     card.pose.classList.toggle('on', !!info.pose);
     card.paused.classList.toggle('on', !!info.paused);
     card.blank.classList.toggle('on', !!info.blank);
+    card.lm.classList.toggle('on', !!info.landmarks);
     card.flip.textContent = info.facing === 'user' ? 'To rear' : 'To front';
     card.flip.onclick = () =>
       onControl(id, 'facing', info.facing === 'user' ? 'environment' : 'user');
@@ -239,16 +273,11 @@ function createClientsPanel(el,
   // measures. What a card answers instead is what the drawing cannot say: where
   // the tag sits, which way it faces, how well established it is, and whether
   // anyone is looking at it right now.
-  const tagCards = new Map();   // tag id -> { root, live, confirm }
+  const tagCards = new Map();   // tag id -> card, see buildTagCard
+  // The nesting the tree is drawn as, kept beside the cards: a card moving to a
+  // new parent is a re-parenting of the node it sits in, not a rebuild of it.
+  const tagNodes = new Map();   // tag id -> { node, plain, chained }
   let tagsFrom = null;
-  // Which tag's remove button is halfway through its two-click confirmation,
-  // held for the same reason the hover is: the cards are rebuilt whenever the
-  // marker map object is replaced, which is every time any tag is refined —
-  // several times a second while a client is streaming. The arming is about the
-  // tag, not the button that was torn out, so it is carried across; otherwise
-  // the second click can never land while a survey is running.
-  let armedTagId = null;
-  let armedTagConfirm = null;
   // Whether each tag's stored pose is still walking anywhere. `resid` alone
   // cannot answer that — it is one fix's disagreement, and the fixes are noisy,
   // so it never falls to the few millimetres that read as converged and every
@@ -257,11 +286,12 @@ function createClientsPanel(el,
   // where it was, held here because the map object is replaced wholesale on
   // every message and carries no history of itself.
   const settleHist = new Map();   // tag id -> { p, q, stillAtMs }
-  // Last hover the viewer told this panel about. Held because the cards are
-  // rebuilt whenever the marker map object is replaced — several times a minute
-  // while a survey is running — and a rebuild would otherwise drop the
-  // highlight off a card the pointer is still sitting on.
-  let hotTagId = null;
+  // Last hover the viewer told this panel about, as { kind, id } | null. Held
+  // rather than read back off the cards: what is hot is one entity across the
+  // whole dashboard, and a card arriving under a pointer that has not moved
+  // since must be drawn hot from the start.
+  let hot = null;
+  const isHot = (kind, id) => !!hot && hot.kind === kind && hot.id === id;
   let agesPaintedAt = 0;
   const AGE_TICK_MS = 1000;
   const SETTLE_WINDOW_MS = 20000;
@@ -271,10 +301,8 @@ function createClientsPanel(el,
   // Which tag card is open, and the record the server sent for it. One at a
   // time: a tag's history is the thing being compared *against the room*, not
   // against the tag below it, and a drawer of open cards is a drawer nobody can
-  // find a tag in. Held out here for the same reason the hover and the arming
-  // are — the cards are rebuilt whenever a marker map arrives, several times a
-  // second while a survey is running, and the card that was open must still be
-  // open afterwards.
+  // find a tag in. Held out here rather than read off the DOM, for the same
+  // reason the hover is: it is the panel's state, not the map's.
   let openTagId = null;
   // { id, samples, events } as it last arrived. Kept whole rather than merged
   // into a running copy: the server sends the whole record every poll precisely
@@ -428,47 +456,85 @@ function createClientsPanel(el,
     return { roots, kids };
   }
 
+  // The wrapper a tag's card and its children's rails live in. One per tag for
+  // as long as the tag is in the map, so a tag that changes parent is moved
+  // rather than rebuilt — and the two `.tag-kids` rails under it are made on
+  // demand and simply detached when that group empties, since the stylesheet
+  // draws the rail off the container's own border.
+  function tagNode(id) {
+    let n = tagNodes.get(id);
+    if (!n) {
+      const node = document.createElement('div');
+      node.className = 'tag-node';
+      n = { node, plain: null, chained: null };
+      tagNodes.set(id, n);
+    }
+    return n;
+  }
+
   function buildTags(markerMap) {
-    // Rebuilt only when the map object changes — it is replaced wholesale by
+    // Repainted only when the map object changes — it is replaced wholesale by
     // every marker-map message and this panel repaints four times a second.
     if (tagsFrom === markerMap) return false;
     tagsFrom = markerMap;
     agesPaintedAt = Date.now();
-    const wasArmed = armedTagId;
-    armedTagConfirm?.disarm();
-    tagsEl.replaceChildren();
-    tagCards.clear();
-    const { roots, kids } = tagTree([...(markerMap?.markers || [])], markerMap?.anchorId);
-    // Depth-first, so a tag is emitted directly under its parent and the rails
-    // in the stylesheet are the nesting itself rather than a computed indent.
-    // Founding children first, then the refine-chained ones on their own rail —
-    // one group per kind of link, so the rail itself carries which it is. Both
-    // built through the same call, or the two rails drift apart the first time
-    // either is touched.
-    const emit = (tag, into) => {
-      const node = document.createElement('div');
-      node.className = 'tag-node';
-      node.append(buildTagCard(tag, markerMap));
-      const mine = kids.get(tag.id);
-      const group = (chained) => {
-        const list = mine.filter((k) => k.chained === chained);
-        if (!list.length) return;
-        const sub = document.createElement('div');
-        sub.className = chained ? 'tag-kids chained' : 'tag-kids';
-        for (const kid of list) emit(kid.tag, sub);
-        node.append(sub);
-      };
-      group(false);
-      group(true);
-      into.append(node);
-    };
-    for (const tag of roots) emit(tag, tagsEl);
-    if (wasArmed !== null) tagCards.get(wasArmed)?.confirm.arm();
-    // A removed tag that comes back is a re-survey, not a continuation, so its
-    // old stillness is not evidence about the new pose.
-    for (const id of settleHist.keys()) {
-      if (!tagCards.has(id)) settleHist.delete(id);
+    const markers = [...(markerMap?.markers || [])];
+    const { roots, kids } = tagTree(markers, markerMap?.anchorId);
+    const live = new Set(markers.map((t) => t.id));
+    for (const id of [...tagCards.keys()]) {
+      if (live.has(id)) continue;
+      tagNodes.get(id)?.node.remove();
+      tagNodes.delete(id);
+      tagCards.delete(id);
+      // A removed tag that comes back is a re-survey, not a continuation, so
+      // its old stillness is not evidence about the new pose.
+      settleHist.delete(id);
     }
+    for (const tag of markers) {
+      const isAnchor = tag.id === markerMap.anchorId;
+      const had = tagCards.get(tag.id);
+      // The one thing a card cannot be repainted across: the anchor's card is a
+      // different shape — no observation count, no facing, "origin" where the
+      // position column goes — because it is a datum rather than a measurement.
+      // Re-anchoring is a whole new room frame anyway.
+      if (had && had.isAnchor !== isAnchor) {
+        had.root.remove();
+        tagCards.delete(tag.id);
+      }
+      if (!tagCards.has(tag.id)) tagCards.set(tag.id, buildTagCard(tag.id, isAnchor));
+    }
+    // Depth-first, so a tag sits directly under its parent and the rails in the
+    // stylesheet are the nesting itself rather than a computed indent. Founding
+    // children first, then the refine-chained ones on their own rail — one
+    // group per kind of link, so the rail itself carries which it is. Both
+    // placed through the same call, or the two rails drift apart the first time
+    // either is touched.
+    const place = (tag) => {
+      const n = tagNode(tag.id);
+      const inner = [tagCards.get(tag.id).root];
+      for (const chained of [false, true]) {
+        const list = (kids.get(tag.id) || []).filter((k) => k.chained === chained);
+        const which = chained ? 'chained' : 'plain';
+        if (!list.length) {
+          n[which]?.remove();
+          continue;
+        }
+        if (!n[which]) {
+          const sub = document.createElement('div');
+          sub.className = chained ? 'tag-kids chained' : 'tag-kids';
+          n[which] = sub;
+        }
+        orderChildren(n[which], list.map((kid) => place(kid.tag)), true);
+        inner.push(n[which]);
+      }
+      orderChildren(n.node, inner, true);
+      return n.node;
+    };
+    // Placed before painted, not after: drawSpark sizes a chart from the
+    // canvas's own layout box, and a card painted while still detached draws
+    // its history at the fallback width until the next poll.
+    orderChildren(tagsEl, roots.map(place), true);
+    for (const tag of markers) paintTagCard(tagCards.get(tag.id), tag);
     // The open card's tag left the map — dropped for disagreeing, or forgotten
     // by hand. Nothing would ever close it otherwise, and the panel would go on
     // asking the server about a tag it no longer has.
@@ -476,10 +542,12 @@ function createClientsPanel(el,
     return true;
   }
 
+  // The region cards on screen, keyed the way every other list here is so
+  // setHovered can reach one. A note (the singleton tally, a candidate line)
+  // belongs to no region and carries `clientId: null`.
+  const groupCards = new Map();   // key -> { root, clientId, ... }
+
   // Landmark regions as cards, one per group, newest survey state each call.
-  // Rebuilt wholesale rather than diffed: there are a handful of them, they
-  // carry no state of their own (no arming, no hover, no rename) and the server
-  // sends the whole set every push.
   //
   // A singleton region is one qualified corner. It is real but it is not a
   // place, and a drawer full of them would bury the regions that are — so they
@@ -507,54 +575,67 @@ function createClientsPanel(el,
         });
       }
     }
-    if (!shown.length && !solo && !cand.length) {
-      groupsEl.replaceChildren();
-      return;
-    }
-    const out = shown.map(buildGroupCard);
+    const items = shown.map((g) => ({ k: `r${g.clientId}:${g.id}`, g }));
     if (solo) {
-      const note = document.createElement('div');
-      note.className = 'drawer-card';
-      note.style.background = 'rgba(255,255,255,0.03)';
-      note.style.opacity = '0.6';
-      note.textContent = `+${solo} single-anchor region${solo === 1 ? '' : 's'}`;
-      out.push(note);
+      items.push({
+        k: 'solo',
+        bg: 'rgba(255,255,255,0.03)',
+        text: `+${solo} single-anchor region${solo === 1 ? '' : 's'}`,
+      });
     }
     for (const c of cand) {
-      const note = document.createElement('div');
-      note.className = 'drawer-card';
-      // The candidate grey, not the client's colour: a card in the client's
-      // colour claims the client *has* these, and the whole point of the card is
-      // that it does not yet.
-      note.style.background = roomCandidateColorCss(CARD_TINT_ALPHA);
-      note.style.opacity = '0.6';
-      note.textContent = `${c.n} candidate${c.n === 1 ? '' : 's'}`
-        + ` · best arc ${Math.round(c.best)}/${ROOM_LANDMARK_ARC_DEG}°`;
-      out.push(note);
+      items.push({
+        k: `c${c.clientId}`,
+        // The candidate grey, not the client's colour: a card in the client's
+        // colour claims the client *has* these, and the whole point of the card
+        // is that it does not yet.
+        bg: roomCandidateColorCss(CARD_TINT_ALPHA),
+        text: `${c.n} candidate${c.n === 1 ? '' : 's'}`
+          + ` · best arc ${Math.round(c.best)}/${ROOM_LANDMARK_ARC_DEG}°`,
+      });
     }
-    groupsEl.replaceChildren(...out);
+    syncKeyed(groupsEl, items, {
+      key: (it) => it.k,
+      store: groupCards,
+      make: (it) => (it.g ? buildGroupCard(it.g.clientId, it.k, it.g.id) : buildGroupNote()),
+      paint: (card, it) => (it.g ? paintGroupCard(card, it.g) : paintGroupNote(card, it)),
+    });
   }
 
-  function buildGroupCard(g) {
+  function buildGroupNote() {
     const root = document.createElement('div');
     root.className = 'drawer-card';
-    const colour = roomClientColorCss(g.clientId);
+    root.style.opacity = '0.6';
+    return { root, clientId: null };
+  }
+
+  function paintGroupNote(card, it) {
+    card.root.style.background = it.bg;
+    if (card.root.textContent !== it.text) card.root.textContent = it.text;
+  }
+
+  function buildGroupCard(clientId, key, regionId) {
+    const root = document.createElement('div');
+    root.className = 'drawer-card';
+    // The card's own key, not its client's. A client has several regions, and
+    // keying the hover by the client made them one entity: pointing at any
+    // region card lit every other region that client owns.
+    //
+    // The client and the region ride along for the map, which draws points
+    // rather than cards and identifies them by that pair.
+    hoverable(root, 'region', key, { clientId, regionId });
     // Tinted rather than classed: the tint is the client's own colour, so it
     // cannot live in the stylesheet as a fixed value. Kept faint — this has to
     // read as "not a tag" at a glance without competing with the tags above it.
-    root.style.background = roomClientColorCss(g.clientId, CARD_TINT_ALPHA);
+    root.style.background = roomClientColorCss(clientId, CARD_TINT_ALPHA);
 
     const head = document.createElement('div');
     head.className = 'head';
     const name = document.createElement('span');
     name.className = 'name';
-    name.textContent = `Region ${g.id}`;
-    name.style.color = colour;
+    name.style.color = roomClientColorCss(clientId);
     const kind = document.createElement('span');
     kind.className = 'kind';
-    // Live against total is the honest state of it: an anchor the map remembers
-    // but nothing is currently looking at cannot contribute to a fix.
-    kind.textContent = `${g.live}/${g.n} anchors`;
     head.append(name, kind);
 
     // `lines` is the tag card's own body container, so these sit on the same
@@ -562,16 +643,24 @@ function createClientsPanel(el,
     const lines = document.createElement('div');
     lines.className = 'lines';
     const pos = document.createElement('div');
-    pos.textContent = `${g.p.map((v) => v.toFixed(2)).join(', ')} m`;
     const arc = document.createElement('div');
-    // The widest arc any member was seen through. It is the quality of the look
-    // this region got, and the reason one region qualifies where another does
-    // not — so it is the one measurement worth a line here.
-    arc.textContent = `client ${g.clientId} · seen through ${g.span}°`;
     lines.append(pos, arc);
 
     root.append(head, lines);
-    return root;
+    return { root, clientId, key, name, kind, pos, arc };
+  }
+
+  function paintGroupCard(card, g) {
+    card.root.classList.toggle('hot', isHot('region', card.key));
+    card.name.textContent = `Region ${g.id}`;
+    // Live against total is the honest state of it: a landmark the map remembers
+    // but nothing is currently looking at cannot contribute to a fix.
+    card.kind.textContent = `${g.live}/${g.n} landmarks`;
+    card.pos.textContent = `${g.p.map((v) => v.toFixed(2)).join(', ')} m`;
+    // The widest arc any member was seen through. It is the quality of the look
+    // this region got, and the reason one region qualifies where another does
+    // not — so it is the one measurement worth a line here.
+    card.arc.textContent = `client ${g.clientId} · seen through ${g.span}°`;
   }
 
   // --- What the tag has been doing ------------------------------------------
@@ -813,23 +902,31 @@ function createClientsPanel(el,
   // (colour alone must not be the only thing telling them apart), and the same
   // row is where the hover readout lands, so the card does not change height as
   // the pointer moves across it.
+  // One span per key rather than one per entry, so the swatches stay flat
+  // siblings of the labels — the gap before an entry is a `.sw:not(:first-child)`
+  // rule and wrapping each entry would take it away.
   function keyRow(el, entries) {
-    el.replaceChildren();
-    for (const [color, label] of entries) {
+    const items = [];
+    entries.forEach(([color, label], i) => {
       // A colourless entry is the hover readout's timestamp: it belongs to no
       // series and must not be given a swatch that implies one.
-      if (color) {
-        const sw = document.createElement('span');
-        sw.className = 'sw';
-        sw.style.background = color;
-        el.append(sw);
-      }
-      const txt = document.createElement('span');
-      // Text in the card's own ink, never the series colour: the swatch beside
-      // it carries the identity.
-      txt.textContent = label;
-      el.append(txt);
-    }
+      if (color) items.push({ k: `sw${i}`, color });
+      items.push({ k: `tx${i}`, label });
+    });
+    syncKeyed(el, items, {
+      key: (it) => it.k,
+      make: (it) => {
+        const span = document.createElement('span');
+        if (it.color !== undefined) span.className = 'sw';
+        return span;
+      },
+      paint: (span, it) => {
+        if (it.color !== undefined) span.style.background = it.color;
+        // Text in the card's own ink, never the series colour: the swatch beside
+        // it carries the identity.
+        else if (span.textContent !== it.label) span.textContent = it.label;
+      },
+    });
   }
 
   // The two charts a tag card carries. Millimetres and degrees are two charts
@@ -944,7 +1041,7 @@ function createClientsPanel(el,
     // told apart from a tag with no history.
     if (!tagHist || tagHist.id !== card.tag.id) {
       els.root.classList.add('empty');
-      els.sum.replaceChildren(textLines('reading the record…'));
+      syncTextRows(els.sum, [{ text: 'reading the record…' }]);
       return;
     }
     const hist = tagHist;
@@ -965,14 +1062,14 @@ function createClientsPanel(el,
           + 'has not been refined since the record began');
       const ev = histEventLine(hist);
       if (ev) lines.push(ev);
-      els.sum.replaceChildren(...lines.map(textLines));
+      syncTextRows(els.sum, lines.map((text) => ({ text })));
       return;
     }
     els.root.classList.remove('empty');
     lines.push(...histSummary(hist, ser));
     const ev = histEventLine(hist);
     if (ev) lines.push(ev);
-    els.sum.replaceChildren(...lines.map(textLines));
+    syncTextRows(els.sum, lines.map((text) => ({ text })));
 
     const t0 = hist.samples[0][S_T];
     // The right edge is now, not the last sample: a tag nobody has looked at for
@@ -987,12 +1084,6 @@ function createClientsPanel(el,
       chart.t1 = t1;
       drawChart(chart);
     });
-  }
-
-  function textLines(text) {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div;
   }
 
   // Opening a card is what asks the server for its history, and closing one is
@@ -1020,7 +1111,23 @@ function createClientsPanel(el,
     onTagHistory(openTagId);
   }
 
-  function buildTagCard(tag, markerMap) {
+  // A metre figure with its sign always written. The position column is
+  // monospace and pushed to the card's right edge, so it is read *down* the
+  // drawer — and an unsigned positive is one character narrower than a negative,
+  // which shifts every ordinate on that card out of the column its neighbours
+  // sit in. The sign is taken from the rendered digits rather than the raw
+  // value: -0.001 prints as -0.00, and a + on it would claim a side of zero the
+  // number on screen does not show.
+  function fmtSignedM(v) {
+    const s = v.toFixed(2);
+    return s.startsWith('-') ? s : `+${s}`;
+  }
+
+  // Everything about a tag card that never changes while the tag is in the map.
+  // Built once and then only painted: it owns two canvases, a two-click
+  // confirmation and whatever the pointer is currently doing to it, none of
+  // which a marker-map message knows anything about.
+  function buildTagCard(id, isAnchor) {
     const root = document.createElement('div');
     // `tag` as well: a client card carries the remote control and must stay
     // open, so only these collapse.
@@ -1034,117 +1141,49 @@ function createClientsPanel(el,
     dot.className = 'dot';
     const name = document.createElement('span');
     name.className = 'name';
-    name.textContent = `Tag ${tag.id}`;
-    const isAnchor = tag.id === markerMap.anchorId;
+    name.textContent = `Tag ${id}`;
     // nObs because a tag promoted on 8 estimates and one settled over 226 are
     // not the same claim, and that gap is usually what a position that looks
     // wrong turns out to be. The anchor has none — it is the datum, not a
     // measurement, and it is the one tag whose being wrong is undetectable.
-    if (!isAnchor) {
-      const kind = document.createElement('span');
-      kind.className = 'kind';
-      kind.textContent = `${tag.nObs} obs`;
-      head.append(dot, name, kind);
-    } else {
-      head.append(dot, name);
-    }
+    const kind = document.createElement('span');
+    kind.className = 'kind';
+    if (!isAnchor) head.append(dot, name, kind);
+    else head.append(dot, name);
 
     // The right edge is the position column, read down the drawer rather than
     // within one card — so what stands in place of the anchor's position goes
     // there too, and the column answers "where is this tag" on every card.
     const at = document.createElement('span');
     at.className = 'at';
+    const axes = [];
     if (isAnchor) {
       at.textContent = 'origin';
     } else {
       // Each ordinate in its own axis colour, the same three the 3D helper and
       // the 2D crosses use. Three bare numbers give no clue which is the
-      // height, and height is the one that exposes a tilted room frame.
-      tag.p.forEach((v, k) => {
+      // height, and height is the one that exposes a tilted room frame. The
+      // separators are their own text nodes: a comma inside the span would take
+      // that ordinate's colour and read as part of the number.
+      for (let k = 0; k < 3; k++) {
         const span = document.createElement('span');
         span.style.color = roomAxisColorCss(k);
-        span.textContent = v.toFixed(2);
-        at.append(span, k < 2 ? ', ' : '');
-      });
+        axes.push(span);
+        at.append(span);
+        if (k < 2) at.append(', ');
+      }
     }
     head.append(at);
 
     const lines = document.createElement('div');
     lines.className = 'lines';
+    // The settle block is several rows and their number changes with the state,
+    // so it owns a container of its own inside the lines.
     const settle = document.createElement('div');
-    if (!isAnchor) {
-      // Which way the tag faces, in the same yaw/pitch convention the client
-      // rows use. A tag mounted a few degrees off is invisible in its position
-      // but is exactly what a mirror-flipped sighting leaves behind.
-      const n = quatRotate(tag.q, [0, 0, 1]);
-      const yaw = Math.atan2(n[0], n[2]) * 180 / Math.PI;
-      const pitch = Math.asin(Math.max(-1, Math.min(1, n[1]))) * 180 / Math.PI;
-      const facing = [
-        kvRow('yaw', `${Math.round(yaw)}°`),
-        kvRow('pitch', `${Math.round(pitch)}°`),
-      ];
-      // What placed this tag and how far that is from the datum. The tree says
-      // the depth already, but not *which* parents did the placing nor how well
-      // checked the result is, and the deepest-chained tag is usually the one
-      // that looks wrong. Parents are ordered by how much of the placing each
-      // did — the first is the one the tree hangs this card off.
-      const via = [];
-      // How many checks this tag has survived: promoting estimates measured
-      // against a two-known-tag fix, plus every refinement since — each one
-      // compared the stored pose against a fix from *other* tags and could
-      // have disagreed. Zero means genuinely unfalsified: placed and then
-      // never once seen beside another known tag. Printed whatever the founding
-      // was, because the tag it matters most for is the one with no founding
-      // chain to print it beside — that branch used to omit it, so a tag being
-      // cross-checked ten times a second still read as the weakest thing in the
-      // map.
-      const checked = kvRow('checked', tag.verified === null || tag.verified === undefined
-        ? 'unrecorded'
-        : `${tag.verified} times`);
-      const depth = (h) => kvRow('depth', h === null || h === undefined
-        ? 'unrecorded'
-        : `${h} hop${h === 1 ? '' : 's'} out`);
-      if (tag.from?.length) {
-        via.push(kvRow('via', tag.from.join(', ')), depth(tag.hops));
-      } else if (tag.from && tag.chainFrom?.length) {
-        // Founded with no tag in view, but chained since: the founding fact is
-        // permanent and stays first, and what has happened since follows it. A
-        // tag that has been corrected against the map for an hour is not the
-        // same thing as one that entered on ARCore this minute, and the card
-        // said they were identical.
-        via.push(
-          kvRow('placed', 'off ARCore alone'),
-          kvRow('chained', tag.chainFrom.join(', ')),
-          depth(tag.chainHops),
-        );
-      } else {
-        // No tag in view when it was placed and none has checked it since — the
-        // fix was ARCore carrying the pose, which is the weakest way into the map.
-        via.push(kvRow('placed',
-          tag.from ? 'off ARCore alone' : 'before this was recorded'));
-      }
-      // Unchecked is the thing worth colouring, not unchained: a tag founded off
-      // ARCore and cross-checked four hundred times since is no longer the
-      // suspect entry on the card.
-      if (!tag.verified) checked.className = 'warn';
-      paintSettle(settle, dot, tag);
-      // Asserted geometry, shown as such. This is the one number on the card
-      // that was not measured, so it says which tag it was snapped to and how
-      // far it was moved — a silent correction is indistinguishable from a
-      // survey that happened to come out clean.
-      const clip = [];
-      if (tag.clippedTo !== null && tag.clippedTo !== undefined) {
-        clip.push(kvRow('clipped', `${tag.clippedMm ?? 0} mm / `
-          + `${(tag.clippedDeg ?? 0).toFixed(1)}° onto tag ${tag.clippedTo}'s plane`));
-      }
-      lines.append(...facing, ...via, checked, settle, ...clip);
-    }
     // Carries its label from the start: the anchor's card is this row and
     // nothing else, and a row with no label in it would decide that card's
     // colon column until the first live paint arrived.
     const live = kvRow('in view', 'no');
-    lines.append(live);
-    layoutKv(lines);
     if (isAnchor) {
       // The datum has nothing to be settled about — it is where it is by
       // definition — so its dot says "not a measurement" rather than "fine".
@@ -1162,9 +1201,9 @@ function createClientsPanel(el,
     rm.type = 'button';
     rm.className = 'icon-btn mini rm danger';
     rm.title = isAnchor
-      ? `Forget tag ${tag.id} — it is the anchor, so the whole survey resets`
-      : `Forget tag ${tag.id}`;
-    rm.setAttribute('aria-label', `Forget tag ${tag.id}`);
+      ? `Forget tag ${id} — it is the anchor, so the whole survey resets`
+      : `Forget tag ${id}`;
+    rm.setAttribute('aria-label', `Forget tag ${id}`);
     // A bin, not a cross: a cross on a card is the gesture for closing it, and
     // this one throws the tag out of the survey. No ribs on the body — at the
     // 12px this glyph is drawn at they close up into a smudge and cost the
@@ -1173,23 +1212,17 @@ function createClientsPanel(el,
       + ' stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
       + '<path d="M4 7h16"/><path d="M9.5 4h5"/>'
       + '<path d="M6.5 7l.9 12.1A2 2 0 0 0 9.4 21h5.2a2 2 0 0 0 2-1.9L17.5 7"/></svg>';
-    const confirm = confirmButton(rm, () => onTagRemove?.(tag.id), {
+    // The arming lives in the button, which now outlives every map message —
+    // it used to have to be carried across the rebuild by the panel, or the
+    // second click could never land while a survey was running.
+    const confirm = confirmButton(rm, () => onTagRemove?.(id), {
       armedTitle: isAnchor
         ? 'Click again to forget the anchor — the whole survey resets'
-        : `Click again to forget tag ${tag.id}`,
-      onArmed: (on) => {
-        armedTagId = on ? tag.id : null;
-        armedTagConfirm = on ? confirm : null;
-      },
+        : `Click again to forget tag ${id}`,
     });
     head.append(rm);
 
-    // Pointing at a tag here points at it in the room views, and vice versa.
-    // Reported, never applied: which tag is hot is the viewer's to decide, or
-    // the card and the map would each hold their own answer and disagree the
-    // moment the pointer moved between them.
-    root.onpointerenter = () => onTagHover?.(tag.id);
-    root.onpointerleave = () => onTagHover?.(null);
+    hoverable(root, 'tag', id);
 
     // Left click anywhere on the card opens it, and opening one closes whatever
     // was open. Not on the buttons inside it: the remove button is a two-click
@@ -1200,35 +1233,147 @@ function createClientsPanel(el,
     // not shut the thing being read.
     root.onclick = (ev) => {
       if (ev.button !== 0 || ev.target.closest('button, canvas')) return;
-      setOpenTag(openTagId === tag.id ? null : tag.id);
+      setOpenTag(openTagId === id ? null : id);
     };
 
     root.append(head, lines, histEls.root);
-    root.classList.toggle('hot', tag.id === hotTagId);
-    root.classList.toggle('open', tag.id === openTagId);
-    // The tag itself is kept so the settle line can be repainted without a
-    // rebuild: it carries an age, and the map object it came from is the only
-    // thing that triggers one.
-    const card = { root, live, confirm, settle, dot, tag, isAnchor, histEls };
-    tagCards.set(tag.id, card);
-    // A rebuild throws away the canvases the history was drawn on, so the open
-    // card redraws itself from the record already in hand rather than waiting
-    // for the next poll — otherwise the charts blink out several times a second
-    // while a survey is running, which is exactly when they are being read.
-    if (tag.id === openTagId) paintHistory(card);
-    return root;
+    // `tag` is the newest map entry for it, kept so the settle line can be
+    // repainted without one: it carries an age, and no marker-map message comes
+    // back to a tag that has stopped being refined.
+    return { root, live, confirm, settle, dot, kind, axes, lines, tag: null, isAnchor, histEls };
   }
 
-  // The settle block is several rows and their number changes with the state, so
-  // it owns a container of its own inside the lines — the rows are plain divs
-  // aligned by their own padding, so nesting them costs nothing.
+  // Which rows a card carries changes as the tag's standing does — a tag going
+  // disputed grows a `last check`, one that gets chained grows two more — so the
+  // body is reconciled by label rather than rebuilt. The two containers that are
+  // painted from elsewhere (the settle block, the in-view line) take part in the
+  // ordering as themselves.
+  function tagCardRows(card, tag) {
+    const rows = [];
+    if (!card.isAnchor) {
+      // Which way the tag faces, in the same yaw/pitch convention the client
+      // rows use. A tag mounted a few degrees off is invisible in its position
+      // but is exactly what a mirror-flipped sighting leaves behind.
+      const n = quatRotate(tag.q, [0, 0, 1]);
+      const yaw = Math.atan2(n[0], n[2]) * 180 / Math.PI;
+      const pitch = Math.asin(Math.max(-1, Math.min(1, n[1]))) * 180 / Math.PI;
+      rows.push({ k: 'yaw', label: 'yaw', value: `${Math.round(yaw)}°` });
+      rows.push({ k: 'pitch', label: 'pitch', value: `${Math.round(pitch)}°` });
+      // What placed this tag and how far that is from the datum. The tree says
+      // the depth already, but not *which* parents did the placing nor how well
+      // checked the result is, and the deepest-chained tag is usually the one
+      // that looks wrong. Parents are ordered by how much of the placing each
+      // did — the first is the one the tree hangs this card off.
+      const depth = (h) => ({
+        k: 'depth',
+        label: 'depth',
+        value: h === null || h === undefined ? 'unrecorded' : `${h} hop${h === 1 ? '' : 's'} out`,
+      });
+      if (tag.from?.length) {
+        rows.push({ k: 'via', label: 'via', value: tag.from.join(', ') }, depth(tag.hops));
+      } else if (tag.from && tag.chainFrom?.length) {
+        // Founded with no tag in view, but chained since: the founding fact is
+        // permanent and stays first, and what has happened since follows it. A
+        // tag that has been corrected against the map for an hour is not the
+        // same thing as one that entered on ARCore this minute, and the card
+        // said they were identical.
+        rows.push(
+          { k: 'placed', label: 'placed', value: 'off ARCore alone' },
+          { k: 'chained', label: 'chained', value: tag.chainFrom.join(', ') },
+          depth(tag.chainHops),
+        );
+      } else {
+        // No tag in view when it was placed and none has checked it since — the
+        // fix was ARCore carrying the pose, which is the weakest way into the map.
+        rows.push({
+          k: 'placed',
+          label: 'placed',
+          value: tag.from ? 'off ARCore alone' : 'before this was recorded',
+        });
+      }
+      // How many checks this tag has survived: promoting estimates measured
+      // against a two-known-tag fix, plus every refinement since — each one
+      // compared the stored pose against a fix from *other* tags and could
+      // have disagreed. Zero means genuinely unfalsified: placed and then
+      // never once seen beside another known tag. Printed whatever the founding
+      // was, because the tag it matters most for is the one with no founding
+      // chain to print it beside — that branch used to omit it, so a tag being
+      // cross-checked ten times a second still read as the weakest thing in the
+      // map.
+      //
+      // Unchecked is the thing worth colouring, not unchained: a tag founded off
+      // ARCore and cross-checked four hundred times since is no longer the
+      // suspect entry on the card.
+      rows.push({
+        k: 'checked',
+        label: 'checked',
+        value: tag.verified === null || tag.verified === undefined
+          ? 'unrecorded'
+          : `${tag.verified} times`,
+        cls: tag.verified ? '' : 'warn',
+      });
+      rows.push({ k: 'settle', el: card.settle });
+      // Asserted geometry, shown as such. This is the one number on the card
+      // that was not measured, so it says which tag it was snapped to and how
+      // far it was moved — a silent correction is indistinguishable from a
+      // survey that happened to come out clean.
+      if (tag.clippedTo !== null && tag.clippedTo !== undefined) {
+        rows.push({
+          k: 'clipped',
+          label: 'clipped',
+          value: `${tag.clippedMm ?? 0} mm / `
+            + `${(tag.clippedDeg ?? 0).toFixed(1)}° onto tag ${tag.clippedTo}'s plane`,
+        });
+      }
+    }
+    rows.push({ k: 'live', el: card.live });
+    return rows;
+  }
+
+  function paintTagCard(card, tag) {
+    card.tag = tag;
+    if (!card.isAnchor) {
+      card.kind.textContent = `${tag.nObs} obs`;
+      tag.p.forEach((v, k) => { card.axes[k].textContent = fmtSignedM(v); });
+    }
+    syncKeyed(card.lines, tagCardRows(card, tag), {
+      key: (r) => r.k,
+      make: (r) => r.el || document.createElement('div'),
+      paint: (el, r) => {
+        // A row painted from elsewhere carries its own value; this call only
+        // decides where in the block it sits.
+        if (r.el) return;
+        el.dataset.kvLabel = r.label;
+        el.dataset.kvValue = r.value;
+        el.className = r.cls || '';
+      },
+    });
+    if (!card.isAnchor) paintSettle(card.settle, card.dot, tag);
+    // Re-padded as a whole: the colon column is the longest label on the card
+    // and the set of rows just changed.
+    layoutKv(card.lines);
+    card.root.classList.toggle('hot', isHot('tag', tag.id));
+    card.root.classList.toggle('open', tag.id === openTagId);
+    // The record already in hand rather than the next poll: the charts are
+    // drawn against *now* as their right edge, and a map message is as good a
+    // moment as any to move it on.
+    if (tag.id === openTagId) paintHistory(card);
+  }
+
+  // The rows are plain divs aligned by their own padding, so nesting them in a
+  // container of their own costs nothing. Keyed by label: the state's own rows
+  // change with it, and the ones both states carry are the same rows.
   function paintSettle(el, dot, tag) {
     const { rows, warn } = settleRows(tag);
-    el.replaceChildren(...rows.map(([label, value]) => {
-      const div = kvRow(label, value);
-      if (warn) div.className = 'warn';
-      return div;
-    }));
+    syncKeyed(el, rows, {
+      key: ([label]) => label,
+      make: () => document.createElement('div'),
+      paint: (div, [label, value]) => {
+        div.dataset.kvLabel = label;
+        div.dataset.kvValue = value;
+        div.className = warn ? 'warn' : '';
+      },
+    });
     // The state's own rows change with it — a tag going disputed grows a
     // `last check` — so the card is re-padded as a whole, not just here.
     layoutKv(el);
@@ -1303,30 +1448,31 @@ function createClientsPanel(el,
       el.classList.toggle('active', on);
     },
 
-    // Told from outside, like the room views: one tag is hot across the whole
-    // dashboard, and this only draws it.
-    setHoveredTag(id) {
-      hotTagId = id;
-      for (const [tagId, card] of tagCards) card.root.classList.toggle('hot', tagId === id);
+    // Told from outside, like the room views: one entity is hot across the
+    // whole dashboard, and this only draws it — on whichever card family the
+    // entity belongs to.
+    setHovered(h) {
+      hot = h;
+      for (const [tagId, card] of tagCards) {
+        card.root.classList.toggle('hot', isHot('tag', tagId));
+      }
+      for (const [id, card] of cards) {
+        card.root.classList.toggle('hot', isHot('client', id));
+      }
+      for (const card of groupCards.values()) {
+        if (card.clientId === null) continue;
+        card.root.classList.toggle('hot', isHot('region', card.key));
+      }
     },
     update(list, markerMap = null, landmarks = []) {
       buildGroups(landmarks);
       emptyEl.style.display = list.length ? 'none' : '';
-      const seen = new Set();
-      for (const info of list) {
-        seen.add(info.id);
-        let card = cards.get(info.id);
-        if (!card) {
-          card = buildCard(info.id);
-          cards.set(info.id, card);
-        }
-        paint(card, info);
-      }
-      for (const [id, card] of cards) {
-        if (seen.has(id)) continue;
-        card.root.remove();
-        cards.delete(id);
-      }
+      syncKeyed(clientsEl, list, {
+        key: (info) => info.id,
+        store: cards,
+        make: (info) => buildCard(info.id),
+        paint,
+      });
       const rebuilt = buildTags(markerMap);
       // Ages tick on this panel's own cadence rather than a timer of their own,
       // so nothing is repainted behind a closed drawer. A second is as fine as

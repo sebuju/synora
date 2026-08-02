@@ -1011,6 +1011,107 @@ body.paused #pauseOverlay {
   font-size: 12px;
 }
 
+/* The card title is not an edit affordance here — .name carries the client
+   card's rename cue, and this one renames nothing. */
+.drawer-card.settings .name {
+  cursor: default;
+}
+
+.drawer-card.settings .name:hover {
+  text-decoration: none;
+}
+
+/* Server settings: one row per setting, label left, controls right. A grid
+   rather than per-row flex, and the three control columns are *fixed* rather
+   than auto — the column of values is what is scanned down the card, and an
+   `auto` column is only as wide as the row it is in, so a toggle and a number
+   field ended up at different distances from the edge. Fixed widths put every
+   value box, every unit and every button in one column each, whatever the row
+   holds. The label takes what is left. */
+.drawer-card.settings .setting {
+  display: grid;
+  grid-template-columns: 1fr 68px 20px auto;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 0;
+}
+
+.drawer-card.settings .setting .label {
+  font-size: 12px;
+  color: #bbb;
+}
+
+.drawer-card.settings .setting .unit {
+  font-size: 11px;
+  color: #888;
+}
+
+/* A bool row has no unit and nothing to apply, so its toggle takes the whole
+   control side and sits hard against the right edge, lining up with the Set
+   buttons of the rows that do — the right edge is the one the eye follows down
+   the card. */
+.drawer-card.settings .setting .toggle {
+  grid-column: 2 / -1;
+  justify-self: end;
+  min-width: 34px;
+}
+
+/* The shared dot leaves room for the wording it normally sits beside; there is
+   none here, so the gap would push it off centre. */
+.drawer-card.settings .setting .toggle::before {
+  margin-right: 0;
+  vertical-align: 0;
+}
+
+.drawer-card.settings .setting input {
+  width: 100%;
+  padding: 3px 6px;
+  color: #eee;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  text-align: right;
+  background: #2d2d2d;
+  border: 1px solid #444;
+  border-radius: 4px;
+}
+
+/* Every button in the card is one height, whatever it holds. Left to their
+   content they are not: a Set button is sized by a line of 12 px text, a toggle
+   by an 8 px dot, and the two came out several pixels apart in a column that is
+   read straight down. The height is stated and the content centred in it, so
+   what a button contains stops deciding how tall it is. */
+.drawer-card.settings .setting button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 24px;
+  padding: 0 7px;
+  font-size: 12px;
+}
+
+/* The room's only metric datum, in the header. Monospace and boxed like the
+   client's own id label: it is a measured number, not a caption, and it is read
+   against a printed tag someone is holding. */
+#tagSizeLabel {
+  flex-shrink: 0;
+  color: #eee;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  padding: 3px 8px;
+  cursor: pointer;
+  background: #2d2d2d;
+  border: 1px solid #444;
+  border-radius: 6px;
+}
+
+#tagSizeLabel:hover {
+  border-color: #666;
+}
+
+#tagSizeLabel:empty {
+  display: none;
+}
+
 /* The survey chain, drawn as the nesting itself: a tag's card sits inside its
    parent's node, so the rails are one left border per level and no depth is
    ever computed. What this shows that the card's own `n hops out` cannot is
