@@ -24,6 +24,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { parseArgs, readJournals } = require('./replay-common.js');
 const { createWalls, DEFAULTS } = require('./walls.js');
 
 function usage(err) {
@@ -39,23 +40,8 @@ function usage(err) {
   process.exit(1);
 }
 
-const journals = [];
-const flags = {};
-const argv = process.argv.slice(2);
-for (let i = 0; i < argv.length; i++) {
-  const a = argv[i];
-  if (a.startsWith('--')) {
-    const key = a.slice(2);
-    if (key === 'ascii') {
-      flags.ascii = true;
-    } else {
-      if (i + 1 >= argv.length) usage(`missing value for --${key}`);
-      flags[key] = argv[++i];
-    }
-  } else {
-    journals.push(a);
-  }
-}
+const { positional: journals, flags } =
+  parseArgs(process.argv.slice(2), { booleans: ['ascii'], usage });
 if (!journals.length) usage();
 
 const markersFile = flags.markers || path.join(__dirname, 'markers.json');
@@ -112,31 +98,17 @@ const walls = createWalls({
 walls.setMarkerMap(markerMap);
 
 let lines = 0;
-for (const file of journals) {
-  let text;
-  try {
-    text = fs.readFileSync(file, 'utf8');
-  } catch (err) {
-    usage(`cannot read ${file}: ${err.message}`);
+// A journal recorded at another marker size is a grid in another metric scale;
+// mixing them silently would be a measurement of nothing.
+const onMeta = (entry, file) => {
+  if (entry.markerSizeM !== rawMap.markerSizeM) {
+    usage(`${path.basename(file)} was recorded with ${entry.markerSizeM} m markers, `
+      + `${path.basename(markersFile)} says ${rawMap.markerSizeM} m — refusing to mix scales`);
   }
-  for (const line of text.split('\n')) {
-    if (!line.trim()) continue;
-    let entry;
-    try {
-      entry = JSON.parse(line);
-    } catch {
-      continue;   // torn final line of a journal cut off mid-write
-    }
-    if (entry.kind === 'meta') {
-      if (entry.markerSizeM !== rawMap.markerSizeM) {
-        usage(`${path.basename(file)} was recorded with ${entry.markerSizeM} m markers, `
-          + `${path.basename(markersFile)} says ${rawMap.markerSizeM} m — refusing to mix scales`);
-      }
-      continue;
-    }
-    lines++;
-    walls.handleReport(entry);
-  }
+};
+for (const { entry } of readJournals(journals, { onMeta, onError: usage })) {
+  lines++;
+  walls.handleReport(entry);
 }
 
 const s = walls.stats();
