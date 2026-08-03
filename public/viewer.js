@@ -202,6 +202,13 @@ function updatePoseLabel(clientId, msg) {
   // Only the per-tile label below needs a tile to live on.
   const dev = devices.get(clientId);
   if (!dev) return;
+  const roll = Number(msg.room?.roll) || 0;
+  if (dev.appliedRoll !== roll) {
+    dev.appliedRoll = roll;
+    dev.wrap.classList.toggle('rot90', roll === 90);
+    dev.wrap.classList.toggle('rot180', roll === 180);
+    dev.wrap.classList.toggle('rot270', roll === 270);
+  }
   clearTimeout(dev.poseLabelTimer);
   if (tags.length) {
     const ids = tags.map((t) => t.id).join(',');
@@ -242,10 +249,13 @@ function ensureDevice(clientId) {
 
   const tile = document.createElement('div');
   tile.className = 'tile';
+  const wrap = document.createElement('div');
+  wrap.className = 'vwrap';
   const video = document.createElement('video');
   video.autoplay = true;
   video.playsInline = true;
   video.muted = !soundOn;
+  wrap.append(video);
   const label = document.createElement('div');
   label.className = 'label';
   label.textContent = tileLabel(clientId);
@@ -257,7 +267,7 @@ function ensureDevice(clientId) {
   };
   const poseLabel = document.createElement('div');
   poseLabel.className = 'pose-label';
-  tile.append(video, label, poseLabel, camBtn);
+  tile.append(wrap, label, poseLabel, camBtn);
   // Click a tile to enlarge it; click again to go back to the grid.
   tile.onclick = () => {
     const zoomed = tile.classList.contains('zoom');
@@ -267,10 +277,10 @@ function ensureDevice(clientId) {
   grid.append(tile);
 
   dev = {
-    pc: null, tile, video, label, camBtn, poseLabel,
+    pc: null, tile, wrap, video, label, camBtn, poseLabel,
     frames: [], lastFrame: null, latency: null, capturing: false,
     rtpMap: null, rtpSamples: [], clockUnc: null,
-    poseLabelTimer: null,
+    poseLabelTimer: null, appliedRoll: 0,
   };
   devices.set(clientId, dev);
   updateCamBtn(clientId, dev);
@@ -615,11 +625,23 @@ function drawCombined() {
       const source = frame ? frame.bitmap : d.video;
       const sw = frame ? frame.bitmap.width : d.video.videoWidth;
       const sh = frame ? frame.bitmap.height : d.video.videoHeight;
-      // Aspect-fit the feed inside its cell.
-      const scale = Math.min(cw / sw, ch / sh);
+      const roll = Number(poses.get(id)?.msg?.room?.roll) || 0;
+      const rotated = roll === 90 || roll === 270;
+      // Aspect-fit the feed inside its cell, against its post-rotation shape.
+      const scale = Math.min(cw / (rotated ? sh : sw), ch / (rotated ? sw : sh));
       const w = sw * scale;
       const h = sh * scale;
-      ctx.drawImage(source, cx + (cw - w) / 2, cy + (ch - h) / 2, w, h);
+      if (roll) {
+        ctx.save();
+        ctx.translate(cx + cw / 2, cy + ch / 2);
+        // Against the roll, not with it — the same inverse the tile's .vwrap
+        // applies, for the reason spelled out beside it in style.css.
+        ctx.rotate(-roll * Math.PI / 180);
+        ctx.drawImage(source, -w / 2, -h / 2, w, h);
+        ctx.restore();
+      } else {
+        ctx.drawImage(source, cx + (cw - w) / 2, cy + (ch - h) / 2, w, h);
+      }
       ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
       ctx.fillRect(cx + 12, cy + ch - 46, 110, 34);
       ctx.fillStyle = '#eee';

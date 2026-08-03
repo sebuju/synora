@@ -11,7 +11,7 @@ const { createSurvey } = require('./survey.js');
 const { createWalls } = require('./walls.js');
 const { createLandmarks, foundingDepth } = require('./landmarks.js');
 const { MIN_ARC_DEG: LANDMARK_MIN_ARC_DEG } = require('./public/landmark-math.js');
-const { segIntersect2D } = require('./public/pose-math.js');
+const { segIntersect2D, quatRotate, quatConj, snapQuarterTurn } = require('./public/pose-math.js');
 const { createDeviceRegistry, modelFromUa } = require('./devices.js');
 const { createSettings } = require('./settings.js');
 
@@ -498,6 +498,28 @@ function sendRoom(obj, opts) {
 // its tile labels read the camera-frame detail — but a client drawing the map
 // does not, and the tag corners and the ARCore matrix are nearly all of it, ten
 // times a second, on the same socket as that client's own pose traffic.
+// Screen roll: how far this client's video sits rotated from upright, read
+// off the room-frame pose already computed for it (never a device sensor).
+// Room-up (0,1,0) expressed in the camera's own frame (OpenCV: x-right,
+// y-down, z-forward) gives the roll the same way xr-client.js's
+// updateScreenRotation reads gravity off ARCore's view orientation for its
+// own on-device overlay — but that view frame is y-up where this camera
+// frame is y-down, so the screen-up reference flips from (0,1) to (0,-1) and
+// the atan2 argument order flips to match.
+//
+// It is a description of the feed, not an instruction to a renderer: a viewer
+// standing this picture back up turns *against* it, where the overlay standing
+// its own screen back up turns with it. See style.css's .vwrap.
+function updateScreenRoll(ws, pose) {
+  if (!pose?.q) return ws.screenRollDeg || 0;   // not localized: hold last value
+  const v = quatRotate(quatConj(pose.q), [0, 1, 0]);
+  // Camera pointed near straight up/down at a tag — roll is noise there.
+  if (Math.hypot(v[0], v[1]) < 0.35) return ws.screenRollDeg || 0;
+  const deg = Math.atan2(v[0], -v[1]) * 180 / Math.PI;
+  ws.screenRollDeg = snapQuarterTurn(deg, ws.screenRollDeg || 0);
+  return ws.screenRollDeg;
+}
+
 function roomPoseMessage(clientId, msg, room) {
   return {
     type: 'pose',
@@ -1440,6 +1462,7 @@ function handleSignal(ws, msg) {
       // the survey had nothing.
       const surveyPose = entry.room.pose;
       maintainLandmarks(ws, entry);
+      entry.room.roll = updateScreenRoll(ws, entry.room.pose);
       journalPose(ws, entry);
       // What is *shown* takes the eased pose; what is stored above did not.
       // Only when the survey's own alignment produced it: a landmark fix or a
@@ -1454,7 +1477,11 @@ function handleSignal(ws, msg) {
       // jitter rides back to the client: the measurement needs both the phone's
       // own pose and the room pose, and only this side has both.
       send(ws, {
-        type: 'room-pose', pose: shown.pose, quality: shown.quality, jitter,
+        // Which of the dots on the room map is this client. Its own number is
+        // this side's to hand out, and a client drawing the map has no other way
+        // to pick itself out of the poses it is being sent for everybody.
+        type: 'room-pose', clientId: ws.clientId,
+        pose: shown.pose, quality: shown.quality, jitter,
         landmarks: landmarksOn() ? landmarks.summary(ws.clientId) : null,
         // Where to walk next, for the phone's own map and overlay. Computed
         // here rather than on the client for the same reason every other
@@ -1482,13 +1509,15 @@ function handleSignal(ws, msg) {
         room: { pose, quality, mapSafe }, mapChanged,
       };
       maintainLandmarks(ws, entry);
+      entry.room.roll = updateScreenRoll(ws, entry.room.pose);
       journalPose(ws, entry);
       send(viewerSocket, { ...msg, clientId: ws.clientId, room: entry.room });
       sendWatchers(roomPoseMessage(ws.clientId, msg, entry.room));
       // The client cannot know its room pose on its own (the marker map lives
       // here) — reflect it back for the on-client stats overlay.
       send(ws, {
-        type: 'room-pose', pose: entry.room.pose, quality: entry.room.quality,
+        type: 'room-pose', clientId: ws.clientId,
+        pose: entry.room.pose, quality: entry.room.quality,
         landmarks: landmarksOn() ? landmarks.summary(ws.clientId) : null });
       if (mapChanged) {
         const map = survey.getMarkerMap();

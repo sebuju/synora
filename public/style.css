@@ -565,13 +565,51 @@ body.paused #pauseOverlay {
   overflow: hidden;
   min-height: 200px;
   cursor: pointer;
+  /* Lets .vwrap size itself in cq units for the 90/270 swap below. */
+  container-type: size;
 }
 
-.tile video {
+/* Wraps the <video> so a screen-roll correction can rotate it — swapping the
+   effective box at 90/270 so a portrait correction inside a landscape cell
+   (or the reverse) does not clip against .tile's overflow:hidden. Same idea
+   as xr-client.html's #overlayRot, sized against this tile's container
+   instead of the viewport.
+
+   The turn is the *opposite* of #overlayRot's, and the class names say the
+   roll rather than the turn for exactly that reason. `roll` is one quantity —
+   how far world-up sits clockwise of screen-up — but the two consumers need
+   opposite corrections from it. The overlay is glued to a screen that has
+   been rolled and turns its content *with* the roll to stand it back up; this
+   feed is a picture of a world that was already rolled by the camera, so it
+   turns *against* the roll to take that out. Copying the overlay's mapping
+   here lands 180 deg out at either quarter turn, and nowhere else — a half
+   turn is its own inverse, which is what hides the sign. */
+.tile .vwrap {
+  position: absolute;
+  inset: 0;
+}
+
+.tile .vwrap video {
   width: 100%;
   height: 100%;
   object-fit: contain;
 }
+
+.tile .vwrap.rot180 {
+  transform: rotate(180deg);
+}
+
+.tile .vwrap.rot90,
+.tile .vwrap.rot270 {
+  inset: auto;
+  left: 50%;
+  top: 50%;
+  width: 100cqh;
+  height: 100cqw;
+  transform-origin: 50% 50%;
+}
+.tile .vwrap.rot90 { transform: translate(-50%, -50%) rotate(-90deg); }
+.tile .vwrap.rot270 { transform: translate(-50%, -50%) rotate(90deg); }
 
 .tile .label {
   position: absolute;

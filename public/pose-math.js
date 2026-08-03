@@ -151,6 +151,17 @@ function quatAngleDeg(a, b) {
   return (2 * Math.acos(Math.min(1, dot))) * 180 / Math.PI;
 }
 
+// Snap a raw angle (degrees) to the nearest quarter turn, holding the
+// previous snapped value until the raw angle has moved past it by `flipDeg`
+// — so a value sitting near a 45/135/... boundary does not chatter between
+// two snaps. Pure trig, no quaternion knowledge: callers derive `deg` from
+// whatever up-vector convention their own frame uses.
+function snapQuarterTurn(deg, prevDeg, flipDeg = 55) {
+  const off = Math.abs(((deg - prevDeg + 540) % 360) - 180);
+  if (off < flipDeg) return prevDeg;
+  return ((Math.round(deg / 90) * 90) % 360 + 360) % 360;
+}
+
 // Weighted mean of quaternions that all sit near each other: sign-align to
 // the first (q and -q are the same rotation, and averaging across the sign
 // flip cancels instead of averaging), then normalized weighted sum. Not valid
@@ -546,7 +557,7 @@ function solvePose(objPts, imgPts, K, seed, { maxIter = 60 } = {}) {
 if (typeof module !== 'undefined') {
   module.exports = {
     quatFromRvec, rvecFromQuat, quatMul, quatConj, quatNormalize, quatRotate,
-    quatAngleDeg, quatMean, quatMedian, quatNudge, se3FromRvecTvec, se3Compose,
+    quatAngleDeg, snapQuarterTurn, quatMean, quatMedian, quatNudge, se3FromRvecTvec, se3Compose,
     se3Invert, se3Identity, transformPoint, segIntersect2D, quatFromTo, solvePose,
     matFromRvec, rvecFromMat, matMul3, mirrorRvecGuesses,
     tagPlaneAgreement, CLIP_PLANE_M, CLIP_PARALLEL_COS,
