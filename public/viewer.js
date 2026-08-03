@@ -131,6 +131,13 @@ const signaling = connectSignaling('viewer', {
       } catch {
         // Stale candidate from a previous connection — ignore.
       }
+    } else if (msg.type === 'stream-stopped') {
+      // The client is still here, it has just stopped sending video (the XR
+      // client's Stream switch). Only the tile goes: its roster entry, its dot
+      // and its pose are all still current, and a closed peer connection on its
+      // own would leave a tile frozen on the last frame it received — which
+      // looks exactly like a client that stopped moving.
+      removeDevice(msg.clientId);
     } else if (msg.type === 'client-gone') {
       trackingLost.delete(msg.clientId);
       poses.delete(msg.clientId);

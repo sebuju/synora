@@ -57,6 +57,13 @@ function createClientsPanel(el,
     return b;
   }
 
+  // Did this client say anything about the switch at all? Absent is "no such
+  // control on that page", which is not the same answer as off — and a button
+  // drawn off against a client that has never heard of it is a lie.
+  function reported(v) {
+    return v !== null && v !== undefined;
+  }
+
   function toggle(label, action, id, title) {
     const b = button(label, title);
     b.className = 'toggle';
@@ -143,15 +150,20 @@ function createClientsPanel(el,
     // client reports back.
     const lm = toggle('Landmarks', 'landmarks', id,
       'Landmark collection — off saves most of the phone\'s per-frame cost');
+    // XR only — that page's camera is a GL texture with no stream behind it, so
+    // sending video is work it does on purpose rather than something it is
+    // always doing. Off costs it nothing.
+    const stream = toggle('Stream', 'stream', id,
+      'Send video to the dashboard and record it here — costs the phone detection rate');
     const flip = button('Flip', 'Switch between the front and rear camera');
     const rec = button('New rec', 'Close the current recording and start the next');
     rec.onclick = () => onControl(id, 'record', true);
-    ctrls.append(res, mic, pose, paused, blank, lm, flip, rec);
+    ctrls.append(res, mic, pose, paused, blank, lm, stream, flip, rec);
 
     root.append(head, lines, ctrls);
     return {
       root, name, rename, kind, lines, vcamBtn,
-      res, mic, pose, paused, blank, lm, flip, rec,
+      res, mic, pose, paused, blank, lm, stream, flip, rec,
       deviceName: null,
     };
   }
@@ -202,7 +214,9 @@ function createClientsPanel(el,
       if (info.clockUnc !== null && info.clockUnc !== undefined) {
         link.push(`clock ±${Math.round(info.clockUnc)} ms`);
       }
-    } else if (info.kind !== 'xr') {
+    } else if (info.kind !== 'xr' || info.stream) {
+      // An XR client with the switch off is not missing anything; one that says
+      // it is streaming and has no feed here is.
       link.push('no video');
     }
     link.push(info.recording
@@ -241,17 +255,20 @@ function createClientsPanel(el,
             : '',
     })));
 
-    // An XR client has no mic, no recorder and no resolution to pick, and its
-    // tag detection is the entire point of the page — offering those controls
-    // would be offering buttons that do nothing.
+    // An XR client has no mic, no lens and no resolution to pick — ARCore
+    // chooses the camera image — and its tag detection is the entire point of
+    // the page, so pausing it would mean stopping the one thing it is for.
+    // Offering those controls would be offering buttons that do nothing.
     const full = info.kind !== 'xr';
-    for (const c of [card.res, card.mic, card.pose, card.paused, card.flip, card.rec]) {
+    for (const c of [card.res, card.mic, card.pose, card.paused, card.flip]) {
       c.style.display = full ? '' : 'none';
     }
-    // The landmark switch is the XR page's; a client that never reported the
-    // state (old build, capture client) gets no button rather than a lying one.
-    card.lm.style.display = info.kind === 'xr' && info.landmarks !== null
-      && info.landmarks !== undefined ? '' : 'none';
+    // The XR page's switches. A client that never reported the state (old
+    // build, capture client) gets no button rather than a lying one.
+    card.lm.style.display = reported(info.landmarks) ? '' : 'none';
+    card.stream.style.display = reported(info.stream) ? '' : 'none';
+    // A recording to cut exists on any client that is sending one.
+    card.rec.style.display = full || info.stream ? '' : 'none';
     card.vcamBtn.style.display = full && info.vcamAvailable ? '' : 'none';
     card.vcamBtn.classList.toggle('on', !!info.vcam);
 
@@ -261,6 +278,7 @@ function createClientsPanel(el,
     card.paused.classList.toggle('on', !!info.paused);
     card.blank.classList.toggle('on', !!info.blank);
     card.lm.classList.toggle('on', !!info.landmarks);
+    card.stream.classList.toggle('on', !!info.stream);
     card.flip.textContent = info.facing === 'user' ? 'To rear' : 'To front';
     card.flip.onclick = () =>
       onControl(id, 'facing', info.facing === 'user' ? 'environment' : 'user');

@@ -366,6 +366,10 @@ function serveStatic(req, res) {
 // client's id; viewer→client messages carry a clientId for routing. Binary
 // frames from a client = recording chunks for that client's current file.
 const clients = new Map();
+// The bulk (recorder-chunk) sockets per client id, held only so a client whose
+// main socket is displaced can have its bulk socket retired with it — the bytes
+// are attributed to whichever main socket owns the id at the time they arrive.
+const bulkSockets = new Map();
 // Client ids are stable per device: a client persists a random id across
 // reloads and presents it on every connection, so a refresh keeps its slot on
 // the dashboard (and its recording filenames) instead of taking a new number.
@@ -1116,7 +1120,18 @@ function handleSignal(ws, msg) {
       // A reload can land the new socket before the old one's close fires, so
       // retire whatever socket still holds the id — only one owns it.
       const prev = clients.get(ws.clientId);
-      if (prev && prev !== ws) prev.close();
+      if (prev && prev !== ws) {
+        prev.close();
+        // And the bulk socket that was feeding it. Binary is written to
+        // whichever main socket holds the id *now*, so a chunk still in flight
+        // from the page being displaced would land in the new page's file and
+        // interleave two WebM streams into one. Unreachable while only /client
+        // recorded — with the XR client recording too, one phone can have two
+        // recorders and the same deviceId. The surviving page reconnects its
+        // own bulk socket and its recording-start opens a fresh file, so no
+        // WebM header is lost.
+        for (const b of bulkSockets.get(ws.clientId) || []) b.close();
+      }
       clients.set(ws.clientId, ws);
       log(`Client ${ws.clientId} connected (${clients.size} total)`);
       sendClients();
@@ -1138,6 +1153,10 @@ function handleSignal(ws, msg) {
       ws.role = 'client-bulk';
       ws.clientId = clientIdFor(msg.deviceId);
       ws.deviceId = msg.deviceId;
+      // Held so a displaced main socket can take its bulk socket with it — see
+      // the retire step above.
+      if (!bulkSockets.has(ws.clientId)) bulkSockets.set(ws.clientId, new Set());
+      bulkSockets.get(ws.clientId).add(ws);
     } else if (msg.role === 'audio-lab') {
       ws.role = 'audio-lab';
       ws.deviceId = msg.deviceId;
@@ -1198,6 +1217,10 @@ function handleSignal(ws, msg) {
         // XR only: whether landmark collection is on (the client's own toggle
         // — the tracker cost lives on the phone, so the phone owns the switch).
         landmarks: msg.landmarks === undefined ? null : !!msg.landmarks,
+        // XR only: whether that page is sending video and recording it. Null is
+        // "this client never said", which is what hides the control — /client
+        // always streams and reports nothing here.
+        stream: msg.stream === undefined ? null : !!msg.stream,
         // WebXR features the session actually granted, as reconnaissance —
         // string-filtered and capped because this rides to the dashboard.
         xrFeatures: Array.isArray(msg.xrFeatures)
@@ -1552,6 +1575,10 @@ function main() {
         // longer say it has gone.
         sendRoom({ type: 'client-gone', clientId: ws.clientId });
         sendClients();
+      } else if (ws.role === 'client-bulk') {
+        const set = bulkSockets.get(ws.clientId);
+        set?.delete(ws);
+        if (set && !set.size) bulkSockets.delete(ws.clientId);
       } else if (ws === viewerSocket) {
         viewerSocket = null;
         log('Viewer disconnected');
