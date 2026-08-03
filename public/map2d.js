@@ -101,7 +101,12 @@ function createMap2dView(canvas, mode = 'top', {
   // The heading arrow's floor, in screen pixels: its 0.2 m world length
   // disappears at the zoom a whole room fits a phone screen at, and a heading
   // is a direction, so its drawn length may be floored without lying.
-  const HEADING_MIN_PX = 26;
+  const HEADING_MIN_PX = 20;
+  // How far behind the client its label is pinned on a heading-up map. Clear of
+  // the 6 px dot, and no further: the label belongs to that dot, and a gap wide
+  // enough to fit anything else between them is a gap wide enough to read it as
+  // belonging to whatever lands there.
+  const CLIENT_LABEL_PIN_PX = 14;
   // Smaller than anything else on the map that means something, on purpose.
   const LANDMARK_DOT_PX = 1.4;
   // A candidate is not a landmark: it is one track's current guess at where a
@@ -230,8 +235,25 @@ function createMap2dView(canvas, mode = 'top', {
   // also centred on would spin about a point that is nothing in particular
   // while the marker orbited it. One setter, so the two can never disagree
   // about which pose the view is built around.
+  //
+  // The centre outlives the turn, though: the near fit below follows the pose
+  // whether or not the map is turned to its heading, so a caller may set a
+  // follow point with no heading at all.
   let headingRad = null;   // null: north up, the room frame's own orientation
-  let headingPos = null;   // null: the fit's own bounds, centred on the room
+  let followPos = null;    // null: the fit's own bounds, centred on the room
+  // Reach only as far as the followed client's own business instead of holding
+  // the whole survey in view — see the fit below. The client has to be named
+  // for it: the fit is built from what *that* client can see, and the map has
+  // no way to work out which of its dots is the page it is being drawn on.
+  let nearFit = false;
+  let selfId = null;
+  // How far past the farthest thing worth keeping in view the near fit reaches,
+  // and the radius it never goes under. The margin keeps a tag off the very edge
+  // of the screen (a mark on the rim reads as one on its way out), and the floor
+  // is what a client with nothing in view gets — a room-sized view of where it
+  // is standing rather than a microscope on an empty patch of floor.
+  const NEAR_FIT_MARGIN = 1.25;
+  const NEAR_FIT_MIN_M = 3;
   let viewRot = 0;
   const HEADING_TAU_MS = 260;
   const FLOOR_FREE_CSS = 'rgba(127,184,164,0.16)';
@@ -597,8 +619,13 @@ function createMap2dView(canvas, mode = 'top', {
     // strokes of this same frame, in pixels.
     const labels = [];
     const obstacles = [];
-    const queueLabel = (key, text, x, y, color, bg, alpha = 1) =>
-      labels.push({ key, text, x, y, color, bg, alpha });
+    // `pin` is a fixed offset from the anchor for a label whose *place* is part
+    // of what it says — the client label sits opposite the heading arrow, so it
+    // may not be dodged somewhere else and then read as pointing the wrong way.
+    // A pinned label takes its spot before anything searches and is drawn last,
+    // over whatever it lands on.
+    const queueLabel = (key, text, x, y, color, bg, alpha = 1, pin = null) =>
+      labels.push({ key, text, x, y, color, bg, alpha, pin });
     // Nearest first, so a label sits as close to its mark as it can. The ring
     // reaches further than it used to because labels now block each other as
     // well as the strokes: a cluster of sight lines to one tag exhausted the
@@ -635,23 +662,56 @@ function createMap2dView(canvas, mode = 'top', {
         }
         return half;
       };
+      // The dodge runs in the same turned space as the geometry it is dodging;
+      // only the drawing is straightened, about the spot the label ended up at.
+      // Text that rode the rotation would be sideways or upside down exactly
+      // when the map is most in use.
+      const drawLabel = (lb, x, y) => {
+        if (labelRot) {
+          ctx.save();
+          ctx.translate(x, y);
+          ctx.rotate(labelRot);
+          ctx.translate(-x, -y);
+        }
+        if (lb.bg) {
+          const w2 = halfWidth(lb.text) + 4;
+          ctx.fillStyle = lb.bg;
+          ctx.fillRect(x - w2, y - 11, w2 * 2, 14);
+        }
+        ctx.fillStyle = lb.color;
+        ctx.fillText(lb.text, x, y);
+        if (labelRot) ctx.restore();
+      };
+      const boxFor = (lb, ox, oy) => ({
+        minX: lb.x + ox - halfWidth(lb.text) - LABEL_PAD,
+        minY: lb.y + oy - 11 - LABEL_PAD,
+        maxX: lb.x + ox + halfWidth(lb.text) + LABEL_PAD,
+        maxY: lb.y + oy + 3 + LABEL_PAD,
+      });
       // Solid labels claim their spot first and the fading ones dodge around
       // them, never the other way round. Below half opacity a label stops
       // reserving at all — a ghost about to disappear must not push a live
       // label aside for good, since a kept spot is only given up when blocked.
       const order = labels.slice().sort((a, b) => b.alpha - a.alpha);
+      // A pinned label cannot move, so it is the one thing every dodge has to
+      // route around: it reserves before the search starts rather than in turn.
+      for (const lb of order) {
+        if (lb.pin && lb.alpha > 0.5) taken.push(boxFor(lb, lb.pin[0], lb.pin[1]));
+      }
+      // Held back and drawn after the rest, so a pinned label lands on top of
+      // whatever could not get out of its way.
+      const pinned = [];
       for (const lb of order) {
         if (lb.alpha <= 0.01) continue;
+        if (lb.pin) {
+          pinned.push(lb);
+          continue;
+        }
         ctx.globalAlpha = lb.alpha;
         const half = halfWidth(lb.text);
         let x = lb.x;
         let y = lb.y;
-        const boxAt = (ox, oy) => ({
-          minX: lb.x + ox - half - LABEL_PAD,
-          minY: lb.y + oy - 11 - LABEL_PAD,
-          maxX: lb.x + ox + half + LABEL_PAD,
-          maxY: lb.y + oy + 3 + LABEL_PAD,
-        });
+        const boxAt = (ox, oy) => boxFor(lb, ox, oy);
         const clearAt = (ox, oy) => {
           const cx = lb.x + ox;
           const cy = lb.y + oy;
@@ -682,24 +742,11 @@ function createMap2dView(canvas, mode = 'top', {
         // blocked the label still lands somewhere and still covers that box,
         // so the next label has to route around it either way.
         if (lb.alpha > 0.5) taken.push(boxAt(x - lb.x, y - lb.y));
-        // The dodge above runs in the same turned space as the geometry it is
-        // dodging; only the drawing is straightened, about the spot the label
-        // ended up at. Text that rode the rotation would be sideways or upside
-        // down exactly when the map is most in use.
-        if (labelRot) {
-          ctx.save();
-          ctx.translate(x, y);
-          ctx.rotate(labelRot);
-          ctx.translate(-x, -y);
-        }
-        if (lb.bg) {
-          const w2 = half + 4;
-          ctx.fillStyle = lb.bg;
-          ctx.fillRect(x - w2, y - 11, w2 * 2, 14);
-        }
-        ctx.fillStyle = lb.color;
-        ctx.fillText(lb.text, x, y);
-        if (labelRot) ctx.restore();
+        drawLabel(lb, x, y);
+      }
+      for (const lb of pinned) {
+        ctx.globalAlpha = lb.alpha;
+        drawLabel(lb, lb.x + lb.pin[0], lb.y + lb.pin[1]);
       }
       ctx.globalAlpha = 1;
       // A label that stopped being queued has nothing to remember.
@@ -829,6 +876,16 @@ function createMap2dView(canvas, mode = 'top', {
     guideAlpha = animFade(guideAlpha, !!guide, dt);
     backdropAlpha = animFade(backdropAlpha, showBackdrop, dt);
     pairsAlpha = animFade(pairsAlpha, showPairs, dt);
+    // With the backdrop gone there is nothing behind the text but the camera
+    // passthrough — a moving, unpredictably bright picture, and a distance or a
+    // tag name laid straight on it is lost against exactly the busy patch it is
+    // describing. So every value carries its own plate, and only then: on the
+    // dark backdrop the same plates would be boxes drawn around text for no
+    // reason. Tied to the fading alpha rather than to the switch, so the plates
+    // arrive as the backdrop leaves instead of appearing after it.
+    const labelBg = backdropAlpha > 0.99
+      ? null
+      : `rgba(10,12,14,${(0.62 * (1 - backdropAlpha)).toFixed(3)})`;
     // Eased the short way round, or turning past the wrap point sends the whole
     // room the long way about.
     {
@@ -883,12 +940,39 @@ function createMap2dView(canvas, mode = 'top', {
     // farthest corner of what there is to see, so nothing surveyed slides off
     // the edge as it walks into a corner of the room. The floor is half the 5 m
     // span floor below, being a radius where that is a width.
-    const follow = mode === 'top' && headingRad !== null && headingPos
-      ? proj(headingPos) : null;
+    //
+    // The near fit keeps the centre and takes a different radius: only as far as
+    // what this client is dealing with right now, which is the tags it can see —
+    // the sight lines are drawn to them, and a line running off the edge of the
+    // screen points at nothing — and the place it has been told to walk to.
+    // Everything else in the room stays where it is and simply falls outside.
+    // It needs the client itself to do that, so until one is named *and* on the
+    // map the view stays out at the whole-room fit rather than closing in on a
+    // guess — a wrong guess here is a map zoomed hard into an empty patch of
+    // floor, which looks exactly like a map that has broken.
+    const follow = mode === 'top' && followPos
+      && (headingRad !== null || nearFit) ? proj(followPos) : null;
+    const self = nearFit && selfId !== null ? clients.get(selfId) : null;
     if (follow) {
       const [fa, fb] = follow;
-      const rad = Math.max(2.5, Math.hypot(
-        Math.max(fa - minA, maxA - fa), Math.max(fb - minB, maxB - fb)));
+      let rad;
+      if (self) {
+        rad = NEAR_FIT_MIN_M;
+        for (const id of self.seen || []) {
+          const m = markers.get(id);
+          if (!m || m.dead) continue;
+          const [ta, tb] = proj(m.pos);
+          rad = Math.max(rad, Math.hypot(ta - fa, tb - fb));
+        }
+        if (guide && guideAlpha > 0.01) {
+          const [ga, gb] = proj(guide.p);
+          rad = Math.max(rad, Math.hypot(ga - fa, gb - fb));
+        }
+        rad *= NEAR_FIT_MARGIN;
+      } else {
+        rad = Math.max(2.5, Math.hypot(
+          Math.max(fa - minA, maxA - fa), Math.max(fb - minB, maxB - fb)));
+      }
       lastFit = { ca: fa, cb: fb, scale: (Math.min(w, h) - 60) / 2 / rad };
     } else {
       // Rotating, the fit is taken against the shorter side for *both* spans: a
@@ -1062,7 +1146,7 @@ function createMap2dView(canvas, mode = 'top', {
       // the end rather than on the stroke or on top of the other one's.
       const lp = AXIS_GIZMO_PX + AXIS_GIZMO_LABEL_PX;
       queueLabel(`axis:${k}`, ROOM_AXIS_NAMES[k],
-        gx + ux * lp, gy + uy * lp + 4, roomAxisColorCss(k));
+        gx + ux * lp, gy + uy * lp + 4, roomAxisColorCss(k), labelBg);
     }
 
     // Wall segments. Top: the wall seen edge-on, a stroke from end to end.
@@ -1131,7 +1215,7 @@ function createMap2dView(canvas, mode = 'top', {
             }
             const [lx2, ly2] = toPx(mx + nx * 0.22 * sign, mz + nz * 0.22 * sign);
             queueLabel(`wall:${seg.key}`, `${len.toFixed(2)}`, lx2, ly2 + 4,
-              '#b9c6cb', null, wallsAlpha * seg.fade);
+              '#b9c6cb', labelBg, wallsAlpha * seg.fade);
           }
         }
       }
@@ -1192,7 +1276,7 @@ function createMap2dView(canvas, mode = 'top', {
         // Back through the scale rather than from the world points: the leg is
         // axis-aligned on screen, so its pixel length is its world length.
         queueLabel(`leg:${a.id}-${b.id}-${leg}`, (len / scale).toFixed(2),
-          (x1 + x2) / 2, (y1 + y2) / 2 - 3, legColor, null, legAlpha);
+          (x1 + x2) / 2, (y1 + y2) / 2 - 3, legColor, labelBg, legAlpha);
       });
     }
     ctx.globalAlpha = 1;
@@ -1428,7 +1512,7 @@ function createMap2dView(canvas, mode = 'top', {
         // "your position, give or take this much".
         if (rPx > 28) {
           queueLabel(`unc:${ph.id}`, `±${ph.shownRadius.toFixed(1)} m`,
-            ux, uy - rPx - 4, color, null, fade * ringAlpha * 0.8);
+            ux, uy - rPx - 4, color, labelBg, fade * ringAlpha * 0.8);
         }
       }
       if (ringAlpha < 0.99 && poseMix < 0.99) {
@@ -1465,7 +1549,7 @@ function createMap2dView(canvas, mode = 'top', {
             : 1;
           const ang = Math.acos(Math.min(1, Math.max(-1, Math.abs(cosA)))) * 180 / Math.PI;
           queueLabel(`sight:${ph.id}-${id}`, `${dist.toFixed(2)} m · ${Math.round(ang)}°`,
-            (sx + tx) / 2, (sy + ty) / 2 - 4, roomAngleColor(ang), null, lineAlpha);
+            (sx + tx) / 2, (sy + ty) / 2 - 4, roomAngleColor(ang), labelBg, lineAlpha);
         }
       }
 
@@ -1528,9 +1612,22 @@ function createMap2dView(canvas, mode = 'top', {
         ctx.globalAlpha = fade;
       }
       const [pa, pb] = proj(anchorP);
+      // Heading-up: the label goes behind the client, opposite the arrow, and
+      // stays there. On this map the arrow is the thing being read while
+      // walking, and a label free to dodge sat on it as often as not — worse,
+      // "behind me" is information, so a label that hops to the far side of the
+      // dot is saying something untrue about which way the phone is pointing.
+      // Pinned it also stops giving way to sight-line distances and tag names,
+      // which are the labels it was losing to and the least of what is on
+      // screen. North-up it dodges as before: there is no arrow to be opposite
+      // to, since the client's own heading is then just one more mark.
+      const hn = Math.hypot(dxh, dyh);
+      const pin = headingRad !== null && hn > 1e-6
+        ? [-dxh / hn * CLIENT_LABEL_PIN_PX, -dyh / hn * CLIENT_LABEL_PIN_PX + 4]
+        : null;
       queueLabel(`client:${ph.id}`,
         `C${ph.id} · ${pa.toFixed(2)}, ${pb.toFixed(2)}${dr > 0.5 ? ' · DR' : ''}`,
-        sx, sy - 12, color, null, fade);
+        sx, pin ? sy : sy - 12, color, labelBg, fade, pin);
       ctx.globalAlpha = 1;
     }
 
@@ -1898,13 +1995,16 @@ function createMap2dView(canvas, mode = 'top', {
     },
 
     // Turn the map so this room-frame direction points up the screen and centre
-    // it on this room-frame point, or null to leave it in the room's own
-    // orientation and bounds. Both given in the room frame rather than as an
-    // angle and a pair of screen coordinates, so the caller never has to know
-    // which two axes this projection keeps or which way its second one runs —
-    // that convention lives here and has exactly one definition.
+    // it on this room-frame point, or null for either to leave that half in the
+    // room's own orientation and bounds. Both given in the room frame rather
+    // than as an angle and a pair of screen coordinates, so the caller never has
+    // to know which two axes this projection keeps or which way its second one
+    // runs — that convention lives here and has exactly one definition.
+    //
+    // A centre with no direction is a view that follows the pose without turning
+    // with it, which is what the near fit wants when heading-up is off.
     setHeadingUp(fwd, pos = null) {
-      headingPos = pos;
+      followPos = pos;
       if (!fwd) {
         headingRad = null;
       } else {
@@ -1913,6 +2013,25 @@ function createMap2dView(canvas, mode = 'top', {
         // "which way must the map be turned so that is up".
         headingRad = Math.hypot(fa, fb) < 1e-6 ? headingRad : Math.atan2(-fa, -fb * orient);
       }
+      schedule();
+    },
+
+    // Zoom in on the followed client rather than holding the whole survey in
+    // view. Needs a follow point (setHeadingUp above) to have anything to close
+    // in on, and `setSelfClient` to know whose sight lines decide how far out it
+    // has to reach.
+    setNearFit(on) {
+      if (nearFit === !!on) return;
+      nearFit = !!on;
+      schedule();
+    },
+
+    // Which of the clients on this map is the page drawing it, or null on a view
+    // that is not any of them (the dashboard). Only the server can answer that —
+    // the id is its own numbering — so it is told rather than worked out here.
+    setSelfClient(id) {
+      if (selfId === id) return;
+      selfId = id;
       schedule();
     },
 
