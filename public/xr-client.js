@@ -21,6 +21,11 @@ const report = document.getElementById('report');
 const startBtn = document.getElementById('startBtn');
 const overlay = document.getElementById('overlay');
 const overlayText = document.getElementById('overlayText');
+// The chip's text, which is a child of it rather than the element itself: the
+// chip also holds the glyph it folds down to, and writing the report straight
+// into the container would delete that glyph on the first update.
+const overlayTextBody = document.getElementById('overlayTextBody');
+const btnToast = document.getElementById('btnToast');
 const blankBtn = document.getElementById('blankBtn');
 const lmBtn = document.getElementById('lmBtn');
 const streamBtn = document.getElementById('streamBtn');
@@ -32,6 +37,8 @@ const exitBtn = document.getElementById('exitBtn');
 const mapBtn = document.getElementById('mapBtn');
 const transparentBtn = document.getElementById('transparentBtn');
 const headingBtn = document.getElementById('headingBtn');
+const fitBtn = document.getElementById('fitBtn');
+const reportBtn = document.getElementById('reportBtn');
 
 // There are no devtools on a phone, and a script that throws while wiring
 // itself up leaves a page that looks completely normal and does nothing — the
@@ -196,9 +203,13 @@ const signaling = connectSignaling('client', {
       // around the room. Null clears it — "nothing worth saying" is the common
       // answer and must not leave the last instruction standing.
       mapView.setGuide(msg.guide || null);
+      // Which of the dots on the map is this phone. Only the server knows — the
+      // clientId is its own numbering — and the near fit has to be able to ask
+      // what *this* client is looking at rather than guess from the geometry.
+      if (msg.clientId !== undefined) mapView.setSelfClient(msg.clientId);
       // The map's rotation comes from the same fix the overlay reports, so the
       // two can never disagree about which way this phone is pointing.
-      applyHeading();
+      applyMapView();
     }
     else if (msg.type === 'pose') {
       // Every localized client's dot, this one included: the server sends the
@@ -479,7 +490,7 @@ const OVERLAY_REPORT_MS = 1000;
 let lastOverlayReport = -Infinity;
 
 function setOverlay(text) {
-  overlayText.textContent = text;
+  overlayTextBody.textContent = text;
   // Reported far more slowly than it is drawn: the overlay refreshes five times
   // a second and nothing in it changes meaningfully that fast.
   const now = performance.now();
@@ -615,8 +626,8 @@ function setMapMode(mode) {
   mapCanvas.classList.toggle('full', mapMode === 'full');
   updateCamInset();
   mapBtn.classList.toggle('active', mapMode !== 'off');
-  transparentBtn.classList.toggle('on', mapMode !== 'off');
-  headingBtn.classList.toggle('on', mapMode !== 'off');
+  // Which of the row's buttons exist at all — the three that only act on a map.
+  overlayBtns.classList.toggle('mapOn', mapMode !== 'off');
   // After the visibility toggles above, since they are what changes the row.
   updateMapInset();
   // Stopped when it is off screen: it runs a frame loop of its own, and the
@@ -659,10 +670,7 @@ function updateScreenRotation(orientation) {
   // and a map that spins while the phone is laid flat is worse than a stale one.
   if (Math.hypot(up[0], up[1]) < ROT_FLAT_MIN) return;
   const deg = Math.atan2(up[0], up[1]) * 180 / Math.PI;
-  // Distance from the quarter turn currently in force, wrapped to ±180.
-  const off = Math.abs(((deg - screenRotDeg + 540) % 360) - 180);
-  if (off < ROT_FLIP_DEG) return;
-  const snapped = ((Math.round(deg / 90) * 90) % 360 + 360) % 360;
+  const snapped = snapQuarterTurn(deg, screenRotDeg, ROT_FLIP_DEG);
   if (snapped === screenRotDeg) return;
   screenRotDeg = snapped;
   for (const r of [90, 180, 270]) overlay.classList.toggle(`rot${r}`, snapped === r);
@@ -679,21 +687,54 @@ function updateScreenRotation(orientation) {
 // convention every camera pose in this project uses — and the renderer works out
 // which way that has to be turned for this projection. Off, the map keeps the
 // room's own orientation and its own bounds, which is the view that matches a
-// floor plan on a wall.
-let headingUp = false;
+// floor plan on a wall. On by default: this map is read while walking the room,
+// where "which way am I facing" is the question being asked of it.
+let headingUp = true;
 
-function applyHeading() {
+// Close in on where the phone is standing instead of holding the whole survey
+// in view. Off is the map this page has always drawn — everything surveyed, at
+// whatever scale that takes, which at room scale puts the tags being looked at
+// within a few pixels of each other. On, the view follows the pose and reaches
+// only as far as this client's own business: the tags it can see and the walk it
+// has been given. On by default, for the same reason heading-up is: this map is
+// read while walking the room, and at room scale the whole-survey fit puts the
+// tags being looked at within a few pixels of each other.
+let nearFit = true;
+
+// Both halves of "what is the view built around" come off the same fix, and the
+// renderer takes them in one call, so this is the only place either is set.
+function applyMapView() {
+  // The turn is heading's alone; the centre is wanted by either of them, so a
+  // fit that follows the pose does not also have to turn the room to get it.
   // Null is off, and only off: the hold through a dropout is `lastFix`, kept
   // here where "the last fix I had" is already known.
   mapView.setHeadingUp(
     headingUp && lastFix ? quatRotate(lastFix.q, [0, 0, 1]) : null,
-    headingUp && lastFix ? lastFix.p : null);
+    (headingUp || nearFit) && lastFix ? lastFix.p : null);
 }
 
 function setHeading(on) {
   headingUp = on;
   headingBtn.classList.toggle('active', headingUp);
-  applyHeading();
+  applyMapView();
+}
+
+// The diagnostic chip, on screen or slid off it. On by default: it is the only
+// surface this page has, and a session that fails on startup has to say so
+// without anyone having pressed anything first.
+let reportOn = true;
+
+function setReport(on) {
+  reportOn = on;
+  overlayText.classList.toggle('away', !reportOn);
+  reportBtn.classList.toggle('active', reportOn);
+}
+
+function setNearFit(on) {
+  nearFit = on;
+  fitBtn.classList.toggle('active', nearFit);
+  mapView.setNearFit(nearFit);
+  applyMapView();
 }
 
 function setTransparent(on) {
@@ -1559,32 +1600,65 @@ exitBtn.addEventListener('pointerup', (ev) => {
   const over = document.elementFromPoint(ev.clientX, ev.clientY);
   if (over === exitBtn) session?.end();
 });
-blankBtn.onclick = () => blank.toggle();
-lmBtn.onclick = () => setLandmarks(!landmarksOn);
+// The row is glyphs, so the name of the control only exists at the moment it is
+// pressed — and what is wanted then is not the name on its own but what the
+// press did, which for every one of these is a state. Long enough to read at
+// arm's length while walking, short enough not to sit over the map afterwards.
+const TOAST_MS = 1400;
+let toastTimer = 0;
+function flashLabel(text) {
+  btnToast.firstElementChild.textContent = text;
+  btnToast.classList.add('on');
+  // Restarted, not queued: two presses in a row must show the second answer for
+  // its full time rather than have the first one's timer take it away early.
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => btnToast.classList.remove('on'), TOAST_MS);
+}
+const onOff = (on) => (on ? 'on' : 'off');
+// One description of an icon button here: press it, then say what it now is.
+// The label is read *after* the action, so it reports the new state rather than
+// the one being left — the same rule the dashboard's non-optimistic controls
+// follow, for the same reason.
+function wireIconBtn(btn, run, label) {
+  btn.onclick = () => {
+    run();
+    flashLabel(label());
+  };
+}
+wireIconBtn(blankBtn, () => blank.toggle(), () => `Blank ${onOff(blank.on)}`);
+wireIconBtn(lmBtn, () => setLandmarks(!landmarksOn), () => `Landmarks ${onOff(landmarksOn)}`);
 lmBtn.classList.add('active');
-streamBtn.onclick = () => setStreaming(!streamOn);
-mapBtn.onclick = () =>
-  setMapMode(MAP_MODES[(MAP_MODES.indexOf(mapMode) + 1) % MAP_MODES.length]);
-transparentBtn.onclick = () => setTransparent(!transparent);
-// Tap the chip to fold it to one line, tap again for the rest. `pointerdown`
-// rather than `click`: it is the one event a finger, a mouse and a stylus all
-// raise exactly once, where touchstart plus the synthesized click that follows
-// it would toggle twice per tap. preventDefault stops that synthesized click
-// and the text selection a press-and-hold would otherwise start. The state is
-// the class on the element — nothing else on the page reads it.
-overlayText.addEventListener(
-  window.PointerEvent ? 'pointerdown' : 'touchstart',
-  (ev) => {
-    ev.preventDefault();
-    overlayText.classList.toggle('collapsed');
-  });
+wireIconBtn(streamBtn, () => setStreaming(!streamOn), () => `Stream ${onOff(streamOn)}`);
+wireIconBtn(mapBtn,
+  () => setMapMode(MAP_MODES[(MAP_MODES.indexOf(mapMode) + 1) % MAP_MODES.length]),
+  () => `Map ${mapMode}`);
+wireIconBtn(transparentBtn, () => setTransparent(!transparent),
+  () => `Backdrop ${onOff(!transparent)}`);
+wireIconBtn(fitBtn, () => setNearFit(!nearFit), () => `Zoom ${nearFit ? 'near' : 'all'}`);
+wireIconBtn(reportBtn, () => setReport(!reportOn), () => `Report ${onOff(reportOn)}`);
+// Tap the chip to send it away; the row's own button is what brings it back.
+// Not a toggle on the chip itself: five lines of diagnostics over the map is
+// worth one tap to be rid of, but once gone there is nothing left on screen to
+// aim at, and a small mark left behind to aim at is exactly what could not be
+// hit inside the session. So the two halves live in different places, and the
+// one that has to work when there is nothing to see is a button in the row.
+//
+// Both events, because folded down this stopped answering `pointerdown` and
+// then stopped answering `click` in the same way and neither is trusted on its
+// own here. Setting a state rather than toggling one is what makes that safe:
+// a tap that raises both says "away" twice.
+const sendReportAway = () => setReport(false);
+overlayText.addEventListener('pointerdown', sendReportAway);
+overlayText.addEventListener('click', sendReportAway);
 // The Android navigation bar comes and goes under the session; the overlay is
 // sized in dvh and its safe-area inset follows, so the strip the buttons cover
 // is not the same one it was.
 window.addEventListener('resize', updateMapInset);
-headingBtn.onclick = () => setHeading(!headingUp);
+wireIconBtn(headingBtn, () => setHeading(!headingUp), () => `Heading ${onOff(headingUp)}`);
 setHeading(headingUp);
-// Both defaults applied once at load, so the buttons and the renderer start out
+setNearFit(nearFit);
+setReport(reportOn);
+// Every default applied once at load, so the buttons and the renderer start out
 // agreeing with the variables above.
 setTransparent(transparent);
 setMapMode(mapMode);
