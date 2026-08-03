@@ -28,7 +28,7 @@
 
 const {
   undistort, reproject, qualifyTrack, clusterLandmarks, solveLandmarkPose,
-  azimuthOf, dist3, MIN_OBS, MAX_RMS_PX, MIN_ARC_DEG,
+  dist3, MIN_OBS, MAX_RMS_PX, MIN_ARC_DEG,
 } = require('./public/landmark-math.js');
 const { quatAngleDeg, transformPoint, se3Invert } = require('./public/pose-math.js');
 
@@ -563,28 +563,6 @@ const GUIDE_MAX_M = 6;
 // 10 Hz is not guidance, it is a flicker — so the standing target is kept until
 // something is clearly better, not merely better.
 const GUIDE_STICKY = 1.35;
-// Asked for slightly more than the arithmetic says. The interval is measured
-// about the *estimated* point, which is a few centimetres off the real one and
-// only re-measured every few sightings, so an instruction for exactly the
-// missing degrees lands just short — measured on a synthetic walk, following a
-// 40 deg instruction to the letter took the span from 20 to 56 of the 60
-// needed, and the guide then had to ask for 5 deg more. Overshooting once beats
-// a second instruction that reads like the first one failed.
-const GUIDE_OVERSHOOT_DEG = 8;
-// When the camera stands roughly opposite the covered arc, the two ends are
-// nearly equidistant and the choice between them is noise — measured as the
-// arc's arrow flipping direction frame to frame on the boundary. Inside this
-// band the previous direction is kept for the same standing target.
-const GUIDE_DIR_HYST_DEG = 12;
-// An arc trimmed by the wall test to less than this is not worth drawing —
-// the target is effectively walled off from where the user stands.
-const GUIDE_MIN_SWEEP_DEG = 5;
-
-const norm180 = (d) => {
-  let a = (d + 180) % 360;
-  if (a < 0) a += 360;
-  return a - 180;
-};
 
 // The solve path's own account of itself, for replay only (`--trace`). The
 // lock's failure is a *dynamics* problem — supply is there, the solve is not —
@@ -1473,7 +1451,7 @@ function createLandmarks({ log = () => {}, opts = {}, trace = null } = {}) {
           // track that stops resolving stops being shown rather than freezing
           // where it last was.
           t.est = j.P && Number.isFinite(j.err) && j.err < MAX_RMS_PX
-            ? { P: j.P, span: j.span, az0: j.az0, az1: j.az1, err: j.err }
+            ? { P: j.P, span: j.span, err: j.err }
             : null;
         }
         let q = j?.ok ? j : null;
@@ -1879,16 +1857,16 @@ function createLandmarks({ log = () => {}, opts = {}, trace = null } = {}) {
     // the guidance scored candidates on straight-line distance alone and
     // asked for walks through the [2 6] wall.
     //
-    // Returns { p, n, span, need, dist, mode, radius, from, sweep } in room
-    // coordinates and degrees:
+    // Returns { p, n, span, need, dist, mode } in room coordinates and degrees:
     //   mode 'closer' — too far for the arc to be worth walking; approach first.
-    //   mode 'arc'    — walk the ground around `p` starting at azimuth `from`
-    //                   (where the camera stands), through `sweep` signed
-    //                   degrees, at `radius` metres. The magnitude travels the
-    //                   wire explicitly: it used to be reconstructed on the
-    //                   phone from two wrapped endpoints, and the mod-360
-    //                   ambiguity turned a stale −3° into 357° — the
-    //                   full-circle "arc".
+    //   mode 'arc'    — the covered arc is `need` degrees short of the gate.
+    //   mode 'dwell'  — wide enough already; keep it in view for more sightings.
+    //
+    // Which *way* round to walk is deliberately not answered. The phone drew
+    // that as a swept arrow and it is gone: the walk it asked for is
+    // self-defeating (see the depth exit below), and the direction pick was
+    // noise whenever the camera stood opposite the covered arc, which needed a
+    // hysteresis band of its own to stop the arrowhead flipping frame to frame.
     guide(clientId, camPose, { blocked } = {}) {
       const s = clients.get(clientId);
       if (!s || !camPose) return null;
@@ -1948,32 +1926,17 @@ function createLandmarks({ log = () => {}, opts = {}, trace = null } = {}) {
         }
       }
       const wasFar = s.guide?.far ?? false;
-      // The arc direction is target-local state: it only means anything while
-      // the instruction keeps pointing at the same feature.
-      const sameTarget = prev && dist3(best.P, prev.P) < groupM;
       const far = best.dist > (wasFar ? GUIDE_NEAR_LEAVE_M : GUIDE_NEAR_M);
-      s.guide = {
-        P: best.P, score: best.score, n: best.n, far,
-        dir: sameTarget ? prev.dir : null,
-      };
+      s.guide = { P: best.P, score: best.score, n: best.n, far };
 
       const { P, head } = best;
       const need = Math.max(0, Math.ceil(MIN_ARC_DEG - head.span));
-      // Horizontal radius: the walk happens on the floor, and a feature above
-      // head height would otherwise ask for an arc wider than the room.
-      const radius = Math.hypot(C[0] - P[0], C[2] - P[2]);
       const out = {
         p: P.map((v) => Math.round(v * 1000) / 1000),
-        // Where the camera was when this was worked out. The map draws the
-        // instruction from here, and asking it to find "the dot that is me"
-        // instead would mean telling the page its own clientId for this one
-        // purpose — it has never needed to know it.
-        at: C.map((v) => Math.round(v * 1000) / 1000),
         n: best.n,
         span: Math.round(head.span),
         need,
         dist: Math.round(best.dist * 100) / 100,
-        radius: Math.round(radius * 100) / 100,
       };
       if (far) return { ...out, mode: 'closer' };
       // Wide enough already and still not a landmark: what it is short of is
@@ -1984,64 +1947,7 @@ function createLandmarks({ log = () => {}, opts = {}, trace = null } = {}) {
       // has usually swept 70-85 deg getting there, so "walk around it" would be
       // an instruction to do what has already been done.
       if (!need) return { ...out, mode: 'dwell' };
-
-      // Which end of the covered arc the camera is standing at. Extending the
-      // near end is the only instruction that adds arc; setting off from the far
-      // end re-walks ground the track already has. When the camera stands
-      // nearly opposite the covered arc the two ends are equidistant and the
-      // choice is noise — keep the previous direction for the same target
-      // rather than flipping the arrow frame to frame.
-      const azNow = azimuthOf(P, { pose: camPose });
-      const d0 = Math.abs(norm180(azNow - head.az0));
-      const d1 = Math.abs(norm180(azNow - head.az1));
-      let dir = d1 <= d0 ? 1 : -1;
-      if (s.guide.dir && Math.abs(d0 - d1) < GUIDE_DIR_HYST_DEG) dir = s.guide.dir;
-      s.guide.dir = dir;
-      // The target is a *fixed room azimuth*: the point at which the covered
-      // arc will have reached the gate, anchored on the far covered end —
-      // extending past az1 means finishing at az0 + the gate, and vice versa.
-      // It must not be derived from where the camera stands: the covered-arc
-      // estimate refreshes only every few sightings, so a target placed
-      // "need° ahead of the camera" was re-laid ahead of every step taken
-      // toward it — an arrowhead that receded exactly as fast as it was
-      // chased, reported as precisely that. Anchored this way it stays put:
-      // walking extends the near end toward it while the far end holds, and
-      // the two meet where the target has been all along.
-      const target = (dir === 1 ? head.az0 : head.az1)
-        + dir * (MIN_ARC_DEG + GUIDE_OVERSHOOT_DEG);
-      const delta = ((dir * (target - azNow)) % 360 + 360) % 360;
-      // Past the target already (the estimate is a beat behind the walk):
-      // arrived. Hold and let the sightings catch up — the wrap would
-      // otherwise turn "5° past" into "355° to go".
-      if (delta > 315) return { ...out, mode: 'dwell' };
-      let sweep = dir * Math.min(delta, 180);
-      // Trim the sweep where the standing arc leaves the room: a point on the
-      // walk whose line to the feature crosses a wall is a viewpoint that
-      // cannot see it. Sampled coarsely — this is an instruction, not a
-      // measurement — and a sweep trimmed to nearly nothing means the target
-      // is effectively walled off; say nothing rather than point at a wall.
-      if (blocked) {
-        const az0 = norm180(azNow);
-        const step = 10 * Math.sign(sweep);
-        let ok = 0;
-        for (let a = step; Math.abs(a) <= Math.abs(sweep); a += step) {
-          const rad = (az0 + a) * Math.PI / 180;
-          const S = [P[0] + radius * Math.sin(rad), P[2] + radius * Math.cos(rad)];
-          if (blocked([P[0], P[2]], S)) break;
-          ok = a;
-        }
-        if (Math.abs(sweep) > Math.abs(ok) + 10) sweep = ok;
-        if (Math.abs(sweep) < GUIDE_MIN_SWEEP_DEG) return null;
-      }
-      return {
-        ...out,
-        mode: 'arc',
-        // From where they stand, through the end of what is covered, to where
-        // the arc becomes wide enough. Drawn as one sweep because that is the
-        // ground they have to cross, covered or not.
-        from: Math.round(norm180(azNow) * 10) / 10,
-        sweep: Math.round(sweep * 10) / 10,
-      };
+      return { ...out, mode: 'arc' };
     },
 
     // For the viewer. Deliberately the merged set, for the same reason.

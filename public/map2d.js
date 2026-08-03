@@ -126,7 +126,6 @@ function createMap2dView(canvas, mode = 'top', {
   const GUIDE_CSS = '#ffd166';
   const GUIDE_RING_M = 0.35;
   const GUIDE_RING_MIN_PX = 9;
-  const GUIDE_HEAD_PX = 9;
   const HOVER_MS = 120;
   let rafPending = false;
   let lastFrameAt = 0;
@@ -518,93 +517,33 @@ function createMap2dView(canvas, mode = 'top', {
     return true;
   }
 
-  // The guidance, drawn as the ground to cover rather than as a label about it.
+  // The guidance: a ring on the ground under the target cluster, and nothing
+  // else. The instruction itself — walk around it, get closer, keep it in view
+  // — is words on the overlay chip; this only answers *which* feature it is
+  // talking about, which is the one thing words cannot say.
   //
-  // Everything here is built from *room* points and pushed through the view's
-  // own projection, never from screen-space trigonometry: this renderer serves
-  // three projections and a rotating phone screen, and an arc computed in
-  // pixels would be right in exactly one of them.
+  // The arc and the dashed approach line that used to be drawn here were cut:
+  // the phone map is heading-up and centred on the reader's own dot, so a line
+  // to the ring said what the ring already said, and the arc's instruction is
+  // one the survey stopped asking for (see `guide` in landmarks.js — it says
+  // nothing at all once depth is trusted).
   //
-  // The azimuth convention is the survey's (`azimuthOf` in landmark-math.js):
-  // atan2(x - Px, z - Pz), so a point at azimuth A and radius r sits at
-  // (Px + r sin A, Pz + r cos A). Two definitions of that would put the arrow
-  // on the wrong side of the room, which is the one error that would be
-  // actively misleading rather than merely unhelpful.
+  // Sized in world metres and pushed through the view's own projection, never
+  // in screen-space: this renderer serves three projections and a rotating
+  // phone screen, and the ring has to read as a place on the floor rather than
+  // as a decoration stuck to the glass.
   function drawGuide(px, g, alpha) {
-    const rad = (deg) => deg * Math.PI / 180;
-    const at = (A, r) => [g.p[0] + r * Math.sin(rad(A)), g.p[1], g.p[2] + r * Math.cos(rad(A))];
     ctx.globalAlpha = alpha * 0.9;
     ctx.strokeStyle = GUIDE_CSS;
-    ctx.fillStyle = GUIDE_CSS;
     ctx.lineWidth = 2;
     ctx.lineCap = 'round';
-
-    // The target itself: a ring on the ground under the cluster, sized in world
-    // metres so it reads as a place rather than as a screen decoration.
-    const [tx, ty] = px(g.p);
-    const ringPx = Math.max(GUIDE_RING_MIN_PX, GUIDE_RING_M * shown.scale);
     ctx.setLineDash([]);
+    const [tx, ty] = px(g.p);
     ctx.beginPath();
-    ctx.arc(tx, ty, ringPx, 0, Math.PI * 2);
+    ctx.arc(tx, ty, Math.max(GUIDE_RING_MIN_PX, GUIDE_RING_M * shown.scale), 0, Math.PI * 2);
     ctx.stroke();
-
-    if (g.mode === 'arc' && Number.isFinite(g.sweep)) {
-      // From where they stand, through the signed sweep the server sent. The
-      // magnitude travels the wire on purpose: reconstructing it here from two
-      // wrapped endpoints was mod-360 ambiguous, and a stale −3° drew as 357°
-      // — a full circle around the target.
-      const delta = g.sweep;
-      const steps = Math.max(8, Math.ceil(Math.abs(delta) / 6));
-      ctx.beginPath();
-      for (let i = 0; i <= steps; i++) {
-        const [x, y] = px(at(g.from + delta * (i / steps), g.radius));
-        if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y);
-      }
-      ctx.stroke();
-      // Arrowhead at the far end, built from the last step of the sweep so it
-      // points along the walk in whatever projection this is.
-      const end = px(at(g.from + delta, g.radius));
-      const before = px(at(g.from + delta * (1 - 1 / steps), g.radius));
-      arrowHead(end, before, alpha);
-    } else if (g.mode === 'closer') {
-      // Straight at it, from where they were standing when the server worked
-      // this out. Dashed, because the line is a route and not a measurement.
-      const from = px(g.at);
-      ctx.setLineDash([6, 5]);
-      ctx.beginPath();
-      ctx.moveTo(from[0], from[1]);
-      ctx.lineTo(tx, ty);
-      ctx.stroke();
-      ctx.setLineDash([]);
-      arrowHead([tx, ty], from, alpha);
-    } else {
-      // Dwell: nowhere to go, so nothing points anywhere. A second ring just
-      // outside the first says "this one, keep it in view" without implying a
-      // direction the person does not need to walk in.
-      ctx.globalAlpha = alpha * 0.45;
-      ctx.beginPath();
-      ctx.arc(tx, ty, ringPx + 5, 0, Math.PI * 2);
-      ctx.stroke();
-    }
     ctx.globalAlpha = 1;
     ctx.lineCap = 'butt';
-  }
-
-  // A head at `tip`, opening away from `tail`. Screen space on purpose: this is
-  // the one part that is decoration rather than geometry, and it should be the
-  // same size however far the map is zoomed out.
-  function arrowHead(tip, tail, alpha) {
-    const a = Math.atan2(tip[1] - tail[1], tip[0] - tail[0]);
-    const wing = 0.45;
-    ctx.globalAlpha = alpha;
-    ctx.beginPath();
-    ctx.moveTo(tip[0], tip[1]);
-    ctx.lineTo(tip[0] - GUIDE_HEAD_PX * Math.cos(a - wing),
-      tip[1] - GUIDE_HEAD_PX * Math.sin(a - wing));
-    ctx.lineTo(tip[0] - GUIDE_HEAD_PX * Math.cos(a + wing),
-      tip[1] - GUIDE_HEAD_PX * Math.sin(a + wing));
-    ctx.closePath();
-    ctx.fill();
   }
 
   function draw(now) {
