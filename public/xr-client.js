@@ -23,6 +23,7 @@ const overlay = document.getElementById('overlay');
 const overlayText = document.getElementById('overlayText');
 const blankBtn = document.getElementById('blankBtn');
 const lmBtn = document.getElementById('lmBtn');
+const streamBtn = document.getElementById('streamBtn');
 const mapCanvas = document.getElementById('mapCanvas');
 const camCanvas = document.getElementById('camCanvas');
 const overlayRot = document.getElementById('overlayRot');
@@ -102,6 +103,9 @@ let lastIntr = null;
 // goes alongside it so the dashboard can draw where the phone is rather than
 // where it was.
 let lastXrNow = null;
+// XR frames since the cost window opened, not since the session started — see
+// costFrame. A total says only that the loop is alive; the rate says whether
+// anything is taking it away.
 let frames = 0;
 let lastTags = [];
 let lastTrack = null;
@@ -115,6 +119,18 @@ let trackFailed = null;
 // maintainLandmarks is a structural no-op for this client. Session-scoped on
 // purpose — the XR page never persists settings to the device registry.
 let landmarksOn = true;
+// Video out, off by default — see setStreaming. `streamOn` is what was asked
+// for and outlives a session; the rest exists only while frames are flowing.
+let streamOn = false;
+let camStream = null;
+let camTrack = null;
+let mediaW = 0;
+let mediaH = 0;
+let mediaStarted = false;
+// Sticky for the session, like trackFailed: a browser that cannot drive a
+// canvas stream frame by frame does not get a second chance, and silence would
+// look exactly like a feature nobody switched on.
+let streamFailed = null;
 // WebXR features the session actually granted (session.enabledFeatures),
 // reported in client-state as reconnaissance: 'plane-detection' or 'anchors'
 // being available would hand chunks of the custom CV over to ARCore.
@@ -144,6 +160,7 @@ const LOST_PING_MS = 1000;
 // mic, no recorder and no resolution and would otherwise overwrite what the
 // capture client on the same phone actually uses.
 const device = resolveDevice('client');
+const deviceIdReady = device.then((d) => d.id);
 device.then((d) => {
   const label = document.getElementById('clientLabel');
   label.textContent = d.name || 'unnamed device';
@@ -153,10 +170,22 @@ device.then((d) => {
 const signaling = connectSignaling('client', {
   onOpen() {
     clockSync.start();
+    tx.socketOpened();
+    // The server tracks a recording per socket, so a new socket needs a fresh
+    // recorder — its first chunk carries the WebM header.
+    if (mediaStarted) tx.startRecorder();
     sendClientState();
+  },
+  onClose() {
+    tx.socketClosed();
+  },
+  onPong(msg) {
+    tx.handlePong(msg);
   },
   onMessage(msg) {
     if (clockSync.handle(msg)) return;
+    // The peer connection and the recorder, shared with /client.
+    if (tx.handleMessage(msg)) return;
     // The room as the server has it — survey, carved floor, walls — for the map
     // below. Only sent while this client says it is drawing one.
     if (roomFeed.handle(msg)) return;
@@ -188,6 +217,9 @@ const signaling = connectSignaling('client', {
       // Wanted state, never a toggle — the dashboard's view is up to a second
       // old, and a toggle raced against a stale view lands inverted.
       else if (msg.action === 'landmarks') setLandmarks(!!msg.value);
+      else if (msg.action === 'stream') setStreaming(!!msg.value);
+      // Cut the current recording and open the next one, when there is one.
+      else if (msg.action === 'record') { if (mediaStarted) tx.startRecorder(); }
     } else if (msg.type === 'pose-config') {
       // Remembered, not just forwarded. pose-config arrives on connect; the
       // detector does not exist until the user starts the XR session, so
@@ -201,8 +233,31 @@ const signaling = connectSignaling('client', {
       detectWorker?.postMessage({ type: 'config', markerSizeM, poseRateMs });
     }
   },
-}, device.then((d) => d.id));
+}, deviceIdReady);
 const clockSync = createClockSync(signaling);
+
+// Recorder chunks, on their own socket so half a megabyte of WebM a second
+// cannot queue ahead of this page's pose reports. Same deviceId as the socket
+// above, so the server maps both to the same client. Opened whether or not
+// streaming is ever switched on — it costs one idle socket, and a socket opened
+// at the moment the first chunk is ready would have the chunk waiting on it.
+const bulk = connectSignaling('client-bulk', {}, deviceIdReady);
+
+// This page's video source is not a camera: it is the canvas the detector's own
+// readback is flipped into, driven one frame at a time (publishFrame). So the
+// stream runs at the detection rate, and with streaming off nothing here runs
+// at all.
+const tx = createMediaTx({
+  signaling,
+  bulk,
+  clockSync,
+  getStream: () => camStream,
+  onStatus: setStatus,
+  // Only if there is something to offer: a dashboard appearing while this page
+  // has no frames would otherwise offer a track that has never produced one.
+  onViewerReady: () => { if (mediaStarted) tx.startCall(); },
+  onCallFailed: () => setTimeout(() => { if (mediaStarted) tx.startCall(); }, 1000),
+});
 
 // Blanking the display while the session keeps tracking. Mounted on the DOM
 // overlay root rather than the body: in an immersive-AR session that subtree is
@@ -321,6 +376,90 @@ function chipDue(now) {
   if (now - chipAt < CHIP_INTERVAL_MS) return false;
   chipAt = now;
   return true;
+}
+
+// What this page costs, which is the one thing about it that cannot be watched:
+// the session owns the screen, so the figures are read afterwards out of the
+// pose journal and the chip is only for the moment someone is holding the
+// phone. Rates, not totals — a running frame count says the loop is alive,
+// which a rate says too, and only a rate says whether something took the loop
+// away.
+//
+// Both readers get one *completed* window. Read live, the chip at 5 Hz would
+// mostly be dividing by a window a fifth of a second old, so the accumulators
+// roll on the frame loop and a partial stands in only until the first roll.
+const COST_WINDOW_MS = 5000;
+let costFrom = 0;
+let dets = 0;
+let detMsSum = 0;
+let blocked = 0;
+let flips = 0;
+let flipMsSum = 0;
+let txFrames = 0;
+let txMsSum = 0;
+let costOut = null;
+
+function costSnapshot(now) {
+  const span = Math.max(1, now - costFrom);
+  return {
+    fps: Math.round(frames * 1e4 / span) / 10,
+    detHz: Math.round(dets * 1e4 / span) / 10,
+    // Null rather than 0: no detection finishing in the window is not a
+    // detection that cost nothing.
+    detMs: dets ? Math.round(detMsSum / dets) : null,
+    flipMs: flips ? Math.round(flipMsSum * 10 / flips) / 10 : null,
+    // What handing that same picture to the encoder costs on this thread. The
+    // encode itself is off it; this is only the frame being taken.
+    txMs: txFrames ? Math.round(txMsSum * 10 / txFrames) / 10 : null,
+    // Detections that came due and were dropped because the previous one was
+    // still out. This is the gap between the rate asked for and the rate
+    // delivered — the number that moves first when anything new is added to
+    // the frame.
+    blocked,
+  };
+}
+
+function costFrame(now) {
+  if (!costFrom) costFrom = now;
+  else if (now - costFrom >= COST_WINDOW_MS) {
+    costOut = costSnapshot(now);
+    costFrom = now;
+    frames = 0;
+    dets = 0;
+    detMsSum = 0;
+    blocked = 0;
+    flips = 0;
+    flipMsSum = 0;
+    txFrames = 0;
+    txMsSum = 0;
+  }
+  frames++;
+}
+
+// The same object on the chip and on every report, so the journal can never
+// disagree with what the screen said.
+function costReport() {
+  return costOut ?? (costFrom ? costSnapshot(performance.now()) : null);
+}
+
+function costLine() {
+  const c = costReport();
+  if (!c) return '';
+  return ` · ${c.fps}f/s · det ${c.detHz}/s`
+    + (c.detMs === null ? '' : ` ${c.detMs}ms`)
+    + (c.blocked ? ` · ${c.blocked} late` : '');
+}
+
+// Video out, on its own line only while it is on or has failed — the state that
+// matters is "this session is also encoding", and a page not streaming should
+// not spend a line saying so.
+function streamLine() {
+  if (streamFailed) return `\nstream OFF — ${streamFailed}`;
+  if (!streamOn) return '';
+  if (!mediaStarted) return '\nstream starting…';
+  const c = costReport();
+  return `\nstream ${mediaW}x${mediaH} · rec`
+    + (c?.txMs === null || c?.txMs === undefined ? '' : ` · ${c.txMs}ms`);
 }
 
 // The overlay is the only diagnostic surface this page has, and it can only be
@@ -574,6 +713,84 @@ function setLandmarks(on) {
   sendClientState();
 }
 
+// ---------------------------------------------------------------------------
+// Video out. The camera on this page is a GL texture the detector reads back
+// every detection frame; the stream is that same readback, flipped into the
+// canvas it was already being flipped into, published one frame at a time. So
+// the stream costs a draw and an encode and never a second look at the camera —
+// and it runs at the detection rate, which on this phone is single figures.
+//
+// Off by default and session-scoped in effect: pose accuracy outranks the
+// picture here, so this is a thing to switch on when someone wants to see what
+// the phone sees, not a thing to leave running.
+function setStreaming(on) {
+  streamOn = on;
+  streamBtn.classList.toggle('active', on);
+  // Starting is the next detection frame's job — there is no frame to hand a
+  // fresh track right now, and a recorder built against a track that has never
+  // produced one has no size to configure itself from.
+  if (!on) stopMedia();
+  sendClientState();
+}
+
+// Returns false when this browser cannot drive a canvas stream frame by frame.
+// A timer-driven captureStream is not an acceptable fallback: it would encode
+// the same picture 30 times a second between detections, which is the one cost
+// this page cannot afford.
+function startMedia(canvas, w, h) {
+  try {
+    camStream = canvas.captureStream(0);
+    camTrack = camStream.getVideoTracks()[0];
+  } catch (err) {
+    camStream = null;
+    camTrack = null;
+    streamFailed = err.message || 'captureStream failed';
+  }
+  if (camTrack && typeof camTrack.requestFrame !== 'function') {
+    camStream = null;
+    camTrack = null;
+    streamFailed = 'no requestFrame';
+  }
+  if (!camStream) {
+    // Rolled back before it is reported, so the dashboard never shows a switch
+    // that is on against a page that refused.
+    setStreaming(false);
+    setStatus(`streaming unavailable: ${streamFailed}`);
+    return false;
+  }
+  mediaW = w;
+  mediaH = h;
+  return true;
+}
+
+function stopMedia() {
+  tx.stopRecorder();
+  tx.stopCall();
+  camStream?.getTracks().forEach((t) => t.stop());
+  camStream = null;
+  camTrack = null;
+  mediaStarted = false;
+  mediaW = 0;
+  mediaH = 0;
+}
+
+// One frame of the stream, from the image the detector is about to look at.
+function publishFrame(canvas, w, h) {
+  // The encoder and the recorder are both bound to the frame size, so ARCore
+  // handing back a different one is a new file and a new offer, not a resize.
+  if (camStream && (w !== mediaW || h !== mediaH)) stopMedia();
+  if (!camStream && !startMedia(canvas, w, h)) return;
+  const t0 = performance.now();
+  camTrack.requestFrame();
+  txMsSum += performance.now() - t0;
+  txFrames++;
+  if (mediaStarted) return;
+  // Only now that a frame exists does the rest have something to describe.
+  mediaStarted = true;
+  tx.startRecorder();
+  if (tx.viewerWaiting) tx.startCall();
+}
+
 // The dashboard's roster is built from what each client reports about itself.
 // This page has far fewer knobs than /client and says so, rather than reporting
 // defaults for controls it does not have.
@@ -592,6 +809,9 @@ function sendClientState() {
     // the room to a page with no overlay to draw it in.
     map: session ? mapMode : 'off',
     landmarks: landmarksOn,
+    // What was asked for, not whether frames are flowing — `session` already
+    // says whether anything can be flowing at all.
+    stream: streamOn,
     xrFeatures,
   });
 }
@@ -699,6 +919,9 @@ function readCameraPixels(tex, w, h) {
 // worker path with the inset off, nothing on the page ever touches these pixels
 // again after the read above.
 function pixelsToCanvas(w, h) {
+  // Timed here rather than at the call sites: this is the page's own per-frame
+  // cost for looking at the picture at all, and it has more than one consumer.
+  const t0 = performance.now();
   if (!readCanvas) {
     readCanvas = document.createElement('canvas');
     readCtx = readCanvas.getContext('2d', { willReadFrequently: true });
@@ -713,6 +936,8 @@ function pixelsToCanvas(w, h) {
     img.data.set(pixels.subarray((h - 1 - y) * row, (h - y) * row), y * row);
   }
   readCtx.putImageData(img, 0, 0);
+  flips++;
+  flipMsSum += performance.now() - t0;
   return readCanvas;
 }
 
@@ -775,6 +1000,16 @@ async function start() {
     session = null;
     sessionId = null;
     camInfo = null;
+    // The cost window belongs to the session that was measured; carried over,
+    // the next session's first reports would describe the last one's.
+    costFrom = 0;
+    costOut = null;
+    // No more frames are coming, and a canvas track that stops being fed keeps
+    // its last one — the dashboard would hold a tile that looks live for as
+    // long as the page stayed open. `streamOn` survives: it is a standing
+    // preference like the map mode, and the next session resumes on its first
+    // detection frame.
+    stopMedia();
     // Nothing is being blanked once the overlay is gone, and a client that
     // still claimed to be blank would be reporting a screen that is not. The
     // map is re-applied rather than turned off: the mode is the user's standing
@@ -792,9 +1027,30 @@ async function start() {
   sendClientState();
 }
 
+// Both detection sites go through here: the `busy` handshake, the schedule and
+// the cost of a detection are one thing, and the tracking-lost branch below had
+// its own copy of the first two before there was a third.
+function startDetection(frame, view, pose, layer, now) {
+  if (busy) {
+    // Due, and dropped because the previous one had not come back.
+    if (now - lastPose >= poseRateMs) blocked++;
+    return;
+  }
+  if (now - lastPose < poseRateMs) return;
+  lastPose = now;
+  busy = true;
+  // Taken past the schedule check, not before it: this asks the layer for a
+  // viewport, and the frame that is not going to detect has no use for one.
+  detectAndReport(frame, view, pose, viewportOf(layer, view)).finally(() => {
+    busy = false;
+    dets++;
+    detMsSum += performance.now() - now;
+  });
+}
+
 function onFrame(t, frame) {
   session.requestAnimationFrame(onFrame);
-  frames++;
+  costFrame(t);
   const layer = session.renderState.baseLayer;
   gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
   gl.clearColor(0, 0, 0, 0);
@@ -822,14 +1078,9 @@ function onFrame(t, frame) {
     }
     const blind = viewerSpace && frame.getViewerPose(viewerSpace);
     const blindView = blind && blind.views[0];
-    if (blindView && !busy && now - lastPose >= poseRateMs) {
-      lastPose = now;
-      busy = true;
-      // No second argument: no world pose exists, and that is what switches the
-      // report to the tag-only message.
-      detectAndReport(frame, blindView, null, viewportOf(layer, blindView))
-        .finally(() => { busy = false; });
-    }
+    // Null pose: no world pose exists, and that is what switches the report to
+    // the tag-only message.
+    if (blindView) startDetection(frame, blindView, null, layer, now);
     // Two lines: how long, and whether anything can still be read. `no cam`
     // is the difference that matters — with a camera image the tags still fix
     // the position outright, without one nothing can be detected at all.
@@ -850,15 +1101,10 @@ function onFrame(t, frame) {
   lastXrNow = cvPose(pose.transform);
   updateScreenRotation(pose.transform.orientation);
   // Detection is far too expensive for every frame, and is a re-entrant
-  // hazard — one at a time, on its own schedule.
-  if (!busy && now - lastPose >= poseRateMs) {
-    lastPose = now;
-    busy = true;
-    // The viewport is the display the projection matrix was built for; it only
-    // matters as the thing the camera image's aspect gets compared against.
-    detectAndReport(frame, view, pose, viewportOf(layer, view))
-      .finally(() => { busy = false; });
-  }
+  // hazard — one at a time, on its own schedule (startDetection).
+  // The viewport is the display the projection matrix was built for; it only
+  // matters as the thing the camera image's aspect gets compared against.
+  startDetection(frame, view, pose, layer, now);
   // Between detections: where ARCore says the camera is, and nothing else.
   sendCarry(pose, now);
 
@@ -906,11 +1152,12 @@ function onFrame(t, frame) {
     // it, with that movement divided out, so the two are independent — walking
     // moves the first and should leave the second alone. The second is the
     // fix's own noise and the number the viewer's uncertainty circle is sized
-    // from. Frame count rides along as the proof the loop is still running.
+    // from. What the loop cost rides along after it — see costLine.
     + (roomPose?.jitter
       ? `\nsteady ${roomPose.jitter.movedMm}/${roomPose.jitter.jitterMm} mm`
       : '\nsteady —')
-    + ` · ${frames}f`);
+    + costLine()
+    + streamLine());
 }
 
 // A view from the 'viewer' space is not part of the render state's view list,
@@ -1112,11 +1359,16 @@ async function detectAndReport(frame, view, pose, viewport) {
   // world track — then there is nothing to predict from and the tracker starts
   // each point from where it was.
   const camView = pose ? { q: cvPose(pose.transform).q } : null;
-  // The inset is the only reason the page ever looks at these pixels again, and
-  // it costs a full-frame flip and raster, so it is done only when it is on.
-  if (camCanvas.classList.contains('on')) {
-    drawCamPreview(pixelsToCanvas(camera.width, camera.height));
-  }
+  // The page looks at these pixels again for the inset and for the video
+  // stream, and each costs a full-frame flip and raster — so the flip is done
+  // once, for whichever of them is on, and not at all when neither is. The
+  // on-page fallback below takes the same image rather than making a second.
+  const insetOn = camCanvas.classList.contains('on');
+  const wantMedia = streamOn && !!session;
+  const image = insetOn || wantMedia
+    ? pixelsToCanvas(camera.width, camera.height) : null;
+  if (insetOn) drawCamPreview(image);
+  if (wantMedia) publishFrame(image, camera.width, camera.height);
 
   const worker = ensureDetectWorker();
   if (worker) {
@@ -1146,8 +1398,8 @@ async function detectAndReport(frame, view, pose, viewport) {
   // the flip this page used to do for everyone.
   if (!(await ensureCore())) return;
   if (!core.hasIntrinsics(meta.w, meta.h)) core.setIntrinsics(meta.w, meta.h, intr);
-  const image = pixelsToCanvas(meta.w, meta.h);
-  const res = await core.detect(lumaSource, image, meta.w, meta.h, performance.now());
+  const source = image ?? pixelsToCanvas(meta.w, meta.h);
+  const res = await core.detect(lumaSource, source, meta.w, meta.h, performance.now());
   if (!res) return;
   if (pageTracker && landmarksOn) {
     if (trackReset) {
@@ -1264,6 +1516,11 @@ function reportDetection(meta, res) {
     // Journalled with the report, so churn is measurable after the fact rather
     // than only while someone is watching the phone.
     churn: res.churn,
+    // What the loop is costing, for the same reason and read the same way: the
+    // only surface this page has is behind an immersive session, so a claim
+    // about what a feature costs here has to come out of the journal rather
+    // than off a screen nobody could be looking at while it was walking.
+    cost: costReport(),
   };
   // With a world pose the server can tie ARCore's frame to the room and carry
   // the position between sightings; without one it gets the observations on
@@ -1305,6 +1562,7 @@ exitBtn.addEventListener('pointerup', (ev) => {
 blankBtn.onclick = () => blank.toggle();
 lmBtn.onclick = () => setLandmarks(!landmarksOn);
 lmBtn.classList.add('active');
+streamBtn.onclick = () => setStreaming(!streamOn);
 mapBtn.onclick = () =>
   setMapMode(MAP_MODES[(MAP_MODES.indexOf(mapMode) + 1) % MAP_MODES.length]);
 transparentBtn.onclick = () => setTransparent(!transparent);
