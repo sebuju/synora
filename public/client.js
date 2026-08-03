@@ -43,10 +43,6 @@ function updateLabel() {
   clientLabel.textContent = parts.join(' · ') || 'identifying…';
 }
 let stream = null;
-let pc = null;
-let recorder = null;
-let wsOpen = false;
-let viewerWaiting = false;
 let cameraPending = null;
 let restarting = false;
 let restartQueued = false;
@@ -61,45 +57,29 @@ const deviceIdReady = device.then((d) => d.id);
 
 const signaling = connectSignaling('client', {
   async onOpen() {
-    wsOpen = true;
+    tx.socketOpened();
     setStatus('connected, waiting for viewer');
     clockSync.start();
     sendClientState();
     // The server tracks a recording per socket, so a new socket needs a fresh
-    // recorder — its first chunk carries the WebM header. It also re-announces
-    // the viewer, so wait to be told rather than trusting the old flag.
-    viewerWaiting = false;
-    if (await ensureCamera()) startRecorder();
+    // recorder — its first chunk carries the WebM header.
+    if (await ensureCamera()) tx.startRecorder();
   },
   onClose() {
-    wsOpen = false;
-    viewerWaiting = false;
+    tx.socketClosed();
     setStatus('signaling lost, reconnecting…');
-    stopRecorder();
   },
   onPong(msg) {
-    // Belt and suspenders for viewer-ready: the pong says whether a viewer is
-    // connected right now, so a missed viewer-ready (page was frozen, socket
-    // was being swapped) heals within one probe interval instead of needing
-    // a manual reload.
-    if (msg.viewer === undefined) return;
-    if (msg.viewer && (!viewerWaiting || pcDead())) {
-      viewerWaiting = true;
-      restartCall();
-    } else if (!msg.viewer) {
-      viewerWaiting = false;
-    }
+    tx.handlePong(msg);
   },
   async onMessage(msg) {
     if (clockSync.handle(msg)) return;
+    // Everything to do with the peer connection and the recorder, in one place
+    // shared with the XR client.
+    if (tx.handleMessage(msg)) return;
     if (msg.type === 'client-id') {
       clientNumber = msg.clientId;
       updateLabel();
-    } else if (msg.type === 'viewer-ready') {
-      viewerWaiting = true;
-      await restartCall();
-    } else if (msg.type === 'restart-recorder') {
-      startRecorder();
     } else if (msg.type === 'control') {
       // Remote control from the dashboard. Every action lands in the same
       // setter the on-screen button calls — a second path would be a second
@@ -109,14 +89,6 @@ const signaling = connectSignaling('client', {
       posePipeline.setConfig(msg);
     } else if (msg.type === 'room-pose') {
       posePipeline.setRoomPose(msg);
-    } else if (msg.type === 'answer' && pc) {
-      await pc.setRemoteDescription(msg.description);
-    } else if (msg.type === 'ice' && pc) {
-      try {
-        await pc.addIceCandidate(msg.candidate);
-      } catch {
-        // Stale candidate from a previous connection — ignore.
-      }
     }
   },
 }, deviceIdReady);
@@ -129,6 +101,21 @@ const clockSync = createClockSync(signaling);
 // ahead of a pose message is exactly the lag it caused. Same deviceId, so the
 // server maps both sockets to the same client.
 const bulk = connectSignaling('client-bulk', {}, deviceIdReady);
+
+// The peer connection and the recorder. This page owns the source (the camera)
+// and the recovery policy (restartCall below, which has a camera to reacquire);
+// the module owns everything downstream of the tracks.
+const tx = createMediaTx({
+  signaling,
+  bulk,
+  clockSync,
+  getStream: () => stream,
+  onStatus: setStatus,
+  // A new recorder does not carry the paused state over.
+  onRecorderStarted: () => applyPaused(),
+  onViewerReady: () => restartCall(),
+  onCallFailed: () => setTimeout(restartCall, 1000),
+});
 
 // Everything this device was last set to, applied before a camera can open —
 // the size and the lens are read at getUserMedia time, so a camera opened
@@ -234,8 +221,7 @@ function ensureCamera() {
 // a new recorder ends here, since neither carries the paused state over.
 function applyPaused() {
   stream?.getTracks().forEach((t) => { t.enabled = !paused; });
-  if (paused && recorder?.state === 'recording') recorder.pause();
-  else if (!paused && recorder?.state === 'paused') recorder.resume();
+  tx.setRecorderPaused(paused);
   // Disabled tracks still deliver frames, they are just black — detecting tags
   // in them costs the same as detecting them in the real picture.
   posePipeline.setPaused(paused);
@@ -256,14 +242,7 @@ async function startCamera() {
   preview.srcObject = stream;
   applyPaused();
 
-  // Swap tracks into the live call where a sender of the same kind exists;
-  // kind additions/removals need renegotiation (callers run startCall then).
-  if (pc) {
-    for (const track of stream.getTracks()) {
-      const sender = pc.getSenders().find((s) => s.track?.kind === track.kind);
-      if (sender) await sender.replaceTrack(track);
-    }
-  }
+  await tx.replaceTracks(stream);
 
   // New tracks may mean a different lens or resolution; the pose pipeline
   // must re-read its intrinsics and make sure its frame loop is armed.
@@ -271,151 +250,6 @@ async function startCamera() {
   // The single point where lens, resolution and mic all become true rather than
   // requested, so it is the one place the roster has to be told from.
   sendClientState();
-}
-
-// Advertise the absolute-capture-time RTP header extension on the video
-// section. It carries each frame's capture instant on the sender's clock,
-// which is what lets the dashboard align feeds from different clients.
-function withAbsCaptureTime(sdp) {
-  if (sdp.includes(ABS_CAPTURE_TIME_URI)) return sdp;
-  // Within a BUNDLE group an extension id must mean the same thing in every
-  // m-section, so the id has to be free across the whole SDP — picking one
-  // that is merely free in the video section collides with audio when the mic
-  // is on. Ids above 14 need the two-byte header form, so stop there.
-  const used = new Set([...sdp.matchAll(/^a=extmap:(\d+)/gm)].map((m) => Number(m[1])));
-  let id = 1;
-  while (used.has(id)) id++;
-  if (id > 14) return sdp;
-
-  return sdp.split(/(?=^m=)/m).map((section) => {
-    if (!section.startsWith('m=video')) return section;
-    const lines = section.trimEnd().split('\r\n');
-    const last = lines.map((l) => l.startsWith('a=extmap:')).lastIndexOf(true);
-    // With no extmap lines to follow, append rather than land above the m= line.
-    lines.splice(last >= 0 ? last + 1 : lines.length, 0,
-      `a=extmap:${id} ${ABS_CAPTURE_TIME_URI}`);
-    return `${lines.join('\r\n')}\r\n`;
-  }).join('');
-}
-
-// Route a sender's encoded frames back out untouched, calling onFrame (if any)
-// on the way past. Enabling insertable streams hands every sender's frames to
-// the transformer, and a sender whose streams are never read has its media
-// dropped — so senders we only want to observe, and ones we care nothing
-// about, both have to be piped.
-function pipeEncoded(sender, onFrame) {
-  if (!sender.createEncodedStreams) return;
-  let streams;
-  try {
-    streams = sender.createEncodedStreams();
-  } catch {
-    return;
-  }
-  const relay = new TransformStream({
-    transform(frame, controller) {
-      onFrame?.(frame);
-      controller.enqueue(frame);
-    },
-  });
-  streams.readable.pipeThrough(relay).pipeTo(streams.writable).catch(() => {});
-}
-
-// The dashboard sees each frame's RTP timestamp but has no way to know when it
-// was captured. Encoded-frame access gives us both at the sending end, so we
-// publish the pairing and let the dashboard interpolate the rest.
-// Each pairing carries that frame's encode delay on top of the capture
-// instant, and the dashboard can only cancel it by taking the smallest one it
-// has seen recently — so what matters is how many samples land inside its
-// window, not how often the mapping strictly needs refreshing. These cost ~70
-// bytes each.
-const RTP_MAP_PUBLISH_MS = 125;
-
-function frameTimingPublisher() {
-  let lastSent = 0;
-  return (frame) => {
-    const now = clockSync.now();
-    if (clockSync.synced && now - lastSent > RTP_MAP_PUBLISH_MS) {
-      lastSent = now;
-      // Our own clock error biases this client's feed alone, so the dashboard
-      // cannot see it in the alignment it measures — send the bound along.
-      signaling.send({
-        type: 'rtp-map',
-        rtp: frame.timestamp,
-        serverTime: now,
-        unc: Math.round(clockSync.uncertaintyMs * 10) / 10,
-      });
-    }
-  };
-}
-
-async function startCall() {
-  pc?.close();
-  pc = new RTCPeerConnection({ ...RTC_CONFIG, encodedInsertableStreams: true });
-  stream.getTracks().forEach((t) => pc.addTrack(t, stream));
-  for (const sender of pc.getSenders()) {
-    pipeEncoded(sender, sender.track?.kind === 'video' ? frameTimingPublisher() : null);
-  }
-  pc.onicecandidate = (ev) => {
-    if (ev.candidate) signaling.send({ type: 'ice', candidate: ev.candidate });
-  };
-  const self = pc;
-  self.onconnectionstatechange = () => {
-    if (self !== pc) return;   // superseded by a later call
-    if (self.connectionState === 'connected') setStatus('streaming');
-    else if (self.connectionState === 'failed') {
-      setStatus('connection failed, retrying…');
-      setTimeout(restartCall, 1000);
-    }
-  };
-  const offer = await pc.createOffer();
-  offer.sdp = withAbsCaptureTime(offer.sdp);
-  await pc.setLocalDescription(offer);
-  signaling.send({ type: 'offer', description: pc.localDescription });
-}
-
-// ---------------------------------------------------------------------------
-// Recording: ship MediaRecorder chunks to the server. A new recorder (and a
-// recording-start message, so the server opens a fresh file) is needed
-// whenever the stream or the socket changes — the first chunk carries the
-// WebM header.
-function pickMime() {
-  const candidates = stream.getAudioTracks().length
-    ? ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm']
-    : ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'];
-  for (const mime of candidates) {
-    if (MediaRecorder.isTypeSupported(mime)) return mime;
-  }
-  return '';
-}
-
-function stopRecorder() {
-  if (recorder && recorder.state !== 'inactive') recorder.stop();
-  recorder = null;
-}
-
-function startRecorder() {
-  if (!stream || !wsOpen) return;
-  stopRecorder();
-  signaling.send({ type: 'recording-start' });
-  // Bitrate tracks the actual capture size — a flat rate turns 4K into mush.
-  // Tiers rather than a formula: encoder efficiency is not linear in pixels.
-  // Read from the track, not the select: the camera may have degraded the
-  // request to whatever it could actually do.
-  const { width = 1280, height = 720 } =
-    stream.getVideoTracks()[0]?.getSettings() ?? {};
-  const px = width * height;
-  recorder = new MediaRecorder(stream, {
-    mimeType: pickMime(),
-    videoBitsPerSecond:
-      px >= 3840 * 2160 * 0.9 ? 16_000_000
-        : px >= 2560 * 1440 * 0.9 ? 8_000_000
-          : 4_000_000,
-  });
-  recorder.ondataavailable = (ev) => {
-    if (ev.data.size > 0) bulk.sendBinary(ev.data);
-  };
-  recorder.start(1000);
-  applyPaused();
 }
 
 // ---------------------------------------------------------------------------
@@ -433,7 +267,7 @@ async function setFacing(next) {
   facing = next;
   try {
     await startCamera();
-    startRecorder();
+    tx.startRecorder();
   } catch (err) {
     facing = prev;
     setStatus(`camera switch failed: ${err.message}`);
@@ -447,9 +281,9 @@ async function setMic(on) {
   micBtn.classList.toggle('active', audioEnabled);
   try {
     await startCamera();
-    startRecorder();
+    tx.startRecorder();
     // Adding/removing an audio track changes the track set — renegotiate.
-    if (pc) await startCall();
+    if (tx.hasCall()) await tx.startCall();
   } catch (err) {
     audioEnabled = !audioEnabled;
     micBtn.classList.toggle('active', audioEnabled);
@@ -465,7 +299,7 @@ async function setResolution(value) {
   resSelect.value = value;
   try {
     await startCamera();
-    startRecorder();
+    tx.startRecorder();
   } catch (err) {
     appliedRes = prev;
     resSelect.value = prev;
@@ -476,12 +310,12 @@ async function setResolution(value) {
 
 // Cut the current recording and open the next one server-side.
 async function newRecording() {
-  if (!wsOpen) {
+  if (!tx.socketOpen) {
     setStatus('not connected — recording unchanged');
     return;
   }
   if (!(await ensureCamera())) return;
-  startRecorder();
+  tx.startRecorder();
   // Recording is invisible from the client, so acknowledge the tap.
   recBtn.classList.add('active');
   setTimeout(() => recBtn.classList.remove('active'), 400);
@@ -529,13 +363,9 @@ resSelect.onchange = () => setResolution(resSelect.value);
 
 // ---------------------------------------------------------------------------
 // Recovery. Backgrounding the browser can cost us the camera, the recorder and
-// the peer connection at once, and none of them come back on their own.
-function ensureRecorder() {
-  // A parked recorder (paused feed) is still a live recording — only a dead
-  // one needs replacing.
-  if (!recorder || recorder.state === 'inactive') startRecorder();
-}
-
+// the peer connection at once, and none of them come back on their own. This
+// half stays here rather than in media-tx.js: it is about reacquiring the
+// *camera*, which is the one thing the XR client does not have.
 async function restartCall() {
   // A request arriving mid-restart must not be dropped: the state it reacted
   // to (a viewer appearing, say) may already have been read past.
@@ -551,19 +381,15 @@ async function restartCall() {
       if (!(await ensureCamera())) break;
       // New tracks mean the recorder is bound to a dead stream; otherwise the
       // running recording is still good and worth keeping in one file.
-      if (cameraWasLive) ensureRecorder();
-      else startRecorder();
-      if (wsOpen && viewerWaiting) await startCall();
+      if (cameraWasLive) tx.ensureRecorder();
+      else tx.startRecorder();
+      if (tx.socketOpen && tx.viewerWaiting) await tx.startCall();
     } while (restartQueued);
   } catch (err) {
     setStatus(`restart failed: ${err.message}`);
   } finally {
     restarting = false;
   }
-}
-
-function pcDead() {
-  return !pc || ['failed', 'disconnected', 'closed'].includes(pc.connectionState);
 }
 
 async function keepAwake() {
@@ -578,8 +404,8 @@ async function keepAwake() {
 document.addEventListener('visibilitychange', async () => {
   if (document.visibilityState !== 'visible') return;
   keepAwake();
-  if (!streamLive() || pcDead()) await restartCall();
-  else ensureRecorder();
+  if (!streamLive() || tx.pcDead()) await restartCall();
+  else tx.ensureRecorder();
 });
 
 (async () => {
@@ -597,8 +423,8 @@ document.addEventListener('visibilitychange', async () => {
   if (d.settings?.pose !== false) setPose(true);
   if (!(await ensureCamera())) return;
   keepAwake();
-  ensureRecorder();
-  if (viewerWaiting) await startCall();
+  tx.ensureRecorder();
+  if (tx.viewerWaiting) await tx.startCall();
   // Camera labels are only readable once camera permission has been granted, so
   // the fingerprint stored before the camera opened is weaker than the one
   // available now. Re-announcing strengthens the *next* recovery, which is the
