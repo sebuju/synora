@@ -158,7 +158,12 @@ const POSE_MIN_GAIN = 0.08;
 const POSE_MIN_DT_S = 0.02;       // two fixes in the same millisecond happen
 const POSE_MAX_DT_MS = 1000;      // older than this, restart rather than blend
 // How long a pose may be carried on velocity alone once the tags go away.
-const POSE_EXTRAPOLATE_MS = 1200;
+// Matched to ALIGN_FRESH_MS: 2 s is already this system's answer to "how stale
+// may a fix be and still be reported". Constant velocity with no drift
+// correction, so the ceiling is an error budget — ~2 m of guess at walking
+// pace — not a tracking claim. Never permanent state: every 'dead' report
+// carries mapSafe:false.
+const POSE_EXTRAPOLATE_MS = 2000;
 const JUMP_HISTORY_TTL_MS = 1500;
 const JUMP_CONFIRM_SAMPLES = 3;
 
@@ -2571,7 +2576,7 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
       }
 
       // No tags in view: carry the pose on the track's own velocity rather
-      // than going dark. Good for well under a second — it is dead reckoning
+      // than going dark. Bounded by POSE_EXTRAPOLATE_MS — it is dead reckoning
       // with no drift correction, so it is reported as such and never used to
       // extend the survey.
       if (!pose && clientId !== undefined) {
