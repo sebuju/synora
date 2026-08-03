@@ -251,11 +251,7 @@ function splitArc(obs, P) {
     out.push({ width: Math.round(Math.min(width, actual)), n: win.length, gap: dist3(a, b) * 1000 });
     if (width >= span) break;
   }
-  // The interval itself, not just its width. A caller telling someone where to
-  // walk needs to know which *end* of the covered arc they are standing at —
-  // the width alone cannot say whether the next step should be left or right.
-  // Unwrapped, so az1 >= az0 and the pair may run past ±180.
-  return { span, az0, az1, rows: out };
+  return { span, rows: out };
 }
 
 // Does this track describe a fixed 3D point? Returns { ok, P, ... } and, when
@@ -292,20 +288,18 @@ function qualifyTrack(obs, opts = {}) {
   // arc gate, which are exactly the ones neither has anything to say about.
   const err = rms(P, obs);
 
-  // The narrow-arc case carries its interval too: this is *the* case the
-  // guidance reads, since a candidate that has not qualified is almost always
-  // one that has not been walked around far enough yet.
+  // The narrow-arc rejection carries its estimate, unlike the ones above it:
+  // this is *the* case the candidate view and the walk guidance read, since a
+  // candidate that has not qualified is almost always one that has not been
+  // walked around far enough yet.
   if (sa.span < minArcDeg) {
-    return {
-      ok: false, reason: 'narrow-arc', P, n: obs.length, err,
-      span: sa.span, az0: sa.az0, az1: sa.az1,
-    };
+    return { ok: false, reason: 'narrow-arc', P, n: obs.length, err, span: sa.span };
   }
 
   const first = sa.rows[0];
   const last = sa.rows[sa.rows.length - 1];
   const out = {
-    P, n: obs.length, span: sa.span, az0: sa.az0, az1: sa.az1, err,
+    P, n: obs.length, span: sa.span, err,
     first: first.gap, last: last.gap, ok: false,
   };
   if (!(err < maxRmsPx)) return { ...out, reason: 'rms' };
