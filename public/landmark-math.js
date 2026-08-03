@@ -350,7 +350,34 @@ function qualifyTrack(obs, opts = {}) {
 // Iteration count is small because the seed makes every hypothesis a good one:
 // at 30% contamination and 6-point subsets, a clean subset turns up in ~12% of
 // draws, so ~40 rounds is already well past 99% confidence.
-const TRIM_PX = 5;
+// The outlier gate, and the number the whole landmark lock turned out to hang
+// on. 5 -> 8 on measurement (.plans/landmark-lock.md §3a-3c), because at 5 it
+// was rejecting *correct* landmarks rather than mismatches:
+//
+//   - 100% of failed landmark solves failed here — the RANSAC always found a
+//     hypothesis, matched 17-30 landmarks, and the trim left 9-11 against a
+//     15-landmark count gate. `no-hypothesis` never occurred, on any journal.
+//   - Residuals taken through a *tag-derived* pose on the track a landmark is
+//     already aliased to — no nearest-point pairing in them, so a position
+//     error cannot hide behind a mismatch — put **45-55% of correctly
+//     corresponded landmarks past 5 px**. That is exactly the observed inlier
+//     ratio (56% on solved frames, 29% on failed).
+//   - No founding property predicts which landmarks miss: Spearman of
+//     per-landmark miss against arc, refinement rms, sighting count and
+//     provenance depth is flat (|rho| <= 0.31, mostly < 0.1) on all three
+//     journals. So this could not be fixed by founding harder.
+//
+// Measured effect, live pipeline, count gate unchanged at 15: solves 12 -> 32,
+// 15 -> 42, 14 -> 18, 13 -> 78 across four journals, with confirmations and
+// mapSafe rescues rising with them.
+//
+// Two things hold it here. Past 8 the takeover tail reopens — trim 10 gives a
+// 664 mm takeover on one journal and 906 mm on another, past the 0.5 m line
+// the plan draws — and loosening the trim lets a near-coplanar cloud walk into
+// the mirrored basin, which is what SOLVE_JUMP_DEG in landmarks.js exists to
+// catch (it must be in place before this number moves; it was measured
+// catching exactly one flip at this setting).
+const TRIM_PX = 8;
 const RANSAC_ROUNDS = 48;
 const RANSAC_SUBSET = 6;
 // Hypotheses only need to be close enough to count inliers with; the winner is
@@ -414,7 +441,11 @@ function solveLandmarkPose(objPts, imgPts, K, seed, opts = {}) {
       bestPose = sol;
     }
   }
-  if (!bestPose) return null;
+  // Why a solve came back empty is invisible from the outside — null means
+  // "no hypothesis" and "the trim ate the count" alike — and those are two
+  // different failures with two different fixes. `onReject` is how the replay
+  // trace tells them apart; nothing live passes one.
+  if (!bestPose) { opts.onReject?.({ why: 'no-hypothesis', inliers: 0, n, rms: null }); return null; }
 
   // Local optimization: refit on everything the winning hypothesis agrees with,
   // which is what turns a minimal-subset fit into an accurate one.
@@ -425,7 +456,10 @@ function solveLandmarkPose(objPts, imgPts, K, seed, opts = {}) {
   for (let i = 0; i < n; i++) {
     if (res[i] <= trimPx) { obj.push(objPts[i]); img.push(imgPts[i]); inlierIdx.push(i); }
   }
-  if (obj.length < minPoints) return null;
+  if (obj.length < minPoints) {
+    opts.onReject?.({ why: 'trimmed', inliers: obj.length, n, rms: bestPose.rms });
+    return null;
+  }
   const refined = LM_PM.solvePose(obj, img, K, bestPose) ?? bestPose;
   // Per-inlier residuals under the *refined* pose, not the hypothesis they were
   // selected by — the caller weights rays by them, and the hypothesis residuals

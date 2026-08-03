@@ -30,7 +30,7 @@ const {
   undistort, reproject, qualifyTrack, clusterLandmarks, solveLandmarkPose,
   azimuthOf, dist3, MIN_OBS, MAX_RMS_PX, MIN_ARC_DEG,
 } = require('./public/landmark-math.js');
-const { quatAngleDeg, transformPoint } = require('./public/pose-math.js');
+const { quatAngleDeg, transformPoint, se3Invert } = require('./public/pose-math.js');
 
 // Observations kept per track. The split-arc test wants the arc, not every
 // sighting along it, and an unbounded ring would grow without limit on a track
@@ -246,10 +246,42 @@ const LANDMARK_MAX_JITTER_MM = 25;
 // chosen before it is. Swept by replay against `lmCheck` journal lines.
 const LANDMARK_AGREE_M = 0.10;
 const LANDMARK_AGREE_DEG = 5;
+// The takeover's own inlier bar, well above MIN_LANDMARKS_FOR_FIX.
+//
+// A takeover is the only place a landmark solve *overrules* ARCore, so it is
+// the only place that needs a bar above "the solve is usable at all". Measured
+// across 205 solves on four walks (.plans/landmark-lock.md §3f), the inlier
+// count is the *only* property that predicts a solve's disagreement with the
+// carry in every walk — Spearman -0.52, -0.48, -0.08, -0.74. Everything
+// geometric that looked promising pooled turned out to be sorting walks rather
+// than solves and changed sign between them: the inlier set's lateral extent
+// (+0.07 / -0.42 / -0.17 / -0.80), its depth spread along the view axis
+// (+0.33 / -0.22 / -0.37 / -0.10), the ratio of the two (flat, -0.012 pooled),
+// the distance to the nearest inlier (-0.11 / +0.64 / +0.30 / +0.65).
+//
+// At 30 the walk that jittered worst keeps 12 takeovers of 72 and the
+// survivors' median disagreement halves, 228 -> 126 mm. Rescue, confirmation
+// and carve rays are deliberately left at MIN_LANDMARKS_FOR_FIX: those turn on
+// *agreement*, where a solve that matches the carry is corroboration and does
+// not need to be trusted on its own.
+//
+// What this is not: proof that the surviving takeovers are more *accurate*.
+// Fewer, smaller disagreements is partly tautological — a solve nearer the
+// carry is nearer the thing it is measured against. The arbiter is the tag: at
+// a re-acquire, does the taken-over pose sit closer to the tag fix than the
+// carry does? That is the test that reverted the carry correction (94 mm
+// against 65 mm) and it is the one to run on the next walk.
+const LANDMARK_TAKEOVER_MIN_INLIERS = 30;
 // The solve's own quality bar for confirmation, on top of agreement: TRIM_PX
 // inliers with an rms at the trim ceiling are a fit on the edge of its own
 // outlier gate.
-const LANDMARK_CONFIRM_RMS_PX = 5;
+//
+// It therefore *tracks* TRIM_PX and is not an independent number — moved 5 ->
+// 8 with it. Left behind, it silently throws away everything the looser trim
+// buys: measured, a trim of 10 against a confirmation ceiling of 5 produced 52
+// solves and **six** confirmations on one journal, i.e. solves that can never
+// rescue mapSafe, never carry landmark rays, and never take over the pose.
+const LANDMARK_CONFIRM_RMS_PX = 8;
 // Whether an agreeing solve may rescue mapSafe (stage 2). The cross-check and
 // its journal line run regardless — this only gates the consequence, so the
 // measurement stage can ship with the behaviour off.
@@ -273,6 +305,71 @@ const SOLVE_CHAIN_MAX = 10;
 // frames and the deep frames had nothing to match at all. The half-tolerance
 // gates on the chained branch in check() are the compounding-drift defence.
 const LANDMARK_MAX_DEPTH = 1;
+
+// A carry correction was built here and **reverted on measurement** — the note
+// stays because the reasoning that justified it is a trap worth marking.
+//
+// The takeover replaces one frame's reported pose and keeps nothing, so on the
+// 16:17 03/08 walk it fired 72 times in 72 isolated runs, the reported pose
+// stepping 235 mm between frames where ARCore's carry stepped 13 mm. The
+// offsets looked like real drift: mean 205 mm against 73 mm of scatter, and
+// two takeovers three seconds apart agreeing to 49 mm while measuring 228 mm.
+// So the correction was kept and applied to later tag-less frames, and the
+// saw-tooth duly went (235 -> 55 mm).
+//
+// **Consistency is not evidence of drift.** A systematic offset between the
+// landmark map's frame and the tag frame is exactly as consistent, and the
+// only measurement that separates them is against the tags themselves. At a
+// tag re-acquire, taken over 129 boundaries: the corrected pose sat **94 mm**
+// from the tag fix and the *raw ARCore carry* sat **65 mm** from it. The
+// correction moved the reported pose away from the only datum in the room.
+//
+// The suspected cause is founding depth. Most founding runs on alignFresh
+// *carried* poses (332 of 416 fed frames on that walk, LANDMARK_MAX_DEPTH 1),
+// which bakes the carry's own drift into the map's coordinates, so a solve
+// against that map answers in the drifted frame rather than the room's. The
+// holdout, which builds only from tag-confirmed frames, localizes to 23-31 mm
+// — the same map founded the other way does not have the offset.
+//
+// Do not re-add a correction until a solve is shown to agree with the tags
+// better than the carry does. That is the measurement, and it is one line of
+// replay away.
+
+// A solve may *correct* the pose it started from. It may not replace it.
+//
+// The mirror flip is what this exists for, and it is the same failure
+// MIN_LANDMARKS_FOR_FIX guards: landmarks are bearing-only points that tend to
+// be near-coplanar, which is the weak PnP configuration, and there is no
+// per-point ambiguity to resolve because a point carries no orientation. The
+// seeded refinement is supposed to make the flip unreachable — a local refiner
+// converges to the basin it started next to — but with enough slightly-wrong
+// correspondences admitted it can walk out of that basin, and then it reports
+// a confident pose in the mirrored one.
+//
+// Measured (.plans/landmark-lock.md §3b): at TRIM_PX 6 and above the 01:20
+// holdout's worst case goes 219 mm / 3.59° -> 2701 mm / 96.04°. The
+// discriminator is *orientation*, not distance: legitimate drift catches on
+// every recorded journal top out at 7.6° and 906 mm, so 20° sits 2.6x above
+// the worst honest correction and 5x below the flip, while position separates
+// only 3x and does the lesser share of the work.
+//
+// It lives in check(), against **this frame's carried pose**, and not in
+// solve() against solve's own seed. That was tried and is wrong: solve()'s
+// seed is only temporally adjacent when the caller's frames are — the holdout
+// strides its frames and chains through refusals, so its seed is metres away
+// by construction and every honest solve read as a jump (0 of 52 localized).
+// check() already computes exactly the right comparison for its own agreement
+// test: `dp` and `deg` against the ARCore pose for that very frame. The mirror
+// is not a subtle disagreement, it is 2.7 m and 96° of one.
+//
+// A jumped fix is not merely refused, it is kept out of the chain: solve() has
+// already made it `lastPose`, and a flipped answer left there re-seeds every
+// later frame into the mirrored basin.
+//
+// Inert on every recorded journal at today's gates: it is a tripwire for the
+// looser trim the sweep wants, not a change to what solves now.
+const SOLVE_JUMP_M = 1.5;
+const SOLVE_JUMP_DEG = 20;
 
 // ARCore's depth map as a *prior*, self-measured against the tags. This is
 // the depth ban's demand made continuous: every detected tag carries both a
@@ -489,7 +586,18 @@ const norm180 = (d) => {
   return a - 180;
 };
 
-function createLandmarks({ log = () => {}, opts = {} } = {}) {
+// The solve path's own account of itself, for replay only (`--trace`). The
+// lock's failure is a *dynamics* problem — supply is there, the solve is not —
+// and no counter that survives a whole session can distinguish "few points
+// were aliased when the frame arrived", "adoption could not claim them" and
+// "the solver threw them out". Those are three different fixes, so the trace
+// records the count at each step of one frame's arithmetic rather than the
+// total at the end.
+//
+// Absent a `trace` callback nothing here computes, allocates or writes: the
+// probe is the one expensive part (it projects the whole refined map a second
+// time) and the live path must never pay for it.
+function createLandmarks({ log = () => {}, opts = {}, trace = null } = {}) {
   // Tunable so replay can sweep them against a recorded session rather than
   // having them argued: the trade is coverage against the chance of adopting
   // the wrong feature, and only a real room can say where it sits.
@@ -508,6 +616,26 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
   // never wired it — a sweep of the single most consequential number in the
   // module silently measured the default every time.
   const minLandmarks = opts.minLandmarks ?? MIN_LANDMARKS_FOR_FIX;
+  // The RANSAC's outlier gate, and the confirmation gate that shadows it.
+  // Swept together *and* separately on purpose: raising the trim without
+  // raising the confirmation ceiling buys solves that can never be confirmed
+  // (an inlier set admitted at 10 px has an rms past a 5 px confirm bar), and
+  // raising both at once measures two things with one number. The trace
+  // measured why this is the knob: 45-55% of *correctly corresponded* refined
+  // landmarks already reproject past 5 px under a tag-derived pose, so the
+  // trim is rejecting real landmarks, not mismatches (.plans/landmark-lock.md
+  // §3a).
+  const trimPx = opts.trimPx ?? null;
+  const confirmRms = opts.confirmRms ?? LANDMARK_CONFIRM_RMS_PX;
+  // Swept, and disableable (Infinity), so the sweep can measure what the gate
+  // is worth rather than assuming it.
+  // The chained-founding cap, swept for the same question as --max-found-depth:
+  // whether founding under anything but a tag-confirmed pose is what puts the
+  // landmark map in a frame of its own.
+  const landmarkMaxDepth = opts.landmarkMaxDepth ?? LANDMARK_MAX_DEPTH;
+  const takeoverMinInliers = opts.takeoverMinInliers ?? LANDMARK_TAKEOVER_MIN_INLIERS;
+  const jumpM = opts.jumpM ?? SOLVE_JUMP_M;
+  const jumpDeg = opts.jumpDeg ?? SOLVE_JUMP_DEG;
   // The mint-block radius around an existing landmark is one voxel, not
   // CLUSTER_M: 5 cm is smaller than the quantisation itself, so at the depth
   // noise a consensus estimate of a feature an existing landmark already
@@ -559,6 +687,10 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
   const stats = {
     observed: 0, qualified: 0, qualifiedDepth: 0, qualifiedConsensus: 0,
     solved: 0, refused: 0,
+    // Solves thrown out by the jump gate. The number that says whether a
+    // looser trim is buying mirrors: it should be 0 at today's gates and
+    // non-zero exactly where the holdout's worst case blows up.
+    jumped: 0,
     // Consensus landmarks dropped by the staleness gate early in their life —
     // the ghost tripwire from the plan: a depth mixture that slipped past the
     // viewpoint gate does not survive reprojection against tag-derived poses
@@ -588,6 +720,13 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
         groups: new Map(), bestSpan: 0, nextLandmark: 1, nextGroup: 1,
         depthErrs: [], depthTrustedWas: false,
         voxels: new Map(), reportSeq: 0, sinceSolve: Infinity,
+        // Trace-only. `reportSeq` cannot serve as the trace clock: it is bumped
+        // by consensusObserve, which runs on founding frames and never on the
+        // tag-less ones the trace is about, so it stands still across exactly
+        // the stretch being measured. `aliasBorn` dates each adoption so alias
+        // age is readable, `traceLive` is last traced frame's aliased points so
+        // deaths are countable.
+        traceSeq: 0, aliasBorn: new Map(), traceLive: new Set(),
       };
       clients.set(clientId, s);
     }
@@ -614,6 +753,9 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
       s.voxels.clear();
       s.reportSeq = 0;
       s.sinceSolve = Infinity;
+      s.traceSeq = 0;
+      s.aliasBorn.clear();
+      s.traceLive.clear();
     }
     return s;
   }
@@ -816,8 +958,13 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
   // The 3D seed correction described at SEED_PAIR_M. Returns a corrected
   // pose, or the seed unchanged when depth is untrusted, the frame carries
   // too little depth, or the pairing is too thin to say anything.
-  function depthSeedCorrect(s, pts, K, seed) {
+  // `out`, when given (trace only), records what the correction had to work
+  // with: the seed is the first thing on the path from a drifted carry to a
+  // px match, and a pairing too thin to move it leaves every radius
+  // downstream aiming at the wrong place.
+  function depthSeedCorrect(s, pts, K, seed, out = null) {
     const ds = depthState(s);
+    if (out) { out.seedPairs = 0; out.seedShiftMm = 0; }
     if (!ds.trusted) return seed;
     const deltas = [];
     for (const p of pts) {
@@ -836,11 +983,13 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
       }
       if (best) deltas.push([best.P[0] - P[0], best.P[1] - P[1], best.P[2] - P[2]]);
     }
+    if (out) out.seedPairs = deltas.length;
     if (deltas.length < SEED_PAIR_MIN) return seed;
     const shift = [0, 1, 2].map((k) =>
       deltas.map((d) => d[k]).sort((a, b) => a - b)[deltas.length >> 1]);
     // A correction the size of the room is not drift, it is a wrong pairing.
     if (Math.hypot(...shift) > SEED_SHIFT_MAX_M) return seed;
+    if (out) out.seedShiftMm = Math.round(Math.hypot(...shift) * 1000);
     return { p: seed.p.map((v, k) => v + shift[k]), q: seed.q };
   }
 
@@ -1036,6 +1185,7 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
       // Close enough, and clearly closer than anything else it could be.
       if (!best || bestD > radius || secondD < bestD * reassocMargin) continue;
       s.alias.set(best.id, landmarkId);
+      if (trace) s.aliasBorn.set(best.id, s.traceSeq);
       taken.add(landmarkId);
       added++;
     }
@@ -1043,9 +1193,156 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
 
     if (s.alias.size > ALIAS_CAP) {
       const ids = [...s.alias.keys()].sort((x, y) => x - y);
-      for (const id of ids.slice(0, ids.length - ALIAS_CAP)) s.alias.delete(id);
+      for (const id of ids.slice(0, ids.length - ALIAS_CAP)) {
+        s.alias.delete(id);
+        if (trace) s.aliasBorn.delete(id);
+      }
     }
     return added;
+  }
+
+  // What one frame looked like at the instant its solve began, stated in the
+  // terms the four hypotheses are (.plans/landmark-lock.md §4). Reads state
+  // and writes none of the product's: if running the probe moved a single
+  // count downstream it would have stopped measuring the thing that ships.
+  //
+  // Called *before* this frame's reassociate — so the alias figures are what
+  // the frame arrived carrying, which is the churn question — and *after* the
+  // seed correction, so the projections are the ones adoption will really use.
+  const median = (xs) => (xs.length
+    ? xs.slice().sort((a, b) => a - b)[xs.length >> 1] : null);
+
+  // How far a projection may miss and still be paired for the shift/scatter
+  // decomposition below. Wider than any adoption radius on purpose: the
+  // question is what the miss *is*, so a window that only admits near misses
+  // would answer it by assumption.
+  const SHIFT_WINDOW_PX = 60;
+
+  function traceProbe(s, pts, pose, K, intr) {
+    const r = {
+      refined: 0, inView: 0, near: 0, nearFree: 0, blockedByCoarse: 0, bestPxP50: '',
+      aliasTotal: s.alias.size, aliasLive: 0, aliasLiveRefined: 0,
+      aliasAgeP50: '', aliasDied: 0,
+      shiftPairs: 0, shiftPxU: '', shiftPxV: '', scatterPx: '',
+    };
+    // In *frame*, not merely in front of the camera: reproject only refuses
+    // points behind it, and a landmark projecting 3000 px off the edge is not
+    // supply by any reading.
+    const w = intr?.w ?? null;
+    const h = intr?.h ?? null;
+    const live = new Set();
+    const ages = [];
+    // The same set reassociate builds: a landmark some point in this frame is
+    // already looking at is not on offer, and a point already aliased is not a
+    // candidate.
+    const taken = new Set();
+    for (const p of pts) {
+      const id = s.alias.get(p.id);
+      if (id === undefined) continue;
+      taken.add(id);
+      live.add(p.id);
+      r.aliasLive++;
+      const a = s.landmarks.get(id);
+      if (a && !a.coarse) r.aliasLiveRefined++;
+      const born = s.aliasBorn.get(p.id);
+      if (born !== undefined) ages.push(s.traceSeq - born);
+    }
+    for (const id of s.traceLive) if (!live.has(id)) r.aliasDied++;
+    s.traceLive = live;
+    const bests = [];
+    const offs = [];
+    for (const [landmarkId, a] of s.landmarks) {
+      if (a.coarse) continue;
+      r.refined++;
+      const q = reproject(a.P, { K, pose });
+      if (!q) continue;
+      if (w !== null && (q[0] < 0 || q[0] > w || q[1] < 0 || q[1] > h)) continue;
+      r.inView++;
+      let bestD = Infinity;
+      let best = null;
+      let freeD = Infinity;
+      for (const p of pts) {
+        const d = Math.hypot(p.u - q[0], p.v - q[1]);
+        if (d < bestD) { bestD = d; best = p; }
+        if (d < freeD && !s.alias.has(p.id)) freeD = d;
+      }
+      if (!best) continue;
+      bests.push(bestD);
+      // Per landmark, so the miss can be correlated against how it was
+      // founded (arc, count, rms) — a per-frame median can say projections
+      // miss by 20 px but not which landmarks miss, and the gate to move is
+      // whichever founding property predicts it.
+      if (a.traceMiss) a.traceMiss.push(bestD); else a.traceMiss = [bestD];
+      if (bestD <= SHIFT_WINDOW_PX) offs.push([best.u - q[0], best.v - q[1]]);
+      if (bestD > solveReassocPx) continue;
+      r.near++;
+      if (!taken.has(landmarkId) && freeD <= solveReassocPx) r.nearFree++;
+      // H2: the point this landmark would claim is already spoken for by a
+      // *coarse* one. The priority ordering cannot undo that — it orders one
+      // pass, and an alias formed on an earlier frame is never revisited.
+      const on = s.alias.get(best.id);
+      const held = on === undefined ? null : s.landmarks.get(on);
+      if (held?.coarse) r.blockedByCoarse++;
+    }
+    // The decomposition the whole H3-vs-seed question turns on, and the one
+    // thing a distance median cannot say: a *rigid* offset shared by every
+    // landmark in frame is the seed still being wrong (rotation especially —
+    // depthSeedCorrect only ever moves translation), while scatter about that
+    // offset is the landmarks' own position error. Same argument, and the same
+    // arithmetic, as the 9 px shared-shift measurement that established coarse
+    // landmarks were noisy rather than mis-seeded.
+    if (offs.length) {
+      const mu = median(offs.map((o) => o[0]));
+      const mv = median(offs.map((o) => o[1]));
+      r.shiftPairs = offs.length;
+      r.shiftPxU = Math.round(mu * 10) / 10;
+      r.shiftPxV = Math.round(mv * 10) / 10;
+      const sc = median(offs.map((o) => Math.hypot(o[0] - mu, o[1] - mv)));
+      r.scatterPx = Math.round(sc * 10) / 10;
+    }
+    const bp = median(bests);
+    if (bp !== null) r.bestPxP50 = Math.round(bp * 10) / 10;
+    const ap = median(ages);
+    if (ap !== null) r.aliasAgeP50 = ap;
+    return r;
+  }
+
+  // How the inlier set is arranged in space, which the count gate says nothing
+  // about. Fifteen landmarks spread over two walls and fifteen on one patch of
+  // one wall are the same number and not the same measurement: a single
+  // near-coplanar cluster cannot constrain the camera along its own view
+  // direction, which is exactly the geometry `.plans/depth-consensus-
+  // landmarks.md` refused the few-pair depth fix over.
+  //
+  // Reported in the *camera's* frame, because that is where the weakness
+  // lives: `depthM` is the spread along the view axis — small means one wall,
+  // and it is the number a spread gate would test — while `lateralM` is the
+  // spread across the frame, which is large even for the degenerate case.
+  // Trace only.
+  function spreadOf(seen, pose) {
+    if (!seen.length) return null;
+    const inv = se3Invert(pose);
+    let x0 = Infinity; let x1 = -Infinity;
+    let y0 = Infinity; let y1 = -Infinity;
+    let z0 = Infinity; let z1 = -Infinity;
+    for (const l of seen) {
+      const c = transformPoint(inv, l.P);
+      if (c[0] < x0) x0 = c[0];
+      if (c[0] > x1) x1 = c[0];
+      if (c[1] < y0) y0 = c[1];
+      if (c[1] > y1) y1 = c[1];
+      if (c[2] < z0) z0 = c[2];
+      if (c[2] > z1) z1 = c[2];
+    }
+    const r2 = (v) => Math.round(v * 100) / 100;
+    return {
+      lateralM: r2(Math.hypot(x1 - x0, y1 - y0)),
+      depthM: r2(z1 - z0),
+      nearM: r2(z0),
+      // The ratio the gate would most likely be written on: a wall seen
+      // head-on has depth spread near zero however wide it is.
+      depthRatio: r2((z1 - z0) / Math.max(Math.hypot(x1 - x0, y1 - y0), 0.01)),
+    };
   }
 
   return {
@@ -1201,6 +1498,7 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
           depth: foundDepth, src: viaDepth ? 'depth' : 'arc',
         });
         s.alias.set(p.id, landmarkId);
+        if (trace) s.aliasBorn.set(p.id, s.traceSeq);
         s.tracks.delete(p.id);
         stats.qualified++;
         if (viaDepth) stats.qualifiedDepth++;
@@ -1218,15 +1516,22 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
     // the solver is a seeded refinement, which is what keeps it out of the
     // mirrored basin that a seedless solve on near-coplanar bearing-only points
     // falls into.
-    solve(clientId, points, gen, intr, seed = null) {
+    // `note` is trace-only: what the *caller* knows and this does not (which
+    // seed it handed over, how long since the last solve), merged into the row.
+    solve(clientId, points, gen, intr, seed = null, note = null) {
       if (!points?.length || gen == null) return null;
       const K = modelOf(intr);
       if (!K) return null;
       const s = clients.get(clientId);
       if (!s || s.gen !== gen) return null;
-      if (s.landmarks.size < minLandmarks) return null;
+      // The row is emitted on every exit below, the early ones included, so a
+      // trace has one line per eligible frame — a CSV whose denominator was
+      // silently the solve *attempts* would answer the wrong question.
+      const row = trace ? { seq: s.traceSeq++, pts: points.length, ...(note ?? {}) } : null;
+      const emit = (outcome, extra) => { if (row) trace({ ...row, ...extra, outcome }); };
+      if (s.landmarks.size < minLandmarks) { emit('no-map'); return null; }
       const carried = seed ?? s.lastPose;
-      if (!carried) { stats.refused++; return null; }
+      if (!carried) { stats.refused++; emit('no-seed'); return null; }
 
       // Undistorted here as at observe, so one convention holds across the
       // whole module and the solver is told the camera is ideal. Depth rides
@@ -1237,11 +1542,14 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
       });
       // The carried seed may have drifted past any adoption radius — measure
       // and remove the bulk of the drift in 3D before asking for px matches.
-      const from = depthSeedCorrect(s, pts, K, carried);
+      const from = depthSeedCorrect(s, pts, K, carried, row);
+      // The probe reads the frame as it arrived — before the reassociate below
+      // changes it.
+      if (row) Object.assign(row, traceProbe(s, pts, from, K, intr));
       // Recognise what can be recognised from the seed *before* solving, which
       // is what makes a long tag-less stretch survivable: without it the
       // matchable set only ever shrinks as tracks die.
-      reassociate(s, pts, from, K);
+      const adoptedTight = reassociate(s, pts, from, K);
 
       const match = () => {
         const objs = [];
@@ -1263,6 +1571,12 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
         return { objs, imgs, metas };
       };
       let { objs, imgs, metas } = match();
+      if (row) {
+        row.adoptedTight = adoptedTight;
+        row.matchedTight = objs.length;
+        row.adoptedWide = 0;
+        row.matchedWide = objs.length;
+      }
       // Escalation, not replacement: 3 px assumes the projecting pose is tag-
       // accurate, and a carried pose whose drift is the very thing being
       // measured reprojects in-view landmarks ~26 px off — at 3 px the
@@ -1273,19 +1587,29 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
       // localized frames). The uniqueness margin and the RANSAC are what keep
       // the wide pass honest; swept via --solve-reassoc-px.
       if (objs.length < minLandmarks && solveReassocPx > reassocPx) {
-        reassociate(s, pts, from, K, solveReassocPx);
+        const adoptedWide = reassociate(s, pts, from, K, solveReassocPx);
         ({ objs, imgs, metas } = match());
+        if (row) { row.adoptedWide = adoptedWide; row.matchedWide = objs.length; }
       }
       if (objs.length < minLandmarks) {
         stats.refused++;
+        emit('refused');
         return null;
       }
 
+      // `onReject` costs nothing when untraced and is the only way to tell a
+      // solve the trim ate from one that never found a hypothesis — H4's two
+      // halves have different fixes.
       const sol = solveLandmarkPose(objs, imgs,
         { fx: K.fx, fy: K.fy, cx: K.cx, cy: K.cy }, from,
-        { minPoints: minLandmarks });
+        {
+          minPoints: minLandmarks,
+          ...(trimPx === null ? {} : { trimPx }),
+          onReject: row ? (d) => Object.assign(row, d) : undefined,
+        });
       if (!sol || !sol.p.every(Number.isFinite)) {
         stats.refused++;
+        emit('failed');
         return null;
       }
       const pose = { p: sol.p, q: sol.q };
@@ -1305,6 +1629,10 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
         const a = s.landmarks.get(l.id);
         return Math.max(d, a?.depth ?? 0);
       }, 0);
+      emit('solved', {
+        inliers: sol.inliers, n: sol.n, rms: Math.round(sol.rms * 100) / 100,
+        ...(row ? spreadOf(seen, pose) : null),
+      });
       return { pose, n: sol.n, inliers: sol.inliers, rms: sol.rms, seen, maxDepth };
     },
 
@@ -1329,19 +1657,52 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
     check(clientId, entry) {
       const { msg, room } = entry;
       if (entry.kind !== 'xr-pose' || !room?.pose || room.quality !== 'tracked') return null;
+      const s = clients.get(clientId);
       if (!msg.points?.length || msg.gen == null) return null;
+      // The ARCore carry: the cross-check's comparison reference, and what a
+      // replay re-derives from when a takeover has replaced the reported pose.
+      const carried = room.pose;
       // Chained seed: while solves keep landing, each one seeds the next —
       // re-seeding from the carried pose every frame handed the matcher the
       // very drift the previous solve had just measured away. The carry is
-      // still the comparison reference below, only the *seed* chains.
-      const s = clients.get(clientId);
+      // still the comparison reference below, only the *seed* chains. The seed
+      // is the *corrected* carry where there is one, which is the same
+      // argument the chain itself rests on: a seed nearer the truth adopts
+      // more. It cannot flatter the agreement test, which uses `carried`.
       const chain = s && s.gen === msg.gen && s.sinceSolve <= SOLVE_CHAIN_MAX;
       const fix = this.solve(clientId, msg.points, msg.gen,
-        msg.intr ?? msg.intrinsics, chain ? null : room.pose);
-      if (s && s.gen === msg.gen) s.sinceSolve = fix ? 0 : s.sinceSolve + 1;
-      if (!fix) return null;
-      const dp = dist3(fix.pose.p, room.pose.p);
-      const deg = quatAngleDeg(fix.pose.q, room.pose.q);
+        msg.intr ?? msg.intrinsics, chain ? null : room.pose,
+        // Trace only: which seed this frame got, and how long the lock has
+        // been gone. Read here because sinceSolve is updated on the next line.
+        trace && s ? {
+          seedSrc: chain ? 'chain' : 'carry',
+          sinceSolve: Number.isFinite(s.sinceSolve) ? s.sinceSolve : -1,
+        } : null);
+      const live = s && s.gen === msg.gen;
+      // A frame that did not solve, and a frame whose solve was thrown out as
+      // a mirror, are the same thing to the chain — so the counter is only
+      // reset once the fix has survived the tripwire below.
+      if (!fix) {
+        if (live) s.sinceSolve += 1;
+        return null;
+      }
+      const dp = dist3(fix.pose.p, carried.p);
+      const deg = quatAngleDeg(fix.pose.q, carried.q);
+      // The mirror tripwire (SOLVE_JUMP_M / _DEG). Refused before anything is
+      // journalled, and rolled out of the chain: solve() has already written
+      // this pose to `lastPose`, so leaving it there would re-seed every later
+      // frame from the reflection.
+      if (dp > jumpM || deg > jumpDeg) {
+        stats.jumped++;
+        if (live) {
+          s.lastPose = room.pose;
+          s.sinceSolve += 1;
+        }
+        log(`Landmarks: client ${clientId} solve refused as a mirror jump — `
+          + `${Math.round(dp * 1000)} mm, ${deg.toFixed(1)}° from the carried pose`);
+        return null;
+      }
+      if (live) s.sinceSolve = 0;
       // Journalled whether or not it changes anything: this line is the
       // measurement LANDMARK_AGREE_M is chosen from, and the replay's parity
       // check reads it back.
@@ -1352,7 +1713,7 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
       const agrees = dp <= LANDMARK_AGREE_M && deg <= LANDMARK_AGREE_DEG;
       const confirmed = agrees && room.quarantined !== true
         && fix.inliers >= minLandmarks
-        && fix.rms <= LANDMARK_CONFIRM_RMS_PX;
+        && fix.rms <= confirmRms;
       if (confirmed && LANDMARK_RESCUE && room.mapSafe !== true) {
         room.mapSafe = true;
         room.safeVia = 'landmark';
@@ -1377,9 +1738,9 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
         // the risk of landmarks agreeing with a drift they were founded
         // during.
         const depth = 1 + (fix.maxDepth ?? 0);
-        if (depth <= LANDMARK_MAX_DEPTH
+        if (depth <= landmarkMaxDepth
           && dp <= LANDMARK_AGREE_M / 2 && deg <= LANDMARK_AGREE_DEG / 2
-          && fix.rms <= LANDMARK_CONFIRM_RMS_PX / 2) {
+          && fix.rms <= confirmRms / 2) {
           this.observe(clientId, msg.points, msg.gen, fix.pose,
             msg.intr ?? msg.intrinsics, depth);
           chained = true;
@@ -1395,12 +1756,17 @@ function createLandmarks({ log = () => {}, opts = {} } = {}) {
       // bars, and disagreement still refuses the carve. Quarantine vetoes:
       // the landmarks were founded in the very room frame quarantine says is
       // in doubt.
+      // `strong` is the bar for *overruling* ARCore, and it is deliberately
+      // higher than the bar for a usable solve: LANDMARK_TAKEOVER_MIN_INLIERS,
+      // not minLandmarks. The count is the only property that predicted a
+      // solve's disagreement in every walk measured, and this is the one place
+      // a solve is trusted alone rather than as corroboration.
       const strong = room.quarantined !== true
-        && fix.inliers >= minLandmarks
-        && fix.rms <= LANDMARK_CONFIRM_RMS_PX;
+        && fix.inliers >= takeoverMinInliers
+        && fix.rms <= confirmRms;
       let took = false;
       if (strong && !agrees) {
-        room.carried = room.pose;
+        room.carried = carried;
         room.pose = fix.pose;
         room.lmFix = true;
         took = true;
@@ -1731,6 +2097,7 @@ module.exports = {
   createLandmarks, landmarkGate, foundingDepth,
   MIN_LANDMARKS_FOR_FIX, LANDMARK_MAX_JITTER_MM,
   LANDMARK_AGREE_M, LANDMARK_AGREE_DEG, LANDMARK_CONFIRM_RMS_PX,
+  LANDMARK_TAKEOVER_MIN_INLIERS,
   LANDMARK_RESCUE, LANDMARK_MAX_DEPTH,
   OBS_RING, QUALIFY_EVERY, dist3,
 };
