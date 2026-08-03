@@ -565,7 +565,19 @@ body.paused #pauseOverlay {
   overflow: hidden;
   min-height: 200px;
   cursor: pointer;
-  /* Lets .vwrap size itself in cq units for the 90/270 swap below. */
+  /* The tile is as tall as the feed makes it, and has to say so itself: the
+     wrapper below is out of flow, so there is nothing left inside the tile to
+     give it a height, and it would otherwise stand at min-height with a 4K
+     portrait feed letterboxed into a 200px strip. The ratio is the feed's own
+     (updateFeedShape), swapped while a quarter-turn correction is in force —
+     a phone held sideways earns a landscape tile, which is the shape its
+     picture is actually going to be. The fallback holds until the first frame
+     arrives with a size to read; min-height stays under it as the floor for a
+     tile that never gets one. */
+  aspect-ratio: var(--feed-ar, 3 / 4);
+  /* Lets .vwrap size itself in cq units for the 90/270 swap below. Sound
+     alongside the ratio above: the column gives the width, the ratio makes
+     the height definite from it, and neither asks the contents anything. */
   container-type: size;
 }
 

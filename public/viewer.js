@@ -208,6 +208,9 @@ function updatePoseLabel(clientId, msg) {
     dev.wrap.classList.toggle('rot90', roll === 90);
     dev.wrap.classList.toggle('rot180', roll === 180);
     dev.wrap.classList.toggle('rot270', roll === 270);
+    // A quarter turn swaps which way round the picture ends up, so the tile
+    // holding the old shape would letterbox the corrected feed inside it.
+    updateFeedShape(dev);
   }
   clearTimeout(dev.poseLabelTimer);
   if (tags.length) {
@@ -283,9 +286,28 @@ function ensureDevice(clientId) {
     poseLabelTimer: null, appliedRoll: 0,
   };
   devices.set(clientId, dev);
+  // `resize` as well as `loadedmetadata`: a client that changes capture
+  // resolution keeps the same track, and the tile would hold the shape of the
+  // size it started with.
+  video.addEventListener('loadedmetadata', () => updateFeedShape(dev));
+  video.addEventListener('resize', () => updateFeedShape(dev));
   updateCamBtn(clientId, dev);
   updateStatus();
   return dev;
+}
+
+// The tile's own shape, from the feed's — see .tile in style.css for why the
+// tile has to be told rather than sized by what is in it. Called from both
+// things that can change the answer: the frame size, and whether a quarter
+// turn is being taken out of it.
+function updateFeedShape(dev) {
+  const vw = dev.video.videoWidth;
+  const vh = dev.video.videoHeight;
+  // No frame yet: leave the fallback ratio standing rather than writing a
+  // 0/0 nobody can render.
+  if (!vw || !vh) return;
+  const rotated = dev.appliedRoll === 90 || dev.appliedRoll === 270;
+  dev.tile.style.setProperty('--feed-ar', rotated ? `${vh} / ${vw}` : `${vw} / ${vh}`);
 }
 
 function removeDevice(clientId) {
