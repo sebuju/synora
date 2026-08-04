@@ -22,6 +22,7 @@ const posePipeline = (() => {
   let bulk = null;       // bulk-upload socket — recorder chunks
   let clockSync = null;
   let onState = null;    // notifies client.js so it can report client-state
+  let publish = null;    // where an observation goes; default is signaling.send
 
   let enabled = false;
   let paused = false;
@@ -97,7 +98,13 @@ const posePipeline = (() => {
     lastTargetMs = res.targetMs ?? config.poseRateMs;
     detectMeter.roll(performance.now());
     detectMeter.bump('dets', res.timing.total);
-    signaling.send({
+    // One observation message, two askers. /client sends it as `pose` and the
+    // server surveys, journals and rosters off it; /audio-lab sends the same
+    // fields as `locate` and the server only answers where that is. The seam is
+    // here rather than a second detect loop on the other page: the camera, the
+    // worker, the intrinsics ladder and the cost meter are the expensive parts
+    // and there must be exactly one of them.
+    (publish || ((m) => signaling.send(m)))({
       type: 'pose',
       t: clockSync.synced ? clockSync.at(res.at) : null,
       w: res.w,
@@ -344,6 +351,7 @@ const posePipeline = (() => {
       bulk = opts.bulk;
       clockSync = opts.clockSync;
       onState = opts.onState;
+      publish = opts.publish || null;
     },
     setRoomPose(msg) {
       roomPose = msg;

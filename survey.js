@@ -2752,6 +2752,48 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
       scheduleSave();
     },
 
+    // Where am I, against the map as it already stands. The read-only half of
+    // handlePose: same observation building, same mirror pick, same joint-then-
+    // fused solve, and then it stops. No bootstrap, no maintainSurvey, no
+    // lastFix, no smoothing, no journal, no roster.
+    //
+    // That restraint is the whole point. The caller is /audio-lab, which is not
+    // a capture device: it shares a phone with the real client, it has no
+    // calibration of its own to stand behind, and it points a camera at one
+    // corner of the room from a chair for three minutes. Letting that extend or
+    // refine the survey would put a measurement rig's convenience above the map
+    // every other page depends on. It asks the map a question; it does not get
+    // to change the answer.
+    //
+    // Unsmoothed and unlatched on purpose too: a stationary caller wanting a
+    // steady number should average many of these, where the scatter is visible,
+    // rather than be handed a filtered one whose steadiness says nothing about
+    // whether it is in the right place.
+    locate(msg) {
+      const obs = buildObs(msg.tags);
+      const known = obs.filter((o) => markers.has(o.id));
+      if (!known.length) return { pose: null, reason: 'no mapped tag in view', nTags: 0 };
+      // No previous fix to disambiguate against — this path deliberately keeps
+      // no per-caller state — so the mirror is resolved on margin alone. Callers
+      // average; a flipped solve scatters and a run of them does not.
+      pickSolutions(known, null);
+      const pose = jointCameraPose(known, msg.intr ?? msg.intrinsics)
+        ?? fuseCameraPose(known);
+      if (!pose) return { pose: null, reason: 'no solve', nTags: known.length };
+      const strong = known.filter(
+        (o) => o.err <= GOOD_MAX_ERR_PX && o.dist <= GOOD_MAX_DIST_M);
+      return {
+        pose,
+        nTags: known.length,
+        ids: known.map((o) => o.id),
+        // Same threshold the survey uses to decide a sighting is worth acting
+        // on, reported rather than enforced: a rig standing still can afford to
+        // wait for good looks, but only if it is told which ones were.
+        quality: strong.length ? 'good' : 'weak',
+        errPx: known.reduce((a, o) => a + o.err, 0) / known.length,
+      };
+    },
+
     // One tag's record, for the dashboard drawer. Asked for rather than pushed:
     // a history is hundreds of samples and only the one card a reader has open
     // needs it, while the marker map goes out several times a second to every

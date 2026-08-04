@@ -1402,6 +1402,18 @@ function handleSignal(ws, msg) {
     if (ws.role === 'audio-lab') journalAudio(ws, msg.entry);
     return;
   }
+  // /audio-lab asking where it is standing. Deliberately NOT the `pose` branch
+  // below: that one surveys, journals, feeds the walls grid and the landmark
+  // map, and pushes a roster the measurement rig has no business appearing in.
+  // This one reads the map and answers. The rig gets a room-frame position
+  // without becoming a client — which is the same line `audio-lab` already
+  // holds on settings and recording.
+  if (msg.type === 'locate') {
+    if (ws.role !== 'audio-lab') return;
+    const r = survey.locate(msg);
+    send(ws, { type: 'located', seq: msg.seq ?? null, ...r });
+    return;
+  }
   if (msg.type === 'ping') {
     // Liveness probe: clients treat an unanswered ping as a dead socket. The
     // reply carries viewer presence so a client that missed a viewer-ready
