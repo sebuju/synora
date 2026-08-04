@@ -37,6 +37,11 @@ function usage(err) {
     + '  [--neg-scale X] [--neg-jitter-mm N] [--neg-tracked-scale X] [--neg-min-px N]\n'
     + '  [--neg-max-dist X] [--neg-min-views N] [--l-blocked X] [--ded-on X]\n'
     + '  [--ded-max-cells N]\n'
+    + '  [--l-retract X] [--visited-farside-min N] [--retract-on X]\n'
+    + '  [--retract-min-views N] [--motion-max-mps X] [--remap-m X]\n'
+    + '  [--map-sweeps N]  extra setMarkerMap() calls after the journal, to let\n'
+    + '                    retraction (rate-limited to one step per cell per call,\n'
+    + '                    same as live) converge for measurement — default 20\n'
     + '  [--out grid.json] [--pgm grid.pgm] [--ascii]');
   process.exit(1);
 }
@@ -89,9 +94,21 @@ if (flags['neg-min-views'] !== undefined) opts.negMinViews = Number(flags['neg-m
 if (flags['l-blocked'] !== undefined) opts.lBlocked = Number(flags['l-blocked']);
 if (flags['ded-on'] !== undefined) opts.dedOn = Number(flags['ded-on']);
 if (flags['ded-max-cells'] !== undefined) opts.dedMaxCells = Number(flags['ded-max-cells']);
+if (flags['l-retract'] !== undefined) opts.lRetract = Number(flags['l-retract']);
+if (flags['visited-farside-min'] !== undefined) {
+  opts.visitedFarsideMin = Number(flags['visited-farside-min']);
+}
+if (flags['retract-on'] !== undefined) opts.retractOn = Number(flags['retract-on']);
+if (flags['retract-min-views'] !== undefined) {
+  opts.retractMinViews = Number(flags['retract-min-views']);
+}
+if (flags['motion-max-mps'] !== undefined) opts.motionMaxMps = Number(flags['motion-max-mps']);
+if (flags['remap-m'] !== undefined) opts.remapM = Number(flags['remap-m']);
 for (const [k, v] of Object.entries(opts)) {
   if (!Number.isFinite(v)) usage(`bad number for ${k}`);
 }
+const mapSweeps = flags['map-sweeps'] !== undefined ? Number(flags['map-sweeps']) : 20;
+if (!Number.isFinite(mapSweeps) || mapSweeps < 0) usage('bad number for --map-sweeps');
 
 const walls = createWalls({
   log: (m) => console.log(m),
@@ -113,6 +130,14 @@ for (const { entry } of readJournals(journals, { onMeta, onError: usage })) {
   lines++;
   walls.handleReport(entry);
 }
+// Plane retraction (step 4) runs inside setMarkerMap and applies at most one
+// step per eligible cell per call — live, that call recurs roughly every
+// REFINE_PUSH_MS while a client refines against the map, so a session's worth
+// of live re-invocations already happened by the time the journal ends. A
+// one-shot replay never calls setMarkerMap a second time, so without these
+// extra calls the offline measurement would understate what the same corpus
+// does live by two orders of magnitude — this is exactly what converges it.
+for (let i = 0; i < mapSweeps; i++) walls.setMarkerMap(markerMap);
 
 const s = walls.stats();
 const segs = walls.getWalls();
@@ -135,15 +160,29 @@ if (s.landmarkRays.total) {
 console.log(`veto:   ${s.veto.waived}/${s.veto.planes} plane-test(s) waived`
   + ' (wedge crossed the plane — the sighting outranks the assumed reach)');
 console.log(`grid: ${s.cells} cells touched, ${s.free} free / ${s.occ} occupied`
-  + ` (${s.freeM2} m² attested free)`);
-// Groups whose far side holds landmark-ray endpoints are excluded from the
+  + ` (${s.freeM2} m² attested free), ${s.visited} visited`);
+if (mapSweeps) console.log(`(${mapSweeps} extra setMarkerMap() sweep(s) applied after the `
+  + 'journal to converge plane retraction — see --map-sweeps)');
+// Groups whose far side has proven itself surveyed are excluded from the
 // headline — a surveyed far side makes behind-cells legitimate — but the
-// exclusion is always said out loud, never silent.
+// exclusion, and which of the three proofs fired, is always said out loud,
+// never silent.
 const farSide = walls.leaksDetail().filter((g) => g.farSide);
+const farReason = (g) => {
+  const why = [];
+  if (g.visited >= (opts.visitedFarsideMin ?? DEFAULTS.visitedFarsideMin)) {
+    why.push(`${g.visited} visits`);
+  }
+  if (g.landmarkEnds >= (opts.landmarkFarsideMin ?? DEFAULTS.landmarkFarsideMin)) {
+    why.push(`${g.landmarkEnds} landmark ends`);
+  }
+  if (g.tagsBehind) why.push(`${g.tagsBehind} tag(s) of its own`);
+  return why.join(', ') || 'farSide';
+};
 console.log(`leaks: ${leakCount} free cell(s) behind a tag plane`
   + ' (wrong by construction — this is the gate-quality headline)'
-  + farSide.map((g) => ` (+${g.count} behind far-side-surveyed [${g.ids.join(' ')}] — excluded)`)
-    .join(''));
+  + farSide.map((g) => ` (+${g.count} behind far-side-surveyed [${g.ids.join(' ')}] `
+    + `[${farReason(g)}] — excluded)`).join(''));
 const sb = walls.sightBlocks();
 console.log(`sight: ${sb.blocked}/${sb.total} proven line(s) of sight crossed by an emitted wall`
   + ` (a wall standing where you looked through — must be 0); ${sb.grazed} grazed`
@@ -159,6 +198,13 @@ console.log(`deduced: ${s.deduced} cell(s)`
   + walls.deducedLeaksDetail().filter((g) => g.farSide)
     .map((g) => ` (+${g.count} behind far-side-surveyed [${g.ids.join(' ')}] — excluded)`)
     .join(''));
+// Retraction: two independent sources, no silent cap. `applied` moved a
+// cell's log-odds; `refusedVisited` is the visited-cell refusal working as
+// designed, not a rejection to chase away by loosening a gate.
+console.log(`retract plane: ${s.retract.plane.applied}/${s.retract.plane.offered} applied`
+  + ` (${s.retract.plane.refusedVisited} refused — visited)`);
+console.log(`retract neg:   ${s.retract.neg.applied}/${s.retract.neg.offered} applied`
+  + ` (${s.retract.neg.refusedVisited} refused — visited)`);
 // leaks cannot see a wall eaten too *short* — it only looks inside the emitted
 // span. The audit is the other direction: attested extent vs what survived the
 // opening test, and how much of the loss came from behind-evidence too shallow

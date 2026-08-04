@@ -267,11 +267,68 @@ const DEFAULTS = {
   // (islandFillCells — speckle and wedge shadows) but still furniture-sized
   // read as deduced obstructions; bigger than this is unexplored world.
   dedMaxCells: 1200,       // ≈ 4.3 m² at 6 cm cells
+
+  // Retraction: the answer to "carved free space is permanent" being wrong
+  // the moment a gate that let bad evidence through gets fixed, or a survey
+  // the module never anticipated (a second room past a tagged wall) gets
+  // walked. A cell that has taken enough contradicting evidence is nudged
+  // back toward unknown by the same bump()/hysteresis machinery that already
+  // promotes and demotes — there is no new state machine, only a new source
+  // of L.
+  //
+  // Two independent sources feed it, both measured against the full 190-
+  // journal corpus before being tuned (.claude/rules/walls.md has the
+  // numbers): a free cell sitting behind a mapped tag's own plane, inside
+  // that tag's bracket, is wrong by construction unless the far side has
+  // its own evidence of being a real room; and a blocked-ray deposit earns
+  // retraction trust when the frame it came from could not have been
+  // motion-blurred — either because it decoded a *different* tag (proving
+  // the detector was working on that image) or because the camera was
+  // reported as stationary during it (proving nothing could have smeared).
+  // Either alone leaves too small a population to matter; the union does
+  // not.
+  //
+  // On by default: this is new evidence, not a hypothesis to gate behind a
+  // replay sweep first — tune retractOn/retractMinViews/motionMaxMps by
+  // replay same as everything else here, but the feature itself ships live.
+  lRetract: 0.3,
+  // Direct-visit twin of landmarkFarsideMin (which stays inert until
+  // landmarkScale is ever turned on). A camera fix accepted at the carve's
+  // own mapSafe+'good' gate, whose own cell falls in a plane's behind-band,
+  // is not an inference about the far side — it is a person standing there.
+  // Measured on the corpus: the far side behind tags 2/6 carries 390 such
+  // visits, comfortably above this bar; the thin sliver behind tag 3 (a
+  // planeEvidence clustering bug, not a second room — see walls.md) carries
+  // 12, correctly below it.
+  visitedFarsideMin: 60,
+  // Retraction promotion bar and viewpoint-diversity requirement for the
+  // negative-evidence source, stricter than dedOn/negMinViews (which only
+  // gate a read-time display class, never a state change) because retraction
+  // actually moves a cell's log-odds.
+  retractOn: 1.5,
+  retractMinViews: 4,
+  // Below this speed the camera could not have produced a motion-blurred
+  // frame regardless of tag count, so a zero-tag report earns the same
+  // retraction trust a partial detection does. Well under ordinary walking
+  // pace (~1.2-1.5 m/s); measured against the corpus at a few candidate
+  // values, this is the point where the eligible (non-visited) population
+  // stops being dominated by noise from the first report after a reset.
+  motionMaxMps: 0.3,
+  // How far a mapped tag must move — measured against its own last-
+  // invalidation baseline, not the immediately previous setMarkerMap call —
+  // before sights recorded against its old position are treated as stale.
+  // REFINE_ALPHA drift arrives as dozens of sub-centimetre nudges that would
+  // never trip a step-to-step diff (measured on this room's own
+  // markers-history.json: 204 mm net drift on tag 3 over 153 samples, no
+  // single step past 10 mm), so the trigger must accumulate against a fixed
+  // point. Same order of magnitude as survey.js's RESEED_DISAGREE_M — the
+  // same "this is not noise" threshold for the same drift.
+  remapM: 0.15,
 };
 
 const GRID_HALF = 2048;
 const GRID_SIDE = GRID_HALF * 2;
-const WALLS_VERSION = 3;
+const WALLS_VERSION = 4;
 const SAVE_DEBOUNCE_MS = 10000;
 
 function createWalls({ file, log, markerSizeM, opts } = {}) {
@@ -301,6 +358,27 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
   // by construction the day the room past the wall is actually walked.
   // Persisted with the grid: the claim is as durable as the carves it earned.
   const landmarkEnds = new Set();
+  // Cells the camera itself has occupied, at the same mapSafe+'good' gate the
+  // carve uses. Direct proof a person stood there — the discriminator
+  // leaksDetail()'s far-side test needed and landmarkEnds alone could not
+  // give it (landmark rays ship inert). Persisted with the grid.
+  const visited = new Set();
+  // Camera position + timestamp of the most recent report with a pose,
+  // regardless of its quality — the retraction trust test needs to know how
+  // fast the camera was moving *during* a frame, which its own displacement
+  // since the last observed pose approximates. Not persisted: velocity does
+  // not survive a restart any better than viewpoint identity does (vp is
+  // reset to -1 on load for the same reason), and under-counting a session's
+  // first report is the only cost.
+  let lastCam = null;
+  let lastAt = null;
+  // id -> { p, q } as of the last time that tag's sights were invalidated.
+  // Diffed against the *live* map on every setMarkerMap call, not against
+  // the previous call — REFINE_ALPHA drift arrives as many sub-centimetre
+  // nudges that never individually cross remapM. Not persisted: an empty
+  // baseline on restart just seeds silently on the first setMarkerMap call,
+  // the same as a first sighting.
+  const remapBaseline = new Map();
   // id -> { id, p, q, hops, clippedTo } from the survey's map; walls never
   // touch a raw tvec — the mapped position is the endpoint, or nothing is.
   const tags = new Map();
@@ -329,6 +407,13 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
     // Veto plane-tests offered to a wedge vs. waived by the sight-line rule —
     // the only cheap window into a decision taken per cell.
     veto: { planes: 0, waived: 0 },
+    // Retraction, by source: plane = the wrong-by-construction sweep (step 4),
+    // neg = the blocked-ray union-trust source. `refusedVisited` is counted
+    // separately from `applied` — it is the gate working, not a rejection.
+    retract: {
+      plane: { offered: 0, applied: 0, refusedVisited: 0 },
+      neg: { offered: 0, applied: 0, refusedVisited: 0 },
+    },
   };
   function reject(bucket, reason) {
     bucket.rej[reason] = (bucket.rej[reason] || 0) + 1;
@@ -339,7 +424,16 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
   }
 
   function newCell() {
-    return { L: 0, views: 0, vp: -1, state: 0, Ln: 0, nviews: 0, nvp: -1 };
+    return {
+      L: 0, views: 0, vp: -1, state: 0, Ln: 0, nviews: 0, nvp: -1,
+      // Retraction-trust twin of Ln/nviews: fed only when the frame proves
+      // itself blur-safe (see negativePass), never from an ordinary blocked
+      // ray. Structurally separate so a cell's read-time "deduced" class
+      // (Ln/nviews) and its eligibility to be un-carved (Lr/rviews) cannot
+      // be conflated — deduced is a display hint, retraction is a state
+      // change, and the second needs to be held to a higher standard.
+      Lr: 0, rviews: 0, rvp: -1,
+    };
   }
 
   function bump(ix, iz, full, repeat, vpKey, touched) {
@@ -384,6 +478,68 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
       c.nviews++;
     }
     c.Ln = Math.min(C.lnMax, c.Ln + (fresh ? full : repeat));
+  }
+
+  // The retraction-trust twin of bumpNeg: fed only when the caller has
+  // already established the frame could not have been motion-blurred (see
+  // negativePass). Kept in its own Lr/rviews slot rather than reusing
+  // Ln/nviews — the read-time "deduced" class must not silently get pickier
+  // or looser depending on what retraction happens to be tuned to, and
+  // retraction must not fire off frames the deduced class would have
+  // accepted but this test would not have trusted.
+  // `dedup` is a Set private to one negativePass call, not the shared
+  // `touched` bumpNeg reads and writes — bumpNeg already claims a cell's one
+  // deposit for the report the moment it runs, so sharing that set here would
+  // make this function see every cell as already taken and deposit nothing.
+  // It still must not land on a cell that took *positive* evidence this
+  // frame; the caller checks that before calling in, using a snapshot taken
+  // before bumpNeg had a chance to mutate `touched`.
+  function bumpRetractTrust(ix, iz, full, repeat, vpKey, dedup) {
+    if (ix < -GRID_HALF || ix >= GRID_HALF || iz < -GRID_HALF || iz >= GRID_HALF) return;
+    const key = cellKey(ix, iz);
+    if (dedup.has(key)) return;
+    dedup.add(key);
+    let c = cells.get(key);
+    if (!c) cells.set(key, c = newCell());
+    const fresh = c.rvp !== vpKey;
+    if (fresh) {
+      c.rvp = vpKey;
+      c.rviews++;
+    }
+    c.Lr = Math.min(C.lnMax, c.Lr + (fresh ? full : repeat));
+    // Acted on immediately, the same way a positive ray's bump() is: no
+    // separate one-shot latch, because retract()'s own clamp+hysteresis is
+    // already what bounds repeated calls, exactly as it bounds repeated
+    // positive evidence. A cell below the bar simply keeps taking evidence
+    // report after report until (if ever) it crosses.
+    if (c.Lr >= C.retractOn && c.rviews >= C.retractMinViews) {
+      retract(key, 1, stats.retract.neg);
+    }
+  }
+
+  // The one path by which "permanent" free (or occupied) evidence may be
+  // overturned. Same clamp and the same demote-then-promote hysteresis as
+  // bump() — retraction is not a new state machine, only a new source of L —
+  // so free -> unknown -> occupied falls out of code that already exists.
+  // Refuses a visited cell outright: a cell the camera has actually occupied
+  // must never be retracted by anything, however strong the contradicting
+  // evidence looks, or a person standing in a room could carve their own
+  // floor away.
+  function retract(key, w, bucket) {
+    if (!(C.lRetract > 0)) return;
+    bucket.offered++;
+    if (visited.has(key)) { bucket.refusedVisited++; return; }
+    let c = cells.get(key);
+    if (!c) cells.set(key, c = newCell());
+    c.L = Math.min(C.lMax, Math.max(C.lMin, c.L + C.lRetract * w));
+    if (c.state === 1 && c.L > C.freeOff) c.state = 0;
+    if (c.state === 2 && c.L < C.occOff) c.state = 0;
+    if (c.state === 0) {
+      if (c.L >= C.occOn) c.state = 2;
+      else if (c.L <= C.freeOn && c.views >= C.minViews) c.state = 1;
+      else if (c.L <= C.freeOnSingle) c.state = 1;
+    }
+    bucket.applied++;
   }
 
   // Rasterise the triangle (x0,z0)-a-b onto the grid: every cell whose centre
@@ -747,6 +903,20 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
       return reject(stats.reports, 'mapSafe'), false;
     }
     const cam = room.pose.p;
+    // How fast the camera moved since the last report with a pose — the
+    // retraction-trust test's motion signal. Computed on every report
+    // reaching here, not only accepted ones: a frame's own blur risk depends
+    // on its displacement from the frame before it, whatever that frame's
+    // quality turned out to be. A gap past 2 s (a restart, a tracking loss,
+    // or a jump between two unrelated recorded sessions during a replay) is
+    // not a measurement — velocity is left unknown rather than computed
+    // across it.
+    const dtS = lastAt !== null ? (entry.at - lastAt) / 1000 : null;
+    const velMps = dtS !== null && dtS > 0 && dtS < 2
+      ? Math.hypot(cam[0] - lastCam[0], cam[1] - lastCam[1], cam[2] - lastCam[2]) / dtS
+      : null;
+    lastCam = cam;
+    lastAt = entry.at;
     // One frame = one facing (the camera's own forward, not per-tag bearing),
     // so a single multi-tag frame is still exactly one viewpoint.
     const fwd = quatRotate(room.pose.q, [0, 0, 1]);
@@ -779,7 +949,7 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
       // pass wants: the detector provably swept the whole frame and found
       // nothing, exactly the "looking straight at where the tag should be"
       // case. negativePass carries its own, stricter gates.
-      const deposits = negativePass(entry, cam, vpKey, touched);
+      const deposits = negativePass(entry, cam, vpKey, touched, velMps);
       if ((carved || deposits) && file) scheduleSave();
       return carved > 0 || deposits > 0;
     }
@@ -792,7 +962,11 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
     // Cells that took direct ray evidence this report, so the frustum pass
     // below cannot hand the same cell the same observation twice.
     const touched = new Set();
-    // The camera is somewhere, and that somewhere is not inside a wall.
+    // The camera is somewhere, and that somewhere is not inside a wall — and
+    // at this same gate (mapSafe, 'good', jitter accepted), direct proof a
+    // person stood there, for leaksDetail()'s far-side test and retraction's
+    // own refusal.
+    visited.add(cellKey(Math.floor(cam[0] / C.cellM), Math.floor(cam[2] / C.cellM)));
     bump(Math.floor(cam[0] / C.cellM), Math.floor(cam[2] / C.cellM),
       C.lMiss * scale, C.lMissRepeat * scale, vpKey, touched);
 
@@ -861,7 +1035,7 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
     // Negative evidence last, sharing `touched` as a reader: every cell the
     // wedges just carved provably had clear line of sight this frame, and a
     // blocked ray must not claim it in the same breath.
-    negativePass(entry, cam, vpKey, touched);
+    negativePass(entry, cam, vpKey, touched, velMps);
     if (file) scheduleSave();
     return true;   // the camera cell took evidence even if every ray failed
   }
@@ -884,7 +1058,7 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
   // tightens that to ~1.5 s, so sustained blind staring stops contributing
   // on its own — and past the first frames it would be same-viewpoint
   // repeat evidence anyway.
-  function negativePass(entry, cam, vpKey, touched) {
+  function negativePass(entry, cam, vpKey, touched, velMps) {
     const { msg, room } = entry;
     if (!(C.negScale > 0) || entry.kind !== 'xr-pose') return 0;
     const K = msg.intrinsics;
@@ -916,6 +1090,23 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
     b.accepted++;
     const negW = C.negScale * (zeroTag ? C.negTrackedScale : 1)
       / (1 + (j.jitterMm / C.softJitterMm) ** 2);
+    // Retraction trust: a blocked ray from this frame is safe to feed toward
+    // un-carving a cell only if the frame proves itself blur-safe two ways —
+    // decoding a *different* tag proves the detector was working on this
+    // image regardless of motion, or the camera being near-stationary proves
+    // nothing could have smeared regardless of tag count. Neither alone
+    // covers enough of the corpus to matter (measured, .claude/rules/
+    // walls.md); the union does. Ordinary blocked-ray evidence (Ln, the
+    // deduced-class feed below) needs neither — it only ever adds a read-time
+    // display hint, never moves a cell's state.
+    const retractTrust = !zeroTag || (velMps !== null && velMps <= C.motionMaxMps);
+    // A cell that took positive evidence *before* this pass ran must not take
+    // a retraction-trust deposit either, same contradiction rule bumpNeg
+    // applies via `touched` — snapshotted now because bumpNeg is about to
+    // start adding to `touched` itself, and that must not read back as "had
+    // positive evidence" a moment later.
+    const positiveTouched = retractTrust ? new Set(touched) : null;
+    const retractDedup = retractTrust ? new Set() : null;
     const inv = se3Invert(room.pose);
     const seen = new Set((msg.tags || []).map((t) => t.id));
     const edgeX = C.negEdgeFrac * K.w;
@@ -964,9 +1155,12 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
       const ux = -rv[0] / horiz;
       const uz = -rv[2] / horiz;
       for (let s = C.negCamClearM; s <= horiz - C.standoffM; s += C.cellM / 2) {
-        bumpNeg(Math.floor((cam[0] + ux * s) / C.cellM),
-          Math.floor((cam[2] + uz * s) / C.cellM),
-          C.lBlocked * negW, C.lBlockedRepeat * negW, vpKey, touched);
+        const ix = Math.floor((cam[0] + ux * s) / C.cellM);
+        const iz = Math.floor((cam[2] + uz * s) / C.cellM);
+        if (retractTrust && !positiveTouched.has(cellKey(ix, iz))) {
+          bumpRetractTrust(ix, iz, C.lBlocked * negW, C.lBlockedRepeat * negW, vpKey, retractDedup);
+        }
+        bumpNeg(ix, iz, C.lBlocked * negW, C.lBlockedRepeat * negW, vpKey, touched);
       }
       tb.deposited++;
       tb.wSum += negW;
@@ -1018,6 +1212,33 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
   }
 
   function setMarkerMap(map) {
+    // Before anything else: has any tag moved far enough, against its own
+    // last-invalidation baseline (never the previous call — see remapM's
+    // comment in DEFAULTS), that the sights recorded against its old position
+    // are now a claim about somewhere the tag is not? A sight is a geometric
+    // line of sight to a specific tag id — recorded per-viewpoint in
+    // `recordSight` — and once that tag has moved, the claim is stale.
+    let anyRemapped = false;
+    for (const m of (map && map.markers) || []) {
+      const base = remapBaseline.get(m.id);
+      if (!base) {
+        remapBaseline.set(m.id, { p: m.p, q: m.q });
+        continue;
+      }
+      const d = Math.hypot(m.p[0] - base.p[0], m.p[1] - base.p[1], m.p[2] - base.p[2]);
+      if (d <= C.remapM) continue;
+      for (const [key, s] of sights) if (s.id === m.id) sights.delete(key);
+      remapBaseline.set(m.id, { p: m.p, q: m.q });
+      anyRemapped = true;
+      log(`Walls: tag ${m.id} moved ${Math.round(d * 1000)} mm since it was last mapped — `
+        + 'dropping its recorded sight lines');
+    }
+    // A tag no longer in the map cannot be diffed against next time it
+    // reappears (it would be a different sighting of a possibly different
+    // knock) — forgotten the same way a hand-removed tag's history is.
+    const liveIds = new Set(((map && map.markers) || []).map((m) => m.id));
+    for (const id of remapBaseline.keys()) if (!liveIds.has(id)) remapBaseline.delete(id);
+
     tags.clear();
     anchorId = map ? map.anchorId : null;
     for (const m of (map && map.markers) || []) {
@@ -1027,6 +1248,58 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
       });
     }
     planeGroups = null;
+    // Wedges may be re-earned against the corrected map — harmless if nothing
+    // actually changed, costing one re-carve per viewpoint.
+    if (anyRemapped) frustumVps.clear();
+    // Bounded sweep over every plane, not only a moved one's: cheap (a
+    // handful of groups, each a pass over already-known live-free cells) and
+    // it is the same sweep a plain mapChanged with no remap should also run —
+    // a plane can stop being wrong-by-construction on its own the moment the
+    // room past it gets walked, with no tag needing to move at all.
+    retractPlaneSweep();
+  }
+
+  // Step 4: a free cell behind a mapped plane, inside the group's own tag
+  // bracket, on a far side that is not farSide (planeFarSide) and not
+  // visited (retract() itself refuses that), is wrong by construction — the
+  // same interval clipFor already refuses to let the veto waive. One
+  // retract() per cell per call; repeated calls (this runs on every
+  // marker-map change) are what let a wrongly-carved area heal in a ramp
+  // bounded by how often the map actually changes, not all at once.
+  //
+  // Scans raw state===1 cells, not liveFree()'s region-filtered set: this
+  // runs on every setMarkerMap (up to survey.js's REFINE_PUSH_MS cadence per
+  // refining client) and must not pay for a full 8-connected flood fill that
+  // often — planeFarSide() needs no cell set at all, so the only cost here is
+  // one pass over the grid's already-free cells.
+  function retractPlaneSweep() {
+    if (!(C.lRetract > 0)) return;
+    if (!planeGroups) planeGroups = groupPlanes();
+    for (const group of planeGroups) {
+      const frame = planeFrameOf(group);
+      if (!frame) continue;
+      const { sOf, frontOf } = frame;
+      const half = tagSizeM / 2;
+      let lo = Infinity;
+      let hi = -Infinity;
+      for (const m of group) {
+        const s = sOf(m.p[0], m.p[2]);
+        lo = Math.min(lo, s - half);
+        hi = Math.max(hi, s + half);
+      }
+      if (planeFarSide(group, frame, lo, hi).farSide) continue;
+      for (const [key, c] of cells) {
+        if (c.state !== 1) continue;
+        const ix = Math.floor(key / GRID_SIDE) - GRID_HALF;
+        const iz = (key % GRID_SIDE) - GRID_HALF;
+        const cx = (ix + 0.5) * C.cellM;
+        const cz = (iz + 0.5) * C.cellM;
+        if (frontOf(cx, cz) > -C.cellM) continue;
+        const s = sOf(cx, cz);
+        if (s < lo || s > hi) continue;
+        retract(key, 1, stats.retract.plane);
+      }
+    }
   }
 
   // Same semantics as the survey's datumDepth: the anchor is the datum
@@ -1269,34 +1542,47 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
     // first (same gap rule as the extents), then excise every front bin inside
     // one. A cluster below openingMinCells is noise, not an opening — that is
     // this reader's own island gate.
+    //
+    // Depth, not just cell count, decides what a cluster *is*. A doorway is
+    // space you can walk *through*, so its evidence reaches the far end of the
+    // band; pose noise bleeding a few centimetres across the very wall the
+    // rays were carved up to is a sliver hugging the plane. Counting cells
+    // cannot tell them apart — a sliver one row deep spanning 0.72 m still has
+    // 27 cells and excised half a wall, while the genuine openings beside it
+    // reached 0.594 m and 0.596 m of the 0.60 m band against that sliver's
+    // 0.215 m. The threshold is half the band rather than a constant of its
+    // own, so it stays tied to the depth actually looked at.
+    //
+    // And the split must happen *before* the gap merge, not after it. Merging
+    // by gap alone and then taking `depth = max` across the result lets one
+    // genuine deep opening hand its depth to a shallow sliver that happens to
+    // sit within wallGapM of it, and the whole merged span is excised as
+    // opening — measured on this room, 6.7+ m of real wall along tag 3's plane
+    // lost in one pass to a 0.29 m sliver borrowing a 0.60 m opening's depth.
+    // A bin therefore only ever merges with a neighbour on its own side of
+    // minDepth, which makes the cluster homogeneous and `depth = max` honest
+    // again. Same failure shape retract() is built around: a merged blob can
+    // hide two different truths.
+    const minDepth = (C.wallNearM + C.wallFarM) / 2;
     const clusters = [];
     const gapBins = C.wallGapM / C.cellM;
     for (const bin of [...behind.keys()].sort((a, b) => a - b)) {
       const e = behind.get(bin);
+      const deep = e.depth >= minDepth;
       const last = clusters[clusters.length - 1];
-      if (last && bin - last.hi <= gapBins) {
+      if (last && last.deep === deep && bin - last.hi <= gapBins) {
         last.hi = bin;
         last.n += e.n;
         last.depth = Math.max(last.depth, e.depth);
       } else {
-        clusters.push({ lo: bin, hi: bin, n: e.n, depth: e.depth });
+        clusters.push({ lo: bin, hi: bin, n: e.n, depth: e.depth, deep });
       }
     }
-    // Depth, not just cell count. A doorway is space you can walk *through*,
-    // so its evidence reaches the far end of the band; pose noise bleeding a
-    // few centimetres across the very wall the rays were carved up to is a
-    // sliver hugging the plane. Counting cells cannot tell them apart — a
-    // sliver one row deep spanning 0.72 m still has 27 cells and excised half
-    // a wall, while the genuine openings beside it reached 0.594 m and
-    // 0.596 m of the 0.60 m band against that sliver's 0.215 m. The threshold
-    // is half the band rather than a constant of its own, so it stays tied to
-    // the depth actually looked at.
-    const minDepth = (C.wallNearM + C.wallFarM) / 2;
     const enough = clusters.filter((o) => o.n >= C.openingMinCells);
     return {
       frontBins,
-      openings: enough.filter((o) => o.depth >= minDepth),
-      shallow: enough.filter((o) => o.depth < minDepth),
+      openings: enough.filter((o) => o.deep),
+      shallow: enough.filter((o) => !o.deep),
     };
   }
 
@@ -1978,6 +2264,56 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
   // Counted only within the segment's along-wall extent: beyond a wall's end
   // (a divider, a doorway wall) free space past the plane's infinite
   // extension is legitimate.
+  // The far-side question alone, independent of any particular cell set —
+  // "wrong by construction" assumes the far side of a tagged wall is never
+  // surveyed, and this is the test for whether that assumption has expired
+  // for one plane (CLAUDE.md called this before landmark rays existed).
+  // Three independent proofs, any one of which is enough, reported
+  // individually so a replay can see which one actually did the work, never
+  // silently. Deliberately cheap — it never touches liveFree()'s island
+  // filtering — because retractPlaneSweep() calls it on every marker-map
+  // change and must not pay for a full region flood fill that often.
+  function planeFarSide(group, frame, lo, hi) {
+    const { sOf, frontOf } = frame;
+    const behind = (key) => {
+      const ix = Math.floor(key / GRID_SIDE) - GRID_HALF;
+      const iz = (key % GRID_SIDE) - GRID_HALF;
+      const cx = (ix + 0.5) * C.cellM;
+      const cz = (iz + 0.5) * C.cellM;
+      if (frontOf(cx, cz) > -C.cellM) return false;
+      const s = sOf(cx, cz);
+      return s >= lo && s <= hi;
+    };
+    let far = 0;
+    for (const key of landmarkEnds) if (behind(key)) far++;
+    // Direct proof, and the one that actually fires today (landmark rays
+    // ship inert): a camera fix accepted at the carve's own gates, whose own
+    // cell falls in this plane's behind-band, is not an inference — it is a
+    // person standing there. Measured on the full corpus: the far side
+    // behind tags 2/6 carries 390 such visits, the sliver behind tag 3 (a
+    // planeEvidence bug, not a room — see walls.md) correctly carries only
+    // 12.
+    let vis = 0;
+    for (const key of visited) if (behind(key)) vis++;
+    // walls.md's own literal prescription: a mapped tag of the far side's
+    // own, inside this plane's along-wall bracket (not merely anywhere in the
+    // room — an unrelated tag elsewhere says nothing about this wall).
+    // Measured inert on the current room (no other tag's centre falls inside
+    // another plane's narrow bracket); it fires the day a second room is
+    // surveyed back-to-back with this one.
+    let tagsBehind = 0;
+    for (const m of tags.values()) {
+      if (group.some((g) => g.id === m.id)) continue;
+      if (frontOf(m.p[0], m.p[2]) >= -C.cellM) continue;
+      const s = sOf(m.p[0], m.p[2]);
+      if (s >= lo && s <= hi) tagsBehind++;
+    }
+    return {
+      visited: vis, landmarkEnds: far, tagsBehind,
+      farSide: far >= C.landmarkFarsideMin || vis >= C.visitedFarsideMin || tagsBehind > 0,
+    };
+  }
+
   function countBehindPlanes(cellSet) {
     if (!planeGroups) planeGroups = groupPlanes();
     const out = [];
@@ -2004,18 +2340,10 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
       };
       let count = 0;
       for (const key of cellSet) if (behind(key)) count++;
-      // "Wrong by construction" assumes the far side of a tagged wall is
-      // never surveyed, and that assumption expires the day it is (CLAUDE.md
-      // called this before landmark rays existed). Enough distinct
-      // landmark-ray endpoints behind this plane, inside the same bracket,
-      // is that day for this group — its count is reported but excluded from
-      // the headline, never silently.
-      let far = 0;
-      for (const key of landmarkEnds) if (behind(key)) far++;
       out.push({
         ids: group.map((m) => m.id).sort((a, b) => a - b),
         count,
-        farSide: far >= C.landmarkFarsideMin,
+        ...planeFarSide(group, frame, lo, hi),
       });
     }
     return out;
@@ -2124,6 +2452,8 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
           c.views,
           Math.round(c.Ln * 1000) / 1000,
           c.nviews,
+          Math.round(c.Lr * 1000) / 1000,
+          c.rviews,
         ]),
         // The proven lines of sight. Persisted with the grid because they are
         // the same evidence: dropping them would let every doorway re-close on
@@ -2139,6 +2469,13 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
         // optional key rather than a version bump: an old build ignores it,
         // and nothing structural changed for one.
         landmarkEnds: [...landmarkEnds].map((key) => [
+          Math.floor(key / GRID_SIDE) - GRID_HALF,
+          (key % GRID_SIDE) - GRID_HALF,
+        ]),
+        // Camera-occupied cells, [ix, iz] like landmarkEnds — the direct-visit
+        // proof leaksDetail()'s far-side test and retractPlaneSweep()'s
+        // refusal both read. As durable as the carves it protects.
+        visited: [...visited].map((key) => [
           Math.floor(key / GRID_SIDE) - GRID_HALF,
           (key % GRID_SIDE) - GRID_HALF,
         ]),
@@ -2176,7 +2513,12 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
     // v1 files predate the negative-evidence columns and load with Ln = 0, v2
     // predates the sight lines and loads with none (doorways re-close until
     // looked through again — the pre-feature behaviour, not something worse);
-    // anything newer than this code may mean the columns something else.
+    // v3 predates the retraction-trust columns and the visited set, loading
+    // with Lr = 0 (no cell starts eligible for un-carving until re-observed —
+    // the same "not something worse" reasoning) and no visited cells (the
+    // far-side test falls back to landmarkEnds/tagsBehind alone until the
+    // room is walked again). Anything newer than this code may mean the
+    // columns something else.
     if (raw.version > WALLS_VERSION) {
       log(`Ignoring ${path.basename(file)}: version ${raw.version}, ` +
         `this build writes ${WALLS_VERSION}`);
@@ -2188,14 +2530,18 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
     for (const [ix, iz] of raw.landmarkEnds || []) {
       landmarkEnds.add(cellKey(ix, iz));
     }
-    for (const [ix, iz, L, views, Ln = 0, nviews = 0] of raw.cells || []) {
+    for (const [ix, iz] of raw.visited || []) {
+      visited.add(cellKey(ix, iz));
+    }
+    for (const [ix, iz, L, views, Ln = 0, nviews = 0, Lr = 0, rviews = 0] of raw.cells || []) {
       // Viewpoint identity does not survive a restart (vp = -1), which only
       // under-counts: an already-promoted cell keeps its state, an unpromoted
       // one needs a genuinely new sighting anyway. State is re-derived without
       // hysteresis — thresholds only.
       const state = L >= C.occOn ? 2
         : ((L <= C.freeOn && views >= C.minViews) || L <= C.freeOnSingle ? 1 : 0);
-      cells.set(cellKey(ix, iz), { L, views, vp: -1, state, Ln, nviews, nvp: -1 });
+      cells.set(cellKey(ix, iz),
+        { L, views, vp: -1, state, Ln, nviews, nvp: -1, Lr, rviews, rvp: -1 });
     }
     if (cells.size) {
       const floor = getFloor();
@@ -2208,6 +2554,10 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
     cells.clear();
     sights.clear();
     landmarkEnds.clear();
+    visited.clear();
+    remapBaseline.clear();
+    lastCam = null;
+    lastAt = null;
     planeGroups = null;
     frustumVps.clear();
     for (const k of Object.keys(stats.reports.rej)) delete stats.reports.rej[k];
@@ -2223,6 +2573,8 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
     stats.neg.tags.total = stats.neg.tags.deposited = 0;
     stats.neg.tags.wSum = 0;
     stats.veto.planes = stats.veto.waived = 0;
+    stats.retract.plane = { offered: 0, applied: 0, refusedVisited: 0 };
+    stats.retract.neg = { offered: 0, applied: 0, refusedVisited: 0 };
     if (file) scheduleSave();
   }
 
@@ -2256,6 +2608,11 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
         },
       },
       veto: { ...stats.veto },
+      retract: {
+        plane: { ...stats.retract.plane },
+        neg: { ...stats.retract.neg },
+      },
+      visited: visited.size,
       cells: cells.size,
       free: freeCells,
       occ: floor.occ.length / 2,
@@ -2272,7 +2629,10 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
     // paths never read it).
     debugCellAt(x, z) {
       const c = cells.get(cellKey(Math.floor(x / C.cellM), Math.floor(z / C.cellM)));
-      return c ? { L: c.L, views: c.views, state: c.state, Ln: c.Ln, nviews: c.nviews } : null;
+      return c ? {
+        L: c.L, views: c.views, state: c.state, Ln: c.Ln, nviews: c.nviews,
+        Lr: c.Lr, rviews: c.rviews,
+      } : null;
     },
     getFloor,
     getWalls,
