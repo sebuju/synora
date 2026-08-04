@@ -199,6 +199,10 @@ const signaling = connectSignaling('client', {
       // around the room. Null clears it — "nothing worth saying" is the common
       // answer and must not leave the last instruction standing.
       mapView.setGuide(msg.guide || null);
+      // The walk coach. A sound and not a line, because this arrives while the
+      // phone is being carried at arm's length through a room and the overlay
+      // is five lines of diagnostics nobody reads mid-stride.
+      if (msg.cue) playCue(msg.cue);
       // Which of the dots on the map is this phone. Only the server knows — the
       // clientId is its own numbering — and the near fit has to be able to ask
       // what *this* client is looking at rather than guess from the geometry.
@@ -855,10 +859,6 @@ function cvPose(transform) {
   };
 }
 
-function setStatus(text) {
-  document.getElementById('status').textContent = text;
-}
-
 async function probe() {
   if (!navigator.xr) {
     report.innerHTML = '<span class="no">no WebXR in this browser.</span>';
@@ -957,6 +957,50 @@ function pixelsToCanvas(w, h) {
   return readCanvas;
 }
 
+// The walk coach's cues, as tones. A sound for the same reason `guideLine` is
+// words and not a number: what this page says has to be usable by someone
+// walking a room with the phone held out in front of them, and a glance is the
+// one thing they cannot spare. The server decides *when* (landmarks.walkCue);
+// this only decides what it sounds like.
+//
+//   solved — low   : a solve landed with the tags out of view. Turn around.
+//   banked — high  : the run back has converged. The event is measurable; go again.
+//   move   — two   : the run has the frames but not the motion. Keep walking.
+//
+// Pitch carries the meaning rather than rhythm, because the two states that
+// matter are opposites and a walker should not have to count anything.
+let audio = null;
+const CUES = {
+  solved: [[440, 0.12]],
+  banked: [[880, 0.12]],
+  move: [[660, 0.06], [660, 0.06]],
+  // Falling, and the only one that repeats: everything walked from here is
+  // void until AR is re-entered, so it has to be unmistakable and it has to
+  // keep saying so.
+  dead: [[330, 0.18], [220, 0.24]],
+};
+
+function playCue(cue) {
+  const notes = CUES[cue];
+  if (!audio || !notes) return;
+  let t = audio.currentTime;
+  for (const [hz, dur] of notes) {
+    const osc = audio.createOscillator();
+    const gain = audio.createGain();
+    osc.frequency.value = hz;
+    // Gating an oscillator on and off clicks at both ends, and a click is
+    // exactly what a room full of pose measurement does not need to be
+    // announced with. The ramp is what makes it a blip.
+    gain.gain.setValueAtTime(0, t);
+    gain.gain.linearRampToValueAtTime(0.3, t + 0.01);
+    gain.gain.linearRampToValueAtTime(0, t + dur);
+    osc.connect(gain).connect(audio.destination);
+    osc.start(t);
+    osc.stop(t + dur + 0.02);
+    t += dur + 0.05;
+  }
+}
+
 async function start() {
   const canvas = document.createElement('canvas');
   gl = canvas.getContext('webgl', { xrCompatible: true, alpha: true });
@@ -987,6 +1031,14 @@ async function start() {
   console.log('XR session features:', xrFeatures ?? 'unreported');
   sessionId = crypto.randomUUID();
   trackReset = true;
+  // Here and nowhere else: this function runs from the tap that opens the
+  // session, and an AudioContext created off a user gesture is born suspended
+  // — its first cue would be dropped without a sound and without an error.
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (Ctx && !audio) audio = new Ctx();
+    audio?.resume?.();
+  } catch { audio = null; }
   await gl.makeXRCompatible();
   session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
   binding = new XRWebGLBinding(session, gl);
@@ -1020,6 +1072,11 @@ async function start() {
     // The cost window belongs to the session that was measured; carried over,
     // the next session's first reports would describe the last one's.
     costMeter.reset();
+    // Nothing left to cue, and a live context holds the device's audio focus
+    // for as long as the page stays open. The next session opens its own from
+    // its own gesture.
+    audio?.close?.();
+    audio = null;
     // No more frames are coming, and a canvas track that stops being fed keeps
     // its last one — the dashboard would hold a tile that looks live for as
     // long as the page stayed open. `streamOn` survives: it is a standing

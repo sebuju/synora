@@ -21,8 +21,15 @@
 // Only the XR path reports any of it (it needs the phone's own pose to separate
 // real motion from fix noise), so anything else gets radius 0 and draws no ring
 // rather than inventing one.
+// A coarse-tier fix reports its own radius (`poseR`, metres) and has no jitter
+// behind it — it is not an ARCore-carried pose at all, so there is no motion to
+// divide out and no centre distinct from the dot. It is checked first because
+// a frame that reaches the tier may still carry a stale jitter reading from
+// before the survey lost the room, and that reading describes nothing here.
 function poseUncertainty(msg) {
-  const j = msg.room?.jitter;
+  const room = msg.room;
+  if (room?.poseR != null) return { r: room.poseR, p: null };
+  const j = room?.jitter;
   return { r: (j?.jitterMm ?? 0) / 1000, p: j?.centre ?? null };
 }
 

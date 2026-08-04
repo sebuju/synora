@@ -753,6 +753,12 @@ function createMap2dView(canvas, mode = 'top', {
       // Dead reckoning is a state the reader acts on (walk back toward a
       // tag), so it fades like staleness does rather than snapping.
       ph.drMix = animFade(ph.drMix ?? 0, !!ph.dr, dt);
+      // Faded for a reason, not for polish: a takeover fires only on the
+      // frames whose solve disagrees, so `lm` flips off and on through the
+      // detection/carry interleave. Snapped, that is a strobe; on the fade's
+      // clock a single frame's flip barely moves the colour and a real stretch
+      // on landmarks goes fully teal.
+      ph.lmMix = animFade(ph.lmMix ?? 0, !!ph.lm, dt);
       ph.shownRadius = animApproach(ph.shownRadius,
         ph.uncertaintyM * UNCERTAINTY_SIGMA, dt, RADIUS_TAU_MS);
       // The circle's centre is a measurement in its own right and moves on the
@@ -1422,7 +1428,12 @@ function createMap2dView(canvas, mode = 'top', {
       if (!ph.target) continue;
       const fade = ph.fade;
       const stale = ph.staleMix;
-      const color = animMixCss(ph.color, '#555', stale);
+      // Identity first, then which map is holding it, then staleness last —
+      // stale has to win, or a client that stopped reporting keeps announcing
+      // it is on landmarks when nothing is being solved at all.
+      const lm = ph.lmMix ?? 0;
+      const idColor = animMixCss(ph.color, roomLandmarkColorCss(), lm);
+      const color = animMixCss(idColor, '#555', stale);
       // With the pose hidden, heading, label, tag lines and distances all
       // anchor on the circle's centre — a line from an invisible point would
       // read as a stray mark. The two points are metres apart, so the switch
@@ -1455,7 +1466,12 @@ function createMap2dView(canvas, mode = 'top', {
         ctx.globalAlpha = fade * ringAlpha;
         ctx.beginPath();
         ctx.arc(ux, uy, rPx, 0, Math.PI * 2);
-        ctx.fillStyle = animMixCss(`${ph.color}22`, 'rgba(85,85,85,0.10)', stale);
+        // The same three-way mix as the dot, built in rgba rather than by
+        // suffixing hex: animMixCss returns rgba() the moment it interpolates,
+        // and `${mixed}22` would silently produce garbage.
+        ctx.fillStyle = animMixCss(
+          animMixCss(roomClientColorCss(ph.id, 0.133), roomLandmarkColorCss(0.133), lm),
+          'rgba(85,85,85,0.10)', stale);
         ctx.fill();
         ctx.strokeStyle = color;
         ctx.globalAlpha = fade * ringAlpha * 0.5;
@@ -1720,6 +1736,11 @@ function createMap2dView(canvas, mode = 'top', {
       // though it earns no carve trust. A message with no room verdict
       // (older server) keeps the last state.
       if (room) ph.dr = room.mapSafe !== true && room.lmFix !== true;
+      // Running off the landmark map: the dot takes the landmark cloud's own
+      // teal, so the colour says which map is holding this client rather than
+      // only which client it is. Same verdict for all three ways that happens
+      // — see roomPoseOffLandmarks.
+      if (room) ph.lm = roomPoseOffLandmarks(room);
       ph.at = performance.now();
     },
 

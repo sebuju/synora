@@ -770,6 +770,22 @@ function roomClientColorCss(id, alpha = null) {
   return `rgba(${(c >> 16) & 255}, ${(c >> 8) & 255}, ${c & 255}, ${alpha})`;
 }
 
+// Whether the pose about to be drawn came off the landmark map rather than off
+// the tags or ARCore's carry. Three states say so and they are one fact to
+// whoever is reading the map: the last-resort fix ('landmark'), the coarse
+// tier ('coarse'), and a takeover ('lmFix'), where the reported pose *is* the
+// solve's and ARCore's carry has been set aside beside it. It lives here for
+// the same reason the palette does — a client reading as landmark-held on one
+// surface and tag-held on another is worse than neither saying so.
+//
+// Deliberately not `safeVia === 'landmark'`: that is a landmark solve agreeing
+// with ARCore and rescuing its trust, and the pose drawn is still ARCore's.
+function roomPoseOffLandmarks(room) {
+  if (!room) return false;
+  return room.lmFix === true
+    || room.quality === 'landmark' || room.quality === 'coarse';
+}
+
 // Room axes, indexed the way a position is: x, y, z. Near three.js's own
 // AxesHelper defaults, and the helper is told them explicitly rather than left
 // on its defaults — the 2D views and the drawer read the same three numbers,

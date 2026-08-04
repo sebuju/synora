@@ -823,16 +823,57 @@ function maintainLandmarks(ws, entry) {
   // the pose. Anything the survey could still report for itself is left alone —
   // a landmark fix sits below dead reckoning's first second.
   if (room.pose && room.quality !== 'dead') return;
+  // What the survey said before either branch below overwrote it. Journalled
+  // for the same reason `room.carried` is on a takeover: both write a pose
+  // where the survey had none, so a replay reading the entry back finds a pose
+  // and skips the very branch that produced it — the fix would be invisible to
+  // the tool that has to measure it. It was already true of the landmark
+  // branch; the tier only made it matter enough to fix.
+  const qWas = room.quality;
   const fix = landmarks.solve(ws.clientId, msg.points, gen, intr, room.pose);
-  if (!fix) return;
-  room.pose = fix.pose;
-  room.quality = 'landmark';
-  // Not survey-quarantined and not tag-derived, so it must never become
-  // permanent evidence anywhere: walls reads exactly this flag. The rescue
-  // above does not apply — with no carried pose there is nothing independent
-  // to agree with.
+  if (fix) {
+    room.pose = fix.pose;
+    room.quality = 'landmark';
+    room.qWas = qWas;
+    // Not survey-quarantined and not tag-derived, so it must never become
+    // permanent evidence anywhere: walls reads exactly this flag. The rescue
+    // above does not apply — with no carried pose there is nothing independent
+    // to agree with.
+    room.mapSafe = false;
+    room.landmarks = { n: fix.n, inliers: fix.inliers, rms: Math.round(fix.rms * 100) / 100 };
+    return;
+  }
+  // The coarse tier, last of all: a position good to a few hundred millimetres
+  // where the precision path has just declined and the survey has nothing.
+  // Measured corpus-wide, 12.8% of point-bearing frames arrive here with no
+  // pose at all (unlocalized, unaligned, slipping) — that is the coverage hole
+  // the tier exists for, and "better than nothing" is the specification.
+  //
+  // Everything that keeps it from contaminating the room is a *property of
+  // what is written here*, not a gate somewhere else:
+  //   - `mapSafe: false`, so landmarkGate, foundingDepth and walls.handleReport
+  //     all exclude it with no edit of their own.
+  //   - `quality: 'coarse'`, which matches no consumer's string test — walls
+  //     wants 'good' or a tag-less 'tracked', founding wants 'good'.
+  //   - no `extPose`: this runs after survey.js has already decided, so
+  //     maintainSurvey has been and gone and cannot promote or refine a tag
+  //     against this pose. The forgetting that would be silent and permanent
+  //     is structurally out of reach rather than merely avoided.
+  //   - `s.lastPose` untouched inside the tier, so the next frame's precision
+  //     solve does not chain from a coarse answer.
+  const coarse = landmarks.solveCoarseTier(ws.clientId, msg.points, gen, intr, room.pose);
+  if (!coarse) return;
+  room.pose = coarse.pose;
+  room.quality = 'coarse';
+  room.qWas = qWas;
   room.mapSafe = false;
-  room.landmarks = { n: fix.n, inliers: fix.inliers, rms: Math.round(fix.rms * 100) / 100 };
+  // The dot is honestly a circle. room-feed reads this in place of the jitter
+  // radius — there is no jitter measurement behind a coarse fix, and reusing
+  // that field would put a number into a gate that reads it as ARCore's.
+  room.poseR = coarse.r;
+  room.landmarks = {
+    n: coarse.n, inliers: coarse.inliers, rms: Math.round(coarse.rms * 100) / 100,
+  };
 }
 
 // The cross-check's own log, throttled like logLandmarks — except a
@@ -1531,7 +1572,12 @@ function handleSignal(ws, msg) {
         // the arc this is derived from is measured in it.
         guide: landmarksOn() && entry.room.pose
           ? landmarks.guide(ws.clientId, entry.room.pose, { blocked: guideBlocked })
-          : null });
+          : null,
+        // The walk coach, as a sound rather than a readout: the phone is in
+        // front of someone walking a room and its overlay is five lines of
+        // diagnostics nobody reads mid-stride. Edge-triggered — null on every
+        // frame that did not change anything, or ten cues a second.
+        cue: landmarksOn() ? landmarks.walkCue(ws.clientId, entry) : null });
       if (mapChanged) {
         const map = survey.getMarkerMap();
         sendRoom({ type: 'marker-map', ...map });

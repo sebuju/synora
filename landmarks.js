@@ -253,6 +253,31 @@ const LANDMARK_AGREE_DEG = 5;
 // carry does? That is the test that reverted the carry correction (94 mm
 // against 65 mm) and it is the one to run on the next walk.
 const LANDMARK_TAKEOVER_MIN_INLIERS = 30;
+// What a re-acquire has to look like before the takeover measurement can read
+// it (.plans/landmark-lock.md §3g). Shared by `walkCue` below, which asks for
+// one live, and by `replay-reacquire.js`, which scores one offline — the same
+// numbers, because a cue that says "done" on a run the offline tool then
+// refuses is worse than no cue.
+//
+// The frame count and the motion are both about the alignment EMA: its gain is
+// `alignAlpha(moved)` in survey.js, 0.02 standing still and 0.25 walking, so a
+// run has to be both long enough and *moving* enough for the tag fix to
+// actually land in the alignment. Eight confirmed frames at the walking gain
+// carries ~90% of the correction; the same eight standing still carry 15%, and
+// the flat alignment that results reads offline as a settled reference when it
+// is really a stalled one.
+const REACQUIRE_MIN_GOOD = 8;
+const REACQUIRE_MIN_RUN_M = 0.15;
+// A gap this long with no tag confirming the alignment ends the run. Not one
+// tracked frame: the journals interleave confirmed and carried frames almost
+// every frame, so a per-frame rule would end every run immediately.
+const REACQUIRE_RUN_BREAK_MS = 1000;
+// How often the coach repeats itself while the session is dead. Not once: the
+// state it describes is one the walker has to act on by stopping and
+// re-entering AR, and measured over five walks on 04/08 three were lost to
+// ARCore relocalizing — a minute or more of walking each, on a pose the survey
+// had already given up on, because nothing said so out loud.
+const REACQUIRE_DEAD_REPEAT_MS = 3000;
 // The solve's own quality bar for confirmation, on top of agreement: TRIM_PX
 // inliers with an rms at the trim ceiling are a fit on the edge of its own
 // outlier gate.
@@ -478,6 +503,64 @@ const CONSENSUS_ADOPT_PX = 24;
 // wants the arc, not the density.
 const ROBS_RING = 40;
 
+// ---- the coarse tier -------------------------------------------------------
+//
+// The paragraph above is the 100 mm product's rule and it stays that. This is
+// the second, explicitly worse answer offered where the first declines: the
+// specification asks for a position wherever tags cannot reach and puts the
+// budget at 0.5 m, and at that budget the coarse cloud's ±5%·z is inside the
+// answer rather than poison in it.
+//
+// The trim is the whole of what makes it work, and that was not obvious — the
+// exclusion looked like the binding constraint and it is not. Measured across
+// six journals: admitting the cloud at the precision trim moved tag-less
+// solves 33 → 42 on the 14:52 walk, because the matches it supplies are
+// exactly the ones a 3-8 px gate then throws out (matched per frame went 35 →
+// 53 while solves did not move). At 40 px the same admission took tag-less
+// solves 33 → 174, 16 → 53, 16 → 39 and 32 → 66 on the four walks that have a
+// coarse cloud, holdout p90 55/227/92/285 mm — inside the tier's budget on
+// every one. 40 px at fx 1326 and 2.5 m is 75 mm of position, which is the
+// same statement from the other end.
+//
+// It is a second number and not a raise of the first: the precision tier's
+// numbers must not move, and at 40 px they would (14:52's holdout worst case
+// goes 51 → 699 mm with the trim raised under the precision path).
+const COARSE_TRIM_PX = 40;
+// The count gate is deliberately *not* raised for the tier, which is the
+// opposite of what this was planned around. `minPoints` inside the RANSAC is
+// the same number, so raising it starves the solver rather than steadying it:
+// on 14:52's holdout 15 → 60 took coverage 103 → 81, and every journal lost.
+// Point count is still the mirror mitigation; the tier gets it by admitting
+// the cloud (matched per frame 35 → 53), not by demanding more of a supply
+// that is not there.
+//
+// What is left guarding the mirror is the tripwire in check() — and it is
+// working hard: at this trim the 14:52 walk refuses 53 solves as mirror jumps.
+// A rise in that count is the tier misbehaving, and it is logged per refusal.
+//
+// The reported radius, in metres, and it is a *measured* figure first and a
+// modelled one only where the geometry is worse than measured.
+//
+// The modelled part alone was tried and is wrong: the inlier rms translated to
+// metres (rms/fx, small-angle, times the range, times the lateral spread's
+// lever arm) came out at ~9 mm on real frames and pinned to the floor on every
+// walk. It cannot do better — the residual sees how well the fit explains its
+// own pixels, and the error that actually dominates here is the coarse
+// landmarks' own ±5%·z, which is invisible to it by construction. A tier whose
+// budget is 500 mm drawing a 10 mm circle is a lie told precisely where the
+// point of the circle was to stop telling it.
+//
+// So the floor is the measurement: holdout position p90 came out 55, 92, 227,
+// 285, 294 and 403 mm across the six journals, at ranges of 2-3 m — about a
+// tenth of range — and the live cross-check against ARCore's carry agrees
+// (median 68-120 mm, p90 154-773 mm). The modelled term is kept as the *max*
+// with it, so a fit whose own residuals say it is worse than typical reports
+// worse rather than being flattened to the typical.
+const COARSE_R_REL = 0.1;
+const COARSE_R_MIN_M = 0.1;
+// Past this the honest answer is not a circle but no answer at all.
+const COARSE_R_MAX_M = 2;
+
 function landmarkGate(entry) {
   const { msg, room } = entry;
   if (!room?.pose || room.mapSafe !== true) return false;
@@ -593,6 +676,19 @@ function createLandmarks({ log = () => {}, opts = {}, trace = null } = {}) {
   // landmark map in a frame of its own.
   const landmarkMaxDepth = opts.landmarkMaxDepth ?? LANDMARK_MAX_DEPTH;
   const takeoverMinInliers = opts.takeoverMinInliers ?? LANDMARK_TAKEOVER_MIN_INLIERS;
+  // Whether the coarse consensus cloud may enter the fit at all (see the
+  // exclusion at match() below). Off by default, which is the 100 mm product
+  // unchanged; the flag exists because that exclusion is the single largest
+  // structural limit on *coverage* — 14-63% of every walk's map — and a
+  // 500 mm tier is a different trade from the one the exclusion was written
+  // for. Nothing but a sweep across several walks can say whether the trade
+  // pays, and until this knob existed the question could not be asked.
+  const solveCoarse = opts.solveCoarse ?? false;
+  // The tier itself, and its own trim. `coarseTier` false reproduces the
+  // module without it — the regression switch, since the tier's whole claim is
+  // that it cannot touch the precision path and that has to stay checkable.
+  const coarseTier = opts.coarseTier ?? true;
+  const coarseTrimPx = opts.coarseTrimPx ?? COARSE_TRIM_PX;
   const jumpM = opts.jumpM ?? SOLVE_JUMP_M;
   const jumpDeg = opts.jumpDeg ?? SOLVE_JUMP_DEG;
   // The mint-block radius around an existing landmark is one voxel, not
@@ -635,6 +731,11 @@ function createLandmarks({ log = () => {}, opts = {}, trace = null } = {}) {
   // is what `reassociate` does, and it turns the map from "usable while its
   // tracks live" into "usable while it is being looked at".
   const clients = new Map();
+  // The walk coach's state, deliberately *not* on the per-client record above:
+  // that one is wiped with the feature generation, and a generation change is
+  // exactly a tracking hiccup mid-walk. A cue that resets itself there would go
+  // quiet in the one moment it is describing.
+  const coach = new Map();
   // `bestSpan` is the single most useful number here and the reason the others
   // are not enough. Landmarks need orbiting motion — a walk *past* something gives
   // a narrow effective baseline however long it is looked at — and when nothing
@@ -646,6 +747,11 @@ function createLandmarks({ log = () => {}, opts = {}, trace = null } = {}) {
   const stats = {
     observed: 0, qualified: 0, qualifiedDepth: 0, qualifiedConsensus: 0,
     solved: 0, refused: 0,
+    // The coarse tier's own count, kept apart from `solved` on purpose: the
+    // two are different products and one total would hide which one is
+    // carrying a session. `coarseJumped` is its share of the tripwire, which
+    // is the tier's only mirror defence and so the number to watch.
+    solvedCoarse: 0, coarseJumped: 0,
     // Solves thrown out by the jump gate. The number that says whether a
     // looser trim is buying mirrors: it should be 0 at today's gates and
     // non-zero exactly where the holdout's worst case blows up.
@@ -1253,6 +1359,57 @@ function createLandmarks({ log = () => {}, opts = {}, trace = null } = {}) {
     };
   }
 
+  // The coarse tier borrows the client's association state and gives it back
+  // exactly as it was. `solve` re-associates before and after matching — that
+  // is how it finds anything at all — and those writes land in `s.alias`,
+  // which the *precision* path reads on its next frame. This is not a
+  // precaution: the moment the tier went in, the cross-check's parity against
+  // its own journal fell from 93/0 to 76/16, entirely from the coarse pass
+  // adopting tracks the precision pass then inherited. So the isolation is a
+  // rollback rather than a promise — whatever the coarse solve associates is
+  // thrown away with it, and the precision path cannot tell it ran.
+  //
+  // `alias` is restored in place, never reassigned: the reset path clears the
+  // same Map object and a swap would leave two of them alive.
+  function isolated(clientId, fn) {
+    const s = clients.get(clientId);
+    if (!s) return fn();
+    const alias = new Map(s.alias);
+    const born = trace ? new Map(s.aliasBorn) : null;
+    const { liveNow, lastPose } = s;
+    try {
+      return fn();
+    } finally {
+      s.alias.clear();
+      for (const [k, v] of alias) s.alias.set(k, v);
+      if (born) {
+        s.aliasBorn.clear();
+        for (const [k, v] of born) s.aliasBorn.set(k, v);
+      }
+      s.liveNow = liveNow;
+      s.lastPose = lastPose;
+    }
+  }
+
+  // What the coarse tier's dot is honestly worth, in metres — see the
+  // constants for the derivation. Reported on every coarse fix so the room
+  // views draw a circle rather than a point, which is the difference between
+  // "you are here" and "you are somewhere in here" and the only thing on
+  // screen that distinguishes the two tiers.
+  function coarseRadiusM(seen, pose, fx, rms) {
+    if (!seen.length || !fx) return COARSE_R_MAX_M;
+    let range = 0;
+    for (const l of seen) range += dist3(pose.p, l.P);
+    range /= seen.length;
+    const sp = spreadOf(seen, pose);
+    // Below one the fit had a *wider* baseline than its range, which does not
+    // sharpen the residual's metre value — it only stops diluting it.
+    const lever = Math.max(1, range / Math.max(sp?.lateralM ?? 0.01, 0.01));
+    const r = Math.max(COARSE_R_REL * range, (rms / fx) * range * lever);
+    return Math.min(COARSE_R_MAX_M,
+      Math.max(COARSE_R_MIN_M, Math.round(r * 100) / 100));
+  }
+
   return {
     // The live depth measurement: every detected tag carries both a depth
     // sample (t.d) and the solver's truth for the same pixel (tvec[2]), so
@@ -1438,7 +1595,15 @@ function createLandmarks({ log = () => {}, opts = {}, trace = null } = {}) {
     // falls into.
     // `note` is trace-only: what the *caller* knows and this does not (which
     // seed it handed over, how long since the last solve), merged into the row.
-    solve(clientId, points, gen, intr, seed = null, note = null) {
+    //
+    // `coarse` runs the same arithmetic as the coarse tier rather than beside
+    // it: one solve, two configurations of it, so the tier cannot drift away
+    // from the path it is meant to be a worse copy of. What it changes is the
+    // two numbers it must (the cloud is admitted, the trim is the tier's) and
+    // the two writes it must not make — `lastPose` and the post-solve
+    // re-association. Both feed the *precision* path's next frame, and a
+    // coarse pose reaching either is how the two tiers would quietly merge.
+    solve(clientId, points, gen, intr, seed = null, { note = null, coarse = false } = {}) {
       if (!points?.length || gen == null) return null;
       const K = modelOf(intr);
       if (!K) return null;
@@ -1447,11 +1612,19 @@ function createLandmarks({ log = () => {}, opts = {}, trace = null } = {}) {
       // The row is emitted on every exit below, the early ones included, so a
       // trace has one line per eligible frame — a CSV whose denominator was
       // silently the solve *attempts* would answer the wrong question.
-      const row = trace ? { seq: s.traceSeq++, pts: points.length, ...(note ?? {}) } : null;
+      const row = trace
+        ? { seq: s.traceSeq++, pts: points.length, ...(coarse ? { tier: 'coarse' } : {}), ...(note ?? {}) }
+        : null;
       const emit = (outcome, extra) => { if (row) trace({ ...row, ...extra, outcome }); };
+      const admitCoarse = coarse || solveCoarse;
+      const trim = coarse ? coarseTrimPx : trimPx;
       if (s.landmarks.size < minLandmarks) { emit('no-map'); return null; }
       const carried = seed ?? s.lastPose;
-      if (!carried) { stats.refused++; emit('no-seed'); return null; }
+      // The tier's refusals are booked nowhere: `refused` is the precision
+      // path's own denominator and the tier attempts a solve on every frame
+      // that one declined, so pooling them would treble it and make the
+      // precision path read as newly broken.
+      if (!carried) { if (!coarse) stats.refused++; emit('no-seed'); return null; }
 
       // Undistorted here as at observe, so one convention holds across the
       // whole module and the solver is told the camera is ideal. Depth rides
@@ -1482,8 +1655,10 @@ function createLandmarks({ log = () => {}, opts = {}, trace = null } = {}) {
           // ±5%·z position noise either wastes the match as a RANSAC outlier
           // or poisons the pose as an inlier. Their aliases still form here
           // — solve-time adoption is how a kitchen landmark gets a track to
-          // refine from at the next founding-grade frame.
-          if (!a || a.coarse) continue;
+          // refine from at the next founding-grade frame. `solveCoarse` lets
+          // a replay lift the exclusion and measure what the cloud is worth
+          // to a coverage-first tier, where 8 cm of noise is inside budget.
+          if (!a || (a.coarse && !admitCoarse)) continue;
           objs.push(a.P);
           imgs.push([p.u, p.v]);
           metas.push({ id: landmarkId, a });
@@ -1518,7 +1693,7 @@ function createLandmarks({ log = () => {}, opts = {}, trace = null } = {}) {
       // is looking at nothing.
       s.liveNow = objs.length;
       if (objs.length < minLandmarks) {
-        stats.refused++;
+        if (!coarse) stats.refused++;
         emit('refused');
         return null;
       }
@@ -1530,20 +1705,23 @@ function createLandmarks({ log = () => {}, opts = {}, trace = null } = {}) {
         { fx: K.fx, fy: K.fy, cx: K.cx, cy: K.cy }, from,
         {
           minPoints: minLandmarks,
-          ...(trimPx === null ? {} : { trimPx }),
+          ...(trim === null ? {} : { trimPx: trim }),
           onReject: row ? (d) => Object.assign(row, d) : undefined,
         });
       if (!sol || !sol.p.every(Number.isFinite)) {
-        stats.refused++;
+        if (!coarse) stats.refused++;
         emit('failed');
         return null;
       }
       const pose = { p: sol.p, q: sol.q };
-      s.lastPose = pose;
-      stats.solved++;
-      // And again from the answer, which is better than the seed was: the next
-      // report starts with more of the map already found.
-      reassociate(s, pts, pose, K);
+      if (coarse) stats.solvedCoarse++;
+      else {
+        s.lastPose = pose;
+        stats.solved++;
+        // And again from the answer, which is better than the seed was: the next
+        // report starts with more of the map already found.
+        reassociate(s, pts, pose, K);
+      }
       // The landmarks that actually supported the fit, with each one's residual
       // under it. Inlier membership is the statement "this landmark was seen
       // this frame", which is what a carve ray hangs on — a landmark merely
@@ -1559,7 +1737,13 @@ function createLandmarks({ log = () => {}, opts = {}, trace = null } = {}) {
         inliers: sol.inliers, n: sol.n, rms: Math.round(sol.rms * 100) / 100,
         ...(row ? spreadOf(seen, pose) : null),
       });
-      return { pose, n: sol.n, inliers: sol.inliers, rms: sol.rms, seen, maxDepth };
+      return {
+        pose, n: sol.n, inliers: sol.inliers, rms: sol.rms, seen, maxDepth,
+        // Only the coarse tier reports a radius: the precision path's answer is
+        // consumed by gates with their own thresholds, and a circle drawn round
+        // it would be the renderer inventing doubt the pipeline does not have.
+        ...(coarse ? { r: coarseRadiusM(seen, pose, K.fx, sol.rms) } : null),
+      };
     },
 
     // The cross-check on a tag-less ARCore-carried frame (stage 1/2 of the
@@ -1600,16 +1784,26 @@ function createLandmarks({ log = () => {}, opts = {}, trace = null } = {}) {
         msg.intr ?? msg.intrinsics, chain ? null : room.pose,
         // Trace only: which seed this frame got, and how long the lock has
         // been gone. Read here because sinceSolve is updated on the next line.
-        trace && s ? {
-          seedSrc: chain ? 'chain' : 'carry',
-          sinceSolve: Number.isFinite(s.sinceSolve) ? s.sinceSolve : -1,
-        } : null);
+        {
+          note: trace && s ? {
+            seedSrc: chain ? 'chain' : 'carry',
+            sinceSolve: Number.isFinite(s.sinceSolve) ? s.sinceSolve : -1,
+          } : null,
+        });
       const live = s && s.gen === msg.gen;
       // A frame that did not solve, and a frame whose solve was thrown out as
       // a mirror, are the same thing to the chain — so the counter is only
       // reset once the fix has survived the tripwire below.
       if (!fix) {
         if (live) s.sinceSolve += 1;
+        // The tier's turn, and only now: the precision path declined, so this
+        // costs one extra RANSAC on a frame that was about to produce nothing.
+        // It cannot rescue mapSafe, carve, chain, take over or seed anything —
+        // it writes one journal line and nothing else. The carried pose is
+        // still here, so the same tripwire applies, and it is the tier's only
+        // mirror defence: `coarseJumped` is where a loose trim announces
+        // itself.
+        this.checkCoarse(clientId, entry, carried);
         return null;
       }
       const dp = dist3(fix.pose.p, carried.p);
@@ -1698,6 +1892,48 @@ function createLandmarks({ log = () => {}, opts = {}, trace = null } = {}) {
         took = true;
       }
       return { fix, dp, deg, agrees, confirmed, chained, took };
+    },
+
+    // The coarse tier on a frame ARCore is still carrying. Diagnostic only, by
+    // construction: it writes `room.lmCoarse` and touches nothing else — not
+    // the pose (ARCore's carry is the better answer here and is already
+    // reported), not mapSafe, not the rays, not the chain. What it is for is
+    // that the tier's behaviour has to be readable somewhere other than the
+    // moment the survey has already collapsed, and this is the frame where a
+    // truth to compare against still exists.
+    checkCoarse(clientId, entry, carried) {
+      if (!coarseTier || !carried) return null;
+      const { msg, room } = entry;
+      const fix = isolated(clientId, () => this.solve(clientId, msg.points, msg.gen,
+        msg.intr ?? msg.intrinsics, carried, { coarse: true }));
+      if (!fix) return null;
+      const dp = dist3(fix.pose.p, carried.p);
+      const deg = quatAngleDeg(fix.pose.q, carried.q);
+      // The same tripwire, and here it is the whole defence — the tier has no
+      // count gate above the precision path's and no confirmation bar at all.
+      // Booked apart from `jumped` so the two tiers' mirror rates never pool.
+      if (dp > jumpM || deg > jumpDeg) {
+        stats.coarseJumped++;
+        return null;
+      }
+      room.lmCoarse = {
+        dpMm: Math.round(dp * 1000), deg: Math.round(deg * 10) / 10,
+        inliers: fix.inliers, rms: Math.round(fix.rms * 100) / 100, rM: fix.r,
+      };
+      return { fix, dp, deg };
+    },
+
+    // The coarse tier where it is the *product*: no tag, no carry, nothing the
+    // survey will stand behind — the case the specification was written for.
+    // The caller owns what it does with the answer; this only refuses to
+    // produce one when the tier is off. There is no tripwire here because
+    // there is nothing to trip against: with no carried pose the only
+    // reference is the seed, and a fix is not a mirror for disagreeing with
+    // the pose it was asked to improve on.
+    solveCoarseTier(clientId, points, gen, intr, seed = null) {
+      if (!coarseTier) return null;
+      return isolated(clientId,
+        () => this.solve(clientId, points, gen, intr, seed, { coarse: true }));
     },
 
     // Distinct landmarks, not raw tracks: several tracks routinely sit on one
@@ -1903,6 +2139,107 @@ function createLandmarks({ log = () => {}, opts = {}, trace = null } = {}) {
       return { ...out, mode: 'arc' };
     },
 
+    // The walk coach: what to do next to produce a *measurable* re-acquire,
+    // for the person walking the room with the phone in front of them.
+    //
+    // The takeover measurement (.plans/landmark-lock.md §3g) needs a solve in
+    // a tag-less stretch and then a tag-confirmed run long enough for the
+    // alignment EMA to converge. No recorded walk does both often: a solve
+    // sits a median 8.9 s from the next tag confirmation, and the whole corpus
+    // yields five independent events. It is not a hard walk, it is one nobody
+    // knew to do — and it cannot be read off the phone, whose only surface is
+    // behind an immersive session and whose landmark line is five lines of
+    // diagnostics someone walking at arm's length is not reading.
+    //
+    // So it is a *sound*, and this returns only the edge — the instant the
+    // state changed. The room-pose message goes out ten times a second and a
+    // level would be a tone, not a cue.
+    //   'solved' — a solve past the takeover gate landed while the tags are
+    //              out of view. The event exists; turn around.
+    //   'banked' — the run back has enough confirmed frames and enough motion
+    //              to converge. The measurement is complete; go again.
+    //   'move'   — the run has the frames but not the motion. Standing still
+    //              floors alignAlpha at 0.02 and the reference never settles,
+    //              which reads offline as a plateau that is really a stall.
+    //   'dead'   — the survey has stopped standing behind the pose at all
+    //              (slip, relocalization, never aligned). Repeats until it is
+    //              fixed, because the only response is to stop walking.
+    //
+    // The thresholds are the replay's, imported from here by it rather than
+    // written twice: a cue that says "banked" on a run the offline tool then
+    // refuses is worse than no cue at all.
+    walkCue(clientId, entry) {
+      const room = entry?.room;
+      if (!room) return null;
+      let c = coach.get(clientId);
+      if (!c) {
+        c = { lastGoodAt: 0, goods: 0, motion: 0, lastP: null, solved: false, pending: false,
+          banked: false, movedAt: 0, deadAt: 0 };
+        coach.set(clientId, c);
+      }
+      const at = entry.at ?? Date.now();
+      const p = entry.msg?.xr?.p;
+      // 'slipping', 'dead', 'unaligned' and the rest all say the same thing to
+      // someone walking: the survey is not standing behind this pose, and
+      // everything measured from here until AR is re-entered is void. Same
+      // rule the replay breaks a stretch on, so the cue cannot promise an
+      // event across a boundary the scorer refuses. Anything in flight is
+      // dropped with it — a solve on one side of a relocalization and a run on
+      // the other are not a cycle.
+      if (room.quality !== 'good' && room.quality !== 'tracked') {
+        c.goods = 0; c.motion = 0; c.lastP = null;
+        c.solved = false; c.pending = false; c.banked = false;
+        if (at - c.deadAt < REACQUIRE_DEAD_REPEAT_MS) return null;
+        c.deadAt = at;
+        return 'dead';
+      }
+      // Cleared on the way back so the next death is announced at once rather
+      // than up to a repeat interval late.
+      c.deadAt = 0;
+      if (room.quality === 'good') {
+        // A single tracked frame between two confirmed ones is ordinary — the
+        // journals interleave them almost every frame — so the run is broken
+        // by *time* without a confirmation, not by one frame of it.
+        if (at - c.lastGoodAt > REACQUIRE_RUN_BREAK_MS) {
+          // The solve belonged to the stretch this run just ended, so the flag
+          // has to survive into the run to say whether banking it means
+          // anything — cleared here and read below, it could never be true at
+          // the same time as the run it qualifies.
+          c.pending = c.solved;
+          c.goods = 0; c.motion = 0; c.lastP = null; c.banked = false; c.solved = false;
+        }
+        c.lastGoodAt = at;
+        c.goods++;
+        if (p && c.lastP) c.motion += dist3(p, c.lastP);
+        if (p) c.lastP = p;
+        // Only a run that a solve preceded is worth announcing. Without this
+        // the cue banked any qualifying run and the walker heard a completed
+        // cycle where the scorer saw none — measured on the 16:59 walk, the
+        // 'banked' after the 63-inlier solve belonged to a later run entirely,
+        // the solve's own run having ended at six confirmed frames.
+        if (!c.pending || c.goods < REACQUIRE_MIN_GOOD || c.banked) return null;
+        if (c.motion >= REACQUIRE_MIN_RUN_M) { c.banked = true; return 'banked'; }
+        // Repeats while it keeps being true: this one is a correction to what
+        // the person is doing right now, not a state change to announce once.
+        if (at - c.movedAt < 1500) return null;
+        c.movedAt = at;
+        return 'move';
+      }
+      // Deliberately *not* gated on how long the tags have been gone. It was,
+      // and the cue then announced fewer events than the offline tool scores:
+      // measured on the 15:43 walk, a 50-inlier solve landed 0.6 s after the
+      // last confirmation, `replay-reacquire.js` scored it, and the walker
+      // heard nothing — which is the failure this whole cue exists to prevent,
+      // in the direction that wastes a walk rather than the one that lies
+      // about it. The latch below is what keeps a run of chained solves to one
+      // sound: it clears when a *new* good run starts, so one cycle is one cue
+      // however many frames solved inside it.
+      if (c.solved || !room.lmCheck) return null;
+      if (room.lmCheck.inliers < takeoverMinInliers) return null;
+      c.solved = true;
+      return 'solved';
+    },
+
     // For the viewer. Deliberately the merged set, for the same reason.
     // `solid` is the grade split the maps draw: a coarse consensus landmark
     // is a depth-grade guess the solve may not count yet, and showing the two
@@ -1953,6 +2290,7 @@ module.exports = {
   MIN_LANDMARKS_FOR_FIX, LANDMARK_MAX_JITTER_MM,
   LANDMARK_AGREE_M, LANDMARK_AGREE_DEG, LANDMARK_CONFIRM_RMS_PX,
   LANDMARK_TAKEOVER_MIN_INLIERS,
+  REACQUIRE_MIN_GOOD, REACQUIRE_MIN_RUN_M, REACQUIRE_RUN_BREAK_MS,
   LANDMARK_RESCUE, LANDMARK_MAX_DEPTH,
   OBS_RING, QUALIFY_EVERY, dist3,
 };

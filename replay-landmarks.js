@@ -23,19 +23,27 @@ const { parseArgs, numFlag, readJournals } = require('./replay-common.js');
 const {
   createLandmarks, landmarkGate, foundingDepth,
   MIN_LANDMARKS_FOR_FIX, LANDMARK_MAX_JITTER_MM,
+  LANDMARK_CONFIRM_RMS_PX, LANDMARK_TAKEOVER_MIN_INLIERS,
 } = require('./landmarks.js');
 const { quatAngleDeg } = require('./public/pose-math.js');
 const { dist3 } = require('./public/landmark-math.js');
+const { createReacquire } = require('./replay-reacquire.js');
 
 function usage(err) {
   if (err) console.error(err);
   console.error('usage: node replay-landmarks.js <journal.pose.jsonl> [more ...]\n'
     + '  [--gate live|any] [--min-landmarks N] [--stride N]\n'
     + '  [--pipeline live [--trace out.csv]]\n'
+    + '  [--pipeline live --reacquire 1 [--ref-min-good K] [--plateau-mm X]\n'
+    + '    [--min-run-motion-m X] [--max-gap-ms N] [--ref-max-ms N] [--run-break-ms N]\n'
+    + '    [--identity-tol-mm X] [--inlier-sweep 1] [--all-solves 1]\n'
+    + '    [--reacquire-trace out.csv]]\n'
     + '  [--min-obs N] [--min-arc DEG] [--collapse X] [--max-rms X]\n'
     + '  [--reassoc-px X] [--reassoc-margin X] [--trim-px X] [--confirm-rms X]\n'
     + '  [--jump-m X] [--jump-deg X]  (Infinity disables the mirror tripwire)\n'
     + '  [--voxel-min-n N] [--voxel-min-views N] [--voxel-cluster-m X]\n'
+    + '  [--solve-coarse 1]  (admit the coarse consensus cloud to the fit)\n'
+    + '  [--coarse-tier 0] [--coarse-trim-px X]  (the 0.5 m fallback tier)\n'
     + '  [--stale-px X] [--stale-streak N] [--guide-cluster-m X] [--quiet 1]');
   process.exit(1);
 }
@@ -74,6 +82,9 @@ if (flags.pipeline === 'live') {
   if (flags['takeover-min-inliers'] !== undefined) {
     liveOpts.takeoverMinInliers = num('takeover-min-inliers');
   }
+  if (flags['solve-coarse'] !== undefined) liveOpts.solveCoarse = num('solve-coarse') !== 0;
+  if (flags['coarse-tier'] !== undefined) liveOpts.coarseTier = num('coarse-tier') !== 0;
+  if (flags['coarse-trim-px'] !== undefined) liveOpts.coarseTrimPx = num('coarse-trim-px');
   const maxFoundDepth = num('max-found-depth', 1);
   // --trace: one row per cross-check-eligible frame, recording where the solve
   // path's count died (.plans/landmark-lock.md §3). The module hands over a row
@@ -83,6 +94,28 @@ if (flags.pipeline === 'live') {
   const tracePath = flags.trace;
   const traceRows = [];
   let pending = null;
+  // --reacquire: the takeover-vs-carry test (.plans/landmark-takeover-trust.md
+  // §3). It rides this loop rather than living in a tool of its own because
+  // only the re-derive produces a solve pose on a frame that never took over,
+  // and those frames are where the sample size is — the journal records
+  // `fix.pose` only where the gate fired, so a journal-only tool can never
+  // sweep below the gate its walk was recorded under.
+  // Defaults live in the module beside the reasoning for them, so a flag left
+  // off here cannot quietly mean something different from a flag left off
+  // there — the four-second window did exactly that and scored 2 boundaries
+  // out of 17 while the module's own default would have taken the stretch.
+  const rqOpts = {
+    confirmRms: liveOpts.confirmRms ?? LANDMARK_CONFIRM_RMS_PX,
+    gateInliers: liveOpts.takeoverMinInliers ?? LANDMARK_TAKEOVER_MIN_INLIERS,
+    allSolves: flags['all-solves'] !== undefined,
+  };
+  for (const [flag, key] of [['ref-min-good', 'refMinGood'], ['plateau-mm', 'plateauMm'],
+    ['min-run-motion-m', 'minRunMotionM'], ['max-gap-ms', 'maxGapMs'],
+    ['ref-max-ms', 'refMaxMs'], ['run-break-ms', 'runBreakMs'],
+    ['identity-tol-mm', 'identityTolMm']]) {
+    if (flags[flag] !== undefined) rqOpts[key] = num(flag);
+  }
+  const reacq = flags.reacquire !== undefined ? createReacquire(rqOpts) : null;
   const lm = createLandmarks({
     log: (m) => { if (!quiet) console.log(m); },
     opts: liveOpts,
@@ -121,7 +154,16 @@ if (flags.pipeline === 'live') {
   let prevAt = 0;
   const parity = { match: 0, mismatch: 0, replayOnly: 0, journalOnly: 0 };
   let firstMismatch = null;
-  for (const { entry } of readJournals(journals, { onError: usage })) {
+  // The coarse tier, counted at both its sites and never pooled with the
+  // precision path's numbers: `coarseCross` is the diagnostic one (a carry was
+  // there to compare against), `coarseLast` is the product one (nothing was).
+  let coarseCross = 0;
+  const coarseCrossDp = [];
+  let lastResort = 0;
+  let lastResortFix = 0;
+  let coarseLast = 0;
+  const coarseLastR = [];
+  for (const { file, entry } of readJournals(journals, { onError: usage })) {
     lines++;
     const room = entry.room;
     if (!room) continue;
@@ -138,6 +180,11 @@ if (flags.pipeline === 'live') {
     delete room.safeVia;
     delete room.landmarkRays;
     delete room.lmFix;
+    // The coarse tier's diagnostic line, re-derived like the rest. Deliberately
+    // *not* in `was`: it is not part of the parity contract, because a journal
+    // recorded before the tier existed has none and every frame would count as
+    // a mismatch on a field the product does not act on.
+    delete room.lmCoarse;
     // `lmCarry` marked a frame corrected by the carry fix that was built and
     // reverted on 03/08 (see the note in landmarks.js). Nothing writes it now;
     // it is stripped so the journals recorded while it was live still replay
@@ -147,7 +194,24 @@ if (flags.pipeline === 'live') {
       room.pose = room.carried;
       delete room.carried;
     }
+    // The last-resort branch's own undo. `qWas` is the quality the survey
+    // reported before a landmark or coarse fix replaced it; without putting it
+    // back, the entry reads as one that already had a pose and the branch that
+    // wrote it never re-runs. Older journals have no `qWas` and replay as they
+    // always did — those frames simply cannot be re-derived, which is the
+    // honest answer rather than a silently different one.
+    if (room.qWas !== undefined) {
+      room.quality = room.qWas;
+      if (room.quality !== 'dead') room.pose = null;
+      delete room.qWas;
+    }
     if (was.safeVia === 'landmark') room.mapSafe = false;
+    // Before the founding branch below, which returns early on a tag-confirmed
+    // frame — and a tag-confirmed frame is where the re-acquire test's
+    // reference comes from. `room.pose` here is the ARCore carry on a tag-less
+    // frame and the alignment as the tags have nudged it on a `good` one; both
+    // are A ∘ xr, which is the whole of what the test needs.
+    reacq?.frame({ file, line: lines, entry, carry: room.pose });
     if (entry.kind === 'xr-pose' && entry.msg.gen != null) {
       lm.noteDepth(0, entry.msg.gen, entry.msg.tags);
     }
@@ -175,6 +239,7 @@ if (flags.pipeline === 'live') {
     // points, applying only the carry correction. Mirrored exactly, or the
     // replay reports a different product on the majority of tag-less frames.
     const r = lm.check(0, entry);
+    reacq?.solve(r);
     if (tracePath && pending) {
       const b = (v) => (v ? 1 : 0);
       traceRows.push({
@@ -218,6 +283,30 @@ if (flags.pipeline === 'live') {
       if (r.confirmed) confirmed++;
       if (r.took) { took++; tookDp.push(r.dp * 1000); }
       if (room.safeVia === 'landmark') rescued++;
+    }
+    if (room.lmCoarse) {
+      coarseCross++;
+      coarseCrossDp.push(room.lmCoarse.dpMm);
+    }
+    // The last-resort branch (server.js), which this tool did not replay at
+    // all until the coarse tier needed measuring. It is where the tier is the
+    // *product* rather than a diagnostic — no tag, no carry, nothing the
+    // survey stands behind — so a tool that stops at check() cannot see the
+    // thing the tier was built for. Mirrored from maintainLandmarks in order:
+    // a tracked frame was handled by check() above and returns there.
+    if (!(entry.kind === 'xr-pose' && room.pose && room.quality === 'tracked')) {
+      if (!(room.pose && room.quality !== 'dead')
+        && entry.msg?.points?.length && entry.msg.gen != null) {
+        lastResort++;
+        const msg = entry.msg;
+        const intr = msg.intr ?? msg.intrinsics;
+        const fix = lm.solve(0, msg.points, msg.gen, intr, room.pose);
+        if (fix) lastResortFix++;
+        else {
+          const c = lm.solveCoarseTier(0, msg.points, msg.gen, intr, room.pose);
+          if (c) { coarseLast++; coarseLastR.push(c.r); }
+        }
+      }
     }
     const now = JSON.stringify({
       c: room.lmCheck, s: room.safeVia, r: room.landmarkRays, f: room.lmFix ?? null,
@@ -275,6 +364,23 @@ if (flags.pipeline === 'live') {
     // one of them and a takeover reporting the room's reflection.
     console.log(`  solves refused as mirror jumps    ${st.jumped}`);
   }
+  // The coarse tier. `last resort` is the headline — those are frames that
+  // carried no position at all, which is the hole the tier was specified for;
+  // the cross-check figure only says the tier is alive and roughly where the
+  // carry is. Reported separately from everything above because they are
+  // different products and one total would let the worse one flatter the
+  // better.
+  console.log(`  coarse tier: last resort ${lastResort} frame(s) — `
+    + `precision ${lastResortFix}, coarse ${coarseLast}`
+    + (coarseLastR.length
+      ? ` (radius median ${pct(coarseLastR, 0.5).toFixed(2)} m, `
+        + `worst ${Math.max(...coarseLastR).toFixed(2)} m)` : ''));
+  console.log(`               on the carry ${coarseCross}`
+    + (coarseCrossDp.length
+      ? ` (vs carried pose: median ${pct(coarseCrossDp, 0.5).toFixed(0)} mm, `
+        + `p90 ${pct(coarseCrossDp, 0.9).toFixed(0)} mm, `
+        + `worst ${Math.max(...coarseCrossDp).toFixed(0)} mm)` : '')
+    + (st.coarseJumped ? `  ·  ${st.coarseJumped} refused as mirror jumps` : ''));
   const dsum = lm.summary(0)?.depth;
   console.log(`  landmarks ${st.clients[0]?.landmarks ?? 0}`
     + ` (${st.qualified - st.qualifiedDepth - st.qualifiedConsensus} by arc, `
@@ -342,7 +448,16 @@ if (flags.pipeline === 'live') {
     console.log(`  journal: ${firstMismatch.then}`);
     console.log(`  replay:  ${firstMismatch.now}`);
   }
-  process.exit(parity.mismatch ? 1 : 0);
+  // Printed after the pipeline's own numbers, and its self-test — not its
+  // verdict — is what can fail the run. A verdict is data; a journal whose
+  // session-frame delta does not reproduce its own carry is a broken input.
+  const rq = reacq
+    ? reacq.report({
+      tracePath: flags['reacquire-trace'],
+      inlierSweep: flags['inlier-sweep'] !== undefined,
+    })
+    : { ok: true };
+  process.exit(parity.mismatch || !rq.ok ? 1 : 0);
 }
 
 // The trace measures the live cross-check's frame-to-frame dynamics, which the
@@ -378,6 +493,7 @@ if (gate !== 'live' && gate !== 'any') usage(`--gate must be live or any, not ${
   if (flags['voxel-min-views'] !== undefined) lmOpts.voxelMinViews = num('voxel-min-views');
   if (flags['voxel-cluster-m'] !== undefined) lmOpts.voxelClusterM = num('voxel-cluster-m');
   if (flags['consensus-adopt-px'] !== undefined) lmOpts.consensusAdoptPx = num('consensus-adopt-px');
+  if (flags['solve-coarse'] !== undefined) lmOpts.solveCoarse = num('solve-coarse') !== 0;
   if (flags['min-obs'] !== undefined) lmOpts.minObs = num('min-obs');
   if (flags['min-arc'] !== undefined) lmOpts.minArcDeg = num('min-arc');
   if (flags['collapse'] !== undefined) lmOpts.splitCollapse = num('collapse');
