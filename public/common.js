@@ -723,6 +723,12 @@ const ROOM_POSE_STALE_MS = 2000;
 // would be worse than showing neither.
 const ROOM_LANDMARK_ARC_DEG = 20;
 
+// How many landmarks the solve has to match before it will localize from them
+// at all. Mirrored from MIN_LANDMARKS_FOR_FIX in landmarks.js, which no page
+// loads — the server sends how many are live, this is what that is read
+// against, and without it "22 live" is a number with no scale.
+const ROOM_LANDMARK_MIN_FOR_FIX = 15;
+
 // Candidates get a colour of their own rather than a dimmer version of the
 // client's. A client colour is an *identity* — the same hue carries that
 // client's dot, its landmarks and its drawer cards — and using it for tracks that
@@ -746,9 +752,9 @@ function roomCandidateColorCss(alpha = null) {
 // the exact colour of the pose marker all over the map — the two mean
 // entirely different things and were being read as one. Teal: not any client
 // hue, not the candidates' grey, not the anchor's gold, not the amber that
-// means "inferred, act on it". Ownership is still readable where it matters
-// — the drawer's region cards carry the client tint and hovering lights the
-// owner's cloud.
+// means "inferred, act on it". Ownership is not drawn at all: a cloud belongs
+// to whoever built it, and that is a fact about the session rather than about
+// the room — the drawer's client card carries the counts instead.
 const ROOM_LANDMARK_COLOR = 0x2dd4bf;
 
 function roomLandmarkColor() {

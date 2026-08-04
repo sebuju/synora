@@ -139,7 +139,7 @@ function createMap2dView(canvas, mode = 'top', {
   // text -> half its width in pixels, for the label dodge. Lives across frames:
   // the font never changes, so a string measured once is measured for good.
   const textHalfWidths = new Map();
-  // What is highlighted — { kind: 'tag' | 'client' | 'region', id } or null.
+  // What is highlighted — { kind: 'tag' | 'client', id } or null.
   // Set from outside only: the drawer and every room view highlight the same
   // entity at once, so the one place that can know is the viewer, and every
   // renderer here is told rather than deciding for itself. One value, not one
@@ -1259,17 +1259,6 @@ function createMap2dView(canvas, mode = 'top', {
     if (landmarksAlpha > 0.01 && landmarks.length) {
       for (const c of landmarks) {
         if (!c.landmarks?.length) continue;
-        // A hovered region card lights that region's own points. p[4] is the
-        // region each point belongs to, carried for exactly this: lighting the
-        // client's whole cloud instead was the coarsest answer available, and
-        // with several regions to a client it lit nearly every dot on screen
-        // whichever card was pointed at. A point from before the field existed
-        // carries no region and simply never lights. Instant rather than
-        // eased: the data is replaced wholesale every push and carries nowhere
-        // to keep a fade.
-        const hotRegion = hovered?.kind === 'region' && c.clientId === hovered.clientId
-          ? hovered.regionId
-          : null;
         ctx.fillStyle = roomLandmarkColorCss();
         for (const p of c.landmarks) {
           // p[3] is the grade: solve-grade landmarks draw bright and a size
@@ -1278,12 +1267,10 @@ function createMap2dView(canvas, mode = 'top', {
           // must not read as the thing it is a guess about.
           const solid = p[3] !== 0;
           if (!solid && !showCoarse) continue;
-          const lit = hotRegion !== null && p[4] === hotRegion;
           const [x, y] = px(p);
-          ctx.globalAlpha = landmarksAlpha * (lit ? 0.95 : solid ? 0.85 : 0.3);
+          ctx.globalAlpha = landmarksAlpha * (solid ? 0.85 : 0.3);
           ctx.beginPath();
-          ctx.arc(x, y, (solid ? LANDMARK_DOT_PX + 1 : LANDMARK_DOT_PX)
-            + (lit ? 0.8 : 0), 0, Math.PI * 2);
+          ctx.arc(x, y, solid ? LANDMARK_DOT_PX + 1 : LANDMARK_DOT_PX, 0, Math.PI * 2);
           ctx.fill();
         }
       }

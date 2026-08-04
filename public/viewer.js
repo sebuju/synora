@@ -403,10 +403,8 @@ const sceneView = createSceneView(sceneCanvas);
 const forgetMarker = (id) => signaling.send({ type: 'marker-remove', id });
 // What the pointer is on, wherever it is: a card in the drawer, a bar or a
 // client dot in the top view, the same entity in the elevation. One value of
-// shape { kind: 'tag' | 'client' | 'region', id } — not one per kind, or two
-// hovers could be lit at once. `id` identifies exactly one thing on screen; a
-// region also carries `clientId`, for the views whose grain is coarser than the
-// card's (the map holds one merged cloud per client, not one per region).
+// shape { kind: 'tag' | 'client', id } — not one per kind, or two hovers could
+// be lit at once. `id` identifies exactly one thing on screen.
 // Held here because it is the one thing every
 // surface has to agree about — each of them reports what its own pointer is
 // over and is told what to draw, so there is no way for two of them to end up
@@ -720,12 +718,24 @@ function clientInfo(id) {
   if (lost && performance.now() - lost.at > LOST_STALE_MS) trackingLost.delete(id);
   const stillLost = trackingLost.get(id);
   const pose = poses.get(id);
+  // The landmark row belongs here rather than being passed to the drawer
+  // alongside: this is the one description of a client, and a panel assembling
+  // its own would be the second. `candidates` is the length of the cloud the
+  // maps are already drawing, so only `live` and the depth verdict come off the
+  // wire as their own numbers.
+  const lm = (roomFeed.getLandmarks() || []).find((c) => c.clientId === id);
   return {
     id,
     kind: 'client',
     ...(roster.get(id) || {}),
     vcamAvailable,
     live: !!dev,
+    landmarkState: lm ? {
+      n: lm.landmarks?.length ?? 0,
+      candidates: lm.candidates?.length ?? 0,
+      live: lm.state?.live ?? 0,
+      depth: lm.state?.depth ?? null,
+    } : null,
     poseMsg: pose?.msg ?? null,
     poseAge: pose ? performance.now() - pose.at : null,
     latency: dev?.latency ?? null,
@@ -802,8 +812,7 @@ let showDrawer = true;
 
 function refreshClientsPanel() {
   if (!showDrawer) return;
-  clientsPanel.update(clientIds().map(clientInfo), roomFeed.getMarkerMap(),
-    roomFeed.getLandmarks());
+  clientsPanel.update(clientIds().map(clientInfo), roomFeed.getMarkerMap());
 }
 
 // Recording byte counts and pose ages move on their own; the roster message

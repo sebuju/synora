@@ -23,13 +23,6 @@ const PANEL_RESOLUTIONS = ['480p', '720p', '1080p', '1440p', '4K'];
 // A pose older than this says nothing about where the client is now.
 const PANEL_POSE_STALE_MS = 2000;
 
-// How strongly a card is washed with its owning client's colour. This is the
-// whole of the ownership cue — there is no coloured edge any more — so it has to
-// be readable against the card's own #1c1c1c at a glance and still stay behind
-// the text. Faint on purpose: several of these stack under the tag cards, and a
-// drawer of saturated blocks reads as a warning rather than as a grouping.
-const CARD_TINT_ALPHA = 0.13;
-
 function createClientsPanel(el,
   { onControl, onVcam, onRename, onHover, onTagOpen, onTagRemove, onTagHistory }) {
   const cards = new Map();   // clientId -> card DOM
@@ -38,14 +31,13 @@ function createClientsPanel(el,
   // vice versa. Reported, never applied: what is hot is the viewer's to
   // decide, or a card and the map would each hold their own answer and
   // disagree the moment the pointer moved between them. One shape for every
-  // card family — { kind: 'tag' | 'client' | 'region', id }.
+  // card family — { kind: 'tag' | 'client', id }.
   //
   // `id` identifies the *card*, and nothing else may be smuggled into it: it is
   // what the dashboard compares hovers by, so two cards sharing one id are one
-  // entity and light as one. Anything a room view needs in order to draw the
-  // hover at its own coarser grain rides in `extra` instead.
-  function hoverable(root, kind, id, extra = null) {
-    root.onpointerenter = () => onHover?.({ kind, id, ...extra });
+  // entity and light as one.
+  function hoverable(root, kind, id) {
+    root.onpointerenter = () => onHover?.({ kind, id });
     root.onpointerleave = () => onHover?.(null);
   }
 
@@ -206,6 +198,51 @@ function createClientsPanel(el,
       out.push(info.pose ? 'no room fix' : 'not localizing');
     }
 
+    // The landmark cross-check: the camera solved from landmarks alone, and this
+    // is how far that landed from the pose being reported. It is the pipeline's
+    // only accuracy measurement and it has never been anywhere but server.log —
+    // the map draws where the landmarks are, which says nothing about whether
+    // they agree with anything. Absent until a solve survives, and that is the
+    // honest reading of a client that has not built a usable map yet.
+    const check = room?.lmCheck;
+    if (check) {
+      const bits = [`landmarks ${check.dpMm} mm`, `${check.deg}°`,
+        `${check.inliers} in`, `rms ${check.rms} px`];
+      // Neither of these is an aside. A takeover means the pose on the map is
+      // the landmarks' answer rather than ARCore's; a rescue means mapSafe —
+      // what gates every permanent thing the walls module writes — is standing
+      // on landmarks past the point the tags stopped vouching for it.
+      if (room.lmFix) bits.push('TOOK OVER');
+      else if (room.safeVia === 'landmark') bits.push('held safe');
+      out.push(bits.join(' · '));
+    }
+
+    // What the cloud on the map cannot say: how much of it anything is looking
+    // at right now. `live` against the solve's own count gate is the whole
+    // answer to "can this client localize off landmarks at all", and it is a far
+    // smaller number than the cloud — the map remembers thousands.
+    const lm = info.landmarkState;
+    if (lm && (lm.n || lm.candidates)) {
+      const bits = [];
+      if (lm.n) {
+        bits.push(`${lm.n} landmarks · ${lm.live} live`
+          + (lm.live < ROOM_LANDMARK_MIN_FOR_FIX ? ` of ${ROOM_LANDMARK_MIN_FOR_FIX}` : ''));
+      }
+      if (lm.candidates) {
+        bits.push(`${lm.candidates} candidate${lm.candidates === 1 ? '' : 's'}`);
+      }
+      // Depth trust, not arc. Measured on this room's journals the arc gate
+      // founds nothing at all (0 of 862 qualifications; depth and consensus did
+      // the rest), so arc progress describes a path nobody is on — and trusted
+      // depth is also what silences the phone's walk guidance, which otherwise
+      // reads as guidance that has given up.
+      const d = lm.depth;
+      if (d && d.residPct !== null) {
+        bits.push(d.trusted ? `depth trusted ±${d.residPct}%` : `depth ±${d.residPct}% unproven`);
+      }
+      out.push(bits.join(' · '));
+    }
+
     const link = [];
     if (info.live) {
       if (info.latency !== null && info.latency !== undefined) {
@@ -252,7 +289,11 @@ function createClientsPanel(el,
       cls: i === 0 && (info.paused || info.blank) ? 'warn'
         : text.startsWith('NO ARCORE TRACK') ? 'bad'
           : text.startsWith('room ') && info.poseAge < PANEL_POSE_STALE_MS ? 'room'
-            : '',
+            // A takeover is the landmarks overruling ARCore about where the
+            // camera is. It is rare, it is consequential, and it must not read
+            // as one more figure in a row of figures.
+            : text.endsWith('TOOK OVER') ? 'warn'
+              : '',
     })));
 
     // An XR client has no mic, no lens and no resolution to pick — ARCore
@@ -558,127 +599,6 @@ function createClientsPanel(el,
     // asking the server about a tag it no longer has.
     if (openTagId !== null && !tagCards.has(openTagId)) setOpenTag(null);
     return true;
-  }
-
-  // The region cards on screen, keyed the way every other list here is so
-  // setHovered can reach one. A note (the singleton tally, a candidate line)
-  // belongs to no region and carries `clientId: null`.
-  const groupCards = new Map();   // key -> { root, clientId, ... }
-
-  // Landmark regions as cards, one per group, newest survey state each call.
-  //
-  // A singleton region is one qualified corner. It is real but it is not a
-  // place, and a drawer full of them would bury the regions that are — so they
-  // are counted rather than listed.
-  function buildGroups(landmarks) {
-    const rows = [];
-    for (const c of landmarks || []) {
-      for (const g of c.groups || []) rows.push({ ...g, clientId: c.clientId });
-    }
-    const solo = rows.filter((g) => g.n < 2).length;
-    const shown = rows.filter((g) => g.n >= 2).sort((a, b) => b.n - a.n);
-    // Candidates, in one line rather than as cards: they have no identity worth
-    // a card, and what is worth knowing is the shape of the pile — how many are
-    // being followed and how far the best of them has got, since "plenty of
-    // candidates, none past 9°" and "no candidates at all" are the two failures
-    // and they call for opposite responses. This is the only place the empty
-    // case says anything at all.
-    const cand = [];
-    for (const c of landmarks || []) {
-      if (c.candidates?.length) {
-        cand.push({
-          clientId: c.clientId,
-          n: c.candidates.length,
-          best: Math.max(...c.candidates.map((k) => k.span || 0)),
-        });
-      }
-    }
-    const items = shown.map((g) => ({ k: `r${g.clientId}:${g.id}`, g }));
-    if (solo) {
-      items.push({
-        k: 'solo',
-        bg: 'rgba(255,255,255,0.03)',
-        text: `+${solo} single-anchor region${solo === 1 ? '' : 's'}`,
-      });
-    }
-    for (const c of cand) {
-      items.push({
-        k: `c${c.clientId}`,
-        // The candidate grey, not the client's colour: a card in the client's
-        // colour claims the client *has* these, and the whole point of the card
-        // is that it does not yet.
-        bg: roomCandidateColorCss(CARD_TINT_ALPHA),
-        text: `${c.n} candidate${c.n === 1 ? '' : 's'}`
-          + ` · best arc ${Math.round(c.best)}/${ROOM_LANDMARK_ARC_DEG}°`,
-      });
-    }
-    syncKeyed(groupsEl, items, {
-      key: (it) => it.k,
-      store: groupCards,
-      make: (it) => (it.g ? buildGroupCard(it.g.clientId, it.k, it.g.id) : buildGroupNote()),
-      paint: (card, it) => (it.g ? paintGroupCard(card, it.g) : paintGroupNote(card, it)),
-    });
-  }
-
-  function buildGroupNote() {
-    const root = document.createElement('div');
-    root.className = 'drawer-card';
-    root.style.opacity = '0.6';
-    return { root, clientId: null };
-  }
-
-  function paintGroupNote(card, it) {
-    card.root.style.background = it.bg;
-    if (card.root.textContent !== it.text) card.root.textContent = it.text;
-  }
-
-  function buildGroupCard(clientId, key, regionId) {
-    const root = document.createElement('div');
-    root.className = 'drawer-card';
-    // The card's own key, not its client's. A client has several regions, and
-    // keying the hover by the client made them one entity: pointing at any
-    // region card lit every other region that client owns.
-    //
-    // The client and the region ride along for the map, which draws points
-    // rather than cards and identifies them by that pair.
-    hoverable(root, 'region', key, { clientId, regionId });
-    // Tinted rather than classed: the tint is the client's own colour, so it
-    // cannot live in the stylesheet as a fixed value. Kept faint — this has to
-    // read as "not a tag" at a glance without competing with the tags above it.
-    root.style.background = roomClientColorCss(clientId, CARD_TINT_ALPHA);
-
-    const head = document.createElement('div');
-    head.className = 'head';
-    const name = document.createElement('span');
-    name.className = 'name';
-    name.style.color = roomClientColorCss(clientId);
-    const kind = document.createElement('span');
-    kind.className = 'kind';
-    head.append(name, kind);
-
-    // `lines` is the tag card's own body container, so these sit on the same
-    // grid as everything above them rather than inventing a second layout.
-    const lines = document.createElement('div');
-    lines.className = 'lines';
-    const pos = document.createElement('div');
-    const arc = document.createElement('div');
-    lines.append(pos, arc);
-
-    root.append(head, lines);
-    return { root, clientId, key, name, kind, pos, arc };
-  }
-
-  function paintGroupCard(card, g) {
-    card.root.classList.toggle('hot', isHot('region', card.key));
-    card.name.textContent = `Region ${g.id}`;
-    // Live against total is the honest state of it: a landmark the map remembers
-    // but nothing is currently looking at cannot contribute to a fix.
-    card.kind.textContent = `${g.live}/${g.n} landmarks`;
-    card.pos.textContent = `${g.p.map((v) => v.toFixed(2)).join(', ')} m`;
-    // The widest arc any member was seen through. It is the quality of the look
-    // this region got, and the reason one region qualifies where another does
-    // not — so it is the one measurement worth a line here.
-    card.arc.textContent = `client ${g.clientId} · seen through ${g.span}°`;
   }
 
   // --- What the tag has been doing ------------------------------------------
@@ -1452,14 +1372,7 @@ function createClientsPanel(el,
   // tree down the drawer every time someone connected.
   const clientsEl = document.createElement('div');
   const tagsEl = document.createElement('div');
-  // Landmark regions, directly under the surveyed tags and deliberately in the
-  // same column: they are the other thing the room is being localized from, and
-  // the comparison is the point. What keeps them from being read *as* tags is
-  // the styling — dimmer, tinted, and carrying the colour of the client whose
-  // session they belong to, because unlike a tag they are not the room's
-  // property. They vanish with that client.
-  const groupsEl = document.createElement('div');
-  el.append(tagsEl, groupsEl, emptyEl, clientsEl);
+  el.append(tagsEl, emptyEl, clientsEl);
 
   return {
     setActive(on) {
@@ -1477,13 +1390,8 @@ function createClientsPanel(el,
       for (const [id, card] of cards) {
         card.root.classList.toggle('hot', isHot('client', id));
       }
-      for (const card of groupCards.values()) {
-        if (card.clientId === null) continue;
-        card.root.classList.toggle('hot', isHot('region', card.key));
-      }
     },
-    update(list, markerMap = null, landmarks = []) {
-      buildGroups(landmarks);
+    update(list, markerMap = null) {
       emptyEl.style.display = list.length ? 'none' : '';
       syncKeyed(clientsEl, list, {
         key: (info) => info.id,
