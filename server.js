@@ -599,6 +599,47 @@ function journalPose(ws, entry) {
   ws.poseJournalLines++;
 }
 
+// Detection rate the client reported achieving against the interval it was
+// asked for (`msg.cost`, from either capture page's rolling-window meter —
+// see common.js createCostMeter). The setting says the rate is "attempted, not
+// achieved" (settings.js) and nothing checked that until now.
+//
+// Logged only on a crossing, the same shape as the ARCore tracking-loss log
+// above — a level judged against one threshold flaps, the lesson already paid
+// for once by depthState (.claude/rules/depth.md), so BEHIND_ON/BEHIND_OFF
+// give the verdict two thresholds rather than one.
+const BEHIND_ON = 0.75;    // ratio of achieved to target that trips "behind"
+const BEHIND_OFF = 0.9;    // ratio that clears it — clears by more than it tripped
+
+function noteDetectRate(ws, cost) {
+  if (!cost) return;
+  const { detHz, targetMs, askedMs } = cost;
+  if (Number.isFinite(detHz) && Number.isFinite(targetMs) && targetMs > 0) {
+    const targetHz = 1000 / targetMs;
+    const ratio = detHz / targetHz;
+    const wasBehind = !!ws.detectBehind;
+    const nowBehind = wasBehind ? ratio < BEHIND_OFF : ratio < BEHIND_ON;
+    if (nowBehind && !wasBehind) {
+      log(`Client ${ws.clientId} behind on detection: ${detHz.toFixed(1)}/s of `
+        + `${targetHz.toFixed(1)} asked (${Math.round(targetMs)} ms/detection)`);
+    } else if (!nowBehind && wasBehind) {
+      log(`Client ${ws.clientId} keeping up on detection again: `
+        + `${detHz.toFixed(1)}/s of ${targetHz.toFixed(1)} asked`);
+    }
+    ws.detectBehind = nowBehind;
+  }
+  // Separately: the interval the client says it is working to may not be the
+  // one this server last asked for — a config push that never arrived, or
+  // arrived before a change. Logged once per value, or a client stuck on a
+  // stale setting floods the log with the same line every report.
+  if (Number.isFinite(askedMs) && askedMs !== settings.get('poseRateMs')
+    && ws.detectAskedLogged !== askedMs) {
+    ws.detectAskedLogged = askedMs;
+    log(`Client ${ws.clientId} detecting at ${askedMs} ms — server is asking for `
+      + `${settings.get('poseRateMs')} ms`);
+  }
+}
+
 function send(socket, obj) {
   if (socket && socket.readyState === socket.OPEN) {
     socket.send(JSON.stringify(obj));
@@ -1464,6 +1505,7 @@ function handleSignal(ws, msg) {
       maintainLandmarks(ws, entry);
       entry.room.roll = updateScreenRoll(ws, entry.room.pose);
       journalPose(ws, entry);
+      noteDetectRate(ws, msg.cost);
       // What is *shown* takes the eased pose; what is stored above did not.
       // Only when the survey's own alignment produced it: a landmark fix or a
       // dead-reckon has replaced `entry.room.pose` by now, and neither has an
@@ -1511,6 +1553,7 @@ function handleSignal(ws, msg) {
       maintainLandmarks(ws, entry);
       entry.room.roll = updateScreenRoll(ws, entry.room.pose);
       journalPose(ws, entry);
+      noteDetectRate(ws, msg.cost);
       send(viewerSocket, { ...msg, clientId: ws.clientId, room: entry.room });
       sendWatchers(roomPoseMessage(ws.clientId, msg, entry.room));
       // The client cannot know its room pose on its own (the marker map lives

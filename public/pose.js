@@ -28,6 +28,29 @@ const posePipeline = (() => {
   let config = { markerSizeM: 0.15, poseRateMs: 150 };
   let facing = 'environment';
 
+  // Detection rate, over the same rolling-window meter /xr-client uses (see
+  // common.js) — so a phone delivering 3 detections a second against a 100 ms
+  // ask is no longer indistinguishable on the dashboard from one delivering
+  // 10. Rolls once per detection rather than once per frame: there is no
+  // continuous frame loop here to roll on, on either path (the worker awaits
+  // each frame in turn, the fallback is driven by requestVideoFrameCallback
+  // gated the same way). `fps` and `blocked` are absent — a slow detect delays
+  // the next one rather than costing a distinct dropped frame, and the whole
+  // deficit already shows up as detHz falling behind targetMs.
+  let lastTargetMs = config.poseRateMs;
+  const detectMeter = createCostMeter({
+    windowMs: 5000,
+    shape: (win) => ({
+      detHz: win.rate('dets'),
+      detMs: win.mean('dets'),
+      // The interval actually being enforced (idle backoff widens it — see
+      // detect-core.js intervalMs) alongside the raw ask, so a client backed
+      // off looking at a blank wall reads as "idle rate", not "behind".
+      targetMs: lastTargetMs,
+      askedMs: config.poseRateMs,
+    }),
+  });
+
   // Intrinsics are read from localStorage, so the page owns them whichever
   // thread does the detecting. They always describe the full frame — crops
   // offset corners, they never rescale the camera model.
@@ -71,6 +94,9 @@ const posePipeline = (() => {
 
   function publishPose(res) {
     const K = intrinsicsAt(res.w, res.h);
+    lastTargetMs = res.targetMs ?? config.poseRateMs;
+    detectMeter.roll(performance.now());
+    detectMeter.bump('dets', res.timing.total);
     signaling.send({
       type: 'pose',
       t: clockSync.synced ? clockSync.at(res.at) : null,
@@ -97,6 +123,10 @@ const posePipeline = (() => {
       // silence. It was briefly conditional, and the cost of that was the joint
       // PnP quietly never running.
       intr: K && { fx: K.fx, fy: K.fy, cx: K.cx, cy: K.cy, dist: K.dist },
+      // What the detection loop is costing, for the drawer card and the
+      // journal — see /xr-client's identical field for why this rides the
+      // pose message rather than client-state.
+      cost: detectMeter.report(),
     });
     updateStats(res);
   }
@@ -241,7 +271,7 @@ const posePipeline = (() => {
     return coreStarting.then(armLoop);
   }
 
-  async function fallbackDetect(now) {
+  async function fallbackDetect(now, targetMs) {
     const w = video.videoWidth;
     const h = video.videoHeight;
     if (!w || !h) return;
@@ -271,6 +301,7 @@ const posePipeline = (() => {
       })),
       gen: tracked?.gen,
       trackMs: tracked?.ms,
+      targetMs,
     });
   }
 
@@ -285,16 +316,20 @@ const posePipeline = (() => {
       const now = performance.now();
       // `busy` matters here in a way it did not when detection was synchronous:
       // a detect that outruns the frame interval must not be started twice.
-      if (core?.ready && !busy && !paused
-        && now - lastDetect >= core.intervalMs(config.poseRateMs, now)) {
-        lastDetect = now;
-        busy = true;
-        try {
-          await fallbackDetect(now);
-        } catch {
-          // A single bad frame (mid-switch, zero-size) must not kill the loop.
-        } finally {
-          busy = false;
+      // The interval is read once core is known ready, or `intervalMs` runs on
+      // a core that does not exist yet.
+      if (core?.ready && !busy && !paused) {
+        const targetMs = core.intervalMs(config.poseRateMs, now);
+        if (now - lastDetect >= targetMs) {
+          lastDetect = now;
+          busy = true;
+          try {
+            await fallbackDetect(now, targetMs);
+          } catch {
+            // A single bad frame (mid-switch, zero-size) must not kill the loop.
+          } finally {
+            busy = false;
+          }
         }
       }
       video.requestVideoFrameCallback(onFrame);

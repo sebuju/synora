@@ -110,10 +110,6 @@ let lastIntr = null;
 // goes alongside it so the dashboard can draw where the phone is rather than
 // where it was.
 let lastXrNow = null;
-// XR frames since the cost window opened, not since the session started — see
-// costFrame. A total says only that the loop is alive; the rate says whether
-// anything is taking it away.
-let frames = 0;
 let lastTags = [];
 let lastTrack = null;
 // Set when the worker reports the tracker shut itself off. Sticky for the
@@ -396,61 +392,42 @@ function chipDue(now) {
 // which a rate says too, and only a rate says whether something took the loop
 // away.
 //
-// Both readers get one *completed* window. Read live, the chip at 5 Hz would
-// mostly be dividing by a window a fifth of a second old, so the accumulators
-// roll on the frame loop and a partial stands in only until the first roll.
-const COST_WINDOW_MS = 5000;
-let costFrom = 0;
-let dets = 0;
-let detMsSum = 0;
-let blocked = 0;
-let flips = 0;
-let flipMsSum = 0;
-let txFrames = 0;
-let txMsSum = 0;
-let costOut = null;
-
-function costSnapshot(now) {
-  const span = Math.max(1, now - costFrom);
-  return {
-    fps: Math.round(frames * 1e4 / span) / 10,
-    detHz: Math.round(dets * 1e4 / span) / 10,
-    // Null rather than 0: no detection finishing in the window is not a
-    // detection that cost nothing.
-    detMs: dets ? Math.round(detMsSum / dets) : null,
-    flipMs: flips ? Math.round(flipMsSum * 10 / flips) / 10 : null,
+// The window itself is `createCostMeter` (common.js), shared with `/client`'s
+// detection meter — this shape function is what makes its output the same
+// keys and rounding the chip and every existing journal already read.
+const costMeter = createCostMeter({
+  windowMs: 5000,
+  shape: (win) => ({
+    fps: win.rate('frames'),
+    detHz: win.rate('dets'),
+    detMs: win.mean('dets'),
+    flipMs: win.mean('flips', 1),
     // What handing that same picture to the encoder costs on this thread. The
     // encode itself is off it; this is only the frame being taken.
-    txMs: txFrames ? Math.round(txMsSum * 10 / txFrames) / 10 : null,
+    txMs: win.mean('tx', 1),
     // Detections that came due and were dropped because the previous one was
     // still out. This is the gap between the rate asked for and the rate
     // delivered — the number that moves first when anything new is added to
     // the frame.
-    blocked,
-  };
-}
+    blocked: win.count('blocked'),
+    // The interval this loop actually gates on and the one it was asked for —
+    // equal here (this path has no idle backoff), but the dashboard reads both
+    // off one shape, so XR carries the pair too rather than being a special
+    // case.
+    targetMs: poseRateMs,
+    askedMs: poseRateMs,
+  }),
+});
 
 function costFrame(now) {
-  if (!costFrom) costFrom = now;
-  else if (now - costFrom >= COST_WINDOW_MS) {
-    costOut = costSnapshot(now);
-    costFrom = now;
-    frames = 0;
-    dets = 0;
-    detMsSum = 0;
-    blocked = 0;
-    flips = 0;
-    flipMsSum = 0;
-    txFrames = 0;
-    txMsSum = 0;
-  }
-  frames++;
+  costMeter.roll(now);
+  costMeter.bump('frames');
 }
 
 // The same object on the chip and on every report, so the journal can never
 // disagree with what the screen said.
 function costReport() {
-  return costOut ?? (costFrom ? costSnapshot(performance.now()) : null);
+  return costMeter.report();
 }
 
 function costLine() {
@@ -823,8 +800,7 @@ function publishFrame(canvas, w, h) {
   if (!camStream && !startMedia(canvas, w, h)) return;
   const t0 = performance.now();
   camTrack.requestFrame();
-  txMsSum += performance.now() - t0;
-  txFrames++;
+  costMeter.bump('tx', performance.now() - t0);
   if (mediaStarted) return;
   // Only now that a frame exists does the rest have something to describe.
   mediaStarted = true;
@@ -977,8 +953,7 @@ function pixelsToCanvas(w, h) {
     img.data.set(pixels.subarray((h - 1 - y) * row, (h - y) * row), y * row);
   }
   readCtx.putImageData(img, 0, 0);
-  flips++;
-  flipMsSum += performance.now() - t0;
+  costMeter.bump('flips', performance.now() - t0);
   return readCanvas;
 }
 
@@ -1044,8 +1019,7 @@ async function start() {
     camInfo = null;
     // The cost window belongs to the session that was measured; carried over,
     // the next session's first reports would describe the last one's.
-    costFrom = 0;
-    costOut = null;
+    costMeter.reset();
     // No more frames are coming, and a canvas track that stops being fed keeps
     // its last one — the dashboard would hold a tile that looks live for as
     // long as the page stayed open. `streamOn` survives: it is a standing
@@ -1075,7 +1049,7 @@ async function start() {
 function startDetection(frame, view, pose, layer, now) {
   if (busy) {
     // Due, and dropped because the previous one had not come back.
-    if (now - lastPose >= poseRateMs) blocked++;
+    if (now - lastPose >= poseRateMs) costMeter.bump('blocked');
     return;
   }
   if (now - lastPose < poseRateMs) return;
@@ -1085,8 +1059,7 @@ function startDetection(frame, view, pose, layer, now) {
   // viewport, and the frame that is not going to detect has no use for one.
   detectAndReport(frame, view, pose, viewportOf(layer, view)).finally(() => {
     busy = false;
-    dets++;
-    detMsSum += performance.now() - now;
+    costMeter.bump('dets', performance.now() - now);
   });
 }
 

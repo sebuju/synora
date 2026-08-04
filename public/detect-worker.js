@@ -72,7 +72,12 @@ const source = {
 async function onFrame(frame) {
   if (!enabled || paused || !core.ready) return;
   const now = performance.now();
-  if (now - lastDetect < core.intervalMs(poseRateMs, now)) return;
+  // The interval actually being enforced, not the raw setting — idle backoff
+  // (see intervalMs) widens it once nothing has been seen for a while, and the
+  // page reports both so a phone backed off looking at a blank wall is not
+  // indistinguishable from one that cannot keep up.
+  const targetMs = core.intervalMs(poseRateMs, now);
+  if (now - lastDetect < targetMs) return;
   lastDetect = now;
 
   const fw = frame.codedWidth || frame.displayWidth;
@@ -114,6 +119,10 @@ async function onFrame(frame) {
     gen: tracked?.gen,
     trackMs: tracked?.ms,
     churn: tracked?.churn,
+    // The interval this detection was gated on, for the page's cost meter —
+    // detect-core.js is not loaded on the page on this path, so it cannot
+    // recompute idle backoff itself.
+    targetMs,
   });
 }
 
