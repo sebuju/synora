@@ -80,9 +80,8 @@ function startWatcher() {
       last = msg;
       for (const c of msg.clients || []) {
         if (!c.landmarks?.length && !c.candidates?.length) continue;
-        const regions = (c.groups || []).filter((g) => g.n >= 2).length;
         console.log(`  [viewer] client ${c.clientId}: ${c.landmarks.length} landmark(s), `
-          + `${c.candidates?.length ?? 0} candidate(s), ${regions} region card(s)`);
+          + `${c.candidates?.length ?? 0} candidate(s), ${c.state?.live ?? 0} live`);
       }
     }
   });

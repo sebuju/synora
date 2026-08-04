@@ -36,7 +36,7 @@ function usage(err) {
     + '  [--reassoc-px X] [--reassoc-margin X] [--trim-px X] [--confirm-rms X]\n'
     + '  [--jump-m X] [--jump-deg X]  (Infinity disables the mirror tripwire)\n'
     + '  [--voxel-min-n N] [--voxel-min-views N] [--voxel-cluster-m X]\n'
-    + '  [--stale-px X] [--stale-streak N] [--group-m X] [--quiet 1]');
+    + '  [--stale-px X] [--stale-streak N] [--guide-cluster-m X] [--quiet 1]');
   process.exit(1);
 }
 
@@ -371,7 +371,9 @@ if (gate !== 'live' && gate !== 'any') usage(`--gate must be live or any, not ${
   if (flags['jump-deg'] !== undefined) lmOpts.jumpDeg = num('jump-deg');
   if (flags['stale-px'] !== undefined) lmOpts.stalePx = num('stale-px');
   if (flags['stale-streak'] !== undefined) lmOpts.staleStreak = num('stale-streak');
-  if (flags['group-m'] !== undefined) lmOpts.groupM = num('group-m');
+  if (flags['guide-cluster-m'] !== undefined) {
+    lmOpts.guideClusterM = num('guide-cluster-m');
+  }
   if (flags['voxel-min-n'] !== undefined) lmOpts.voxelMinN = num('voxel-min-n');
   if (flags['voxel-min-views'] !== undefined) lmOpts.voxelMinViews = num('voxel-min-views');
   if (flags['voxel-cluster-m'] !== undefined) lmOpts.voxelClusterM = num('voxel-cluster-m');
@@ -467,16 +469,15 @@ if (gate !== 'live' && gate !== 'any') usage(`--gate must be live or any, not ${
     console.log(`landmarks dropped as stale: ${s.dropped}`);
   }
 
-  // What the drawer would actually show. The card count is the number the
-  // reader lives with, and it is not the region count: singletons collapse into
-  // one note, so a grouping radius is judged on cards, not on groups.
-  const groups = lm.groups(0);
-  const cards = groups.filter((g) => g.n >= 2);
-  const solo = groups.length - cards.length;
-  const sizes = cards.map((g) => g.n).sort((a, b) => b - a);
-  console.log(`\nregions ${groups.length} → ${cards.length} card(s)`
-    + `${solo ? ` + 1 note for ${solo} singleton(s)` : ''}`
-    + `, sizes ${sizes.join('/') || '—'}`);
+  // What the drawer would actually show of all this: how many of the landmarks
+  // above a track is currently sitting on, against the count gate. The map draws
+  // the whole cloud and a walk can end with thousands of them and nothing live.
+  const vs = lm.viewerState(0);
+  if (vs) {
+    console.log(`\nlive landmarks ${vs.live} (fix needs ${minLandmarks})`
+      + `, depth ${vs.depth.residPct === null ? 'unmeasured'
+        : `${vs.depth.trusted ? 'trusted ' : ''}±${vs.depth.residPct}%`}`);
+  }
 
   // ---- the holdout --------------------------------------------------------
   //
