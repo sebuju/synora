@@ -9,6 +9,7 @@
 //     [--markers markers.json] [--step-m 0.30] [--step-m-per-s 3.0]
 //     [--step-max-dt 0.6] [--step-cap-m 1.0] [--step-recover 3]
 //     [--refine-noise-scale 1] [--joint-pnp 1] [--joint-min-offplane-m 0.03]
+//     [--adopt-chain 1] [--anchored-refine 1]
 //     [--perturb id:deg[:m]] [--log] [--per-journal] [--refine]
 //
 // The journal lines are fed to survey.alignXr / survey.handlePose with the
@@ -49,6 +50,7 @@ function usage(err) {
     + '  [--markers markers.json] [--step-m X] [--step-m-per-s X]\n'
     + '  [--step-max-dt X] [--step-cap-m X] [--step-recover N]\n'
     + '  [--refine-noise-scale X] [--joint-pnp 0|1] [--joint-min-offplane-m X]\n'
+    + '  [--adopt-chain 0|1] [--anchored-refine 0|1]\n'
     + '  [--perturb id:deg[:m]] [--log] [--per-journal] [--refine]');
   process.exit(1);
 }
@@ -96,6 +98,15 @@ if (flags['refine-noise-scale'] !== undefined) {
 // `--joint-pnp 0` reproduces the module as it stood before the joint multi-tag
 // solve: every call falls straight through to fuseCameraPose.
 if (flags['joint-pnp'] !== undefined) opts.jointPnp = Number(flags['joint-pnp']);
+// `--adopt-chain 0 --anchored-refine 0` reproduces the module as it stood before
+// the refinement-cycle fix. Both default on and both are separately switchable,
+// because they are independent: adoption fills a founding chain that was never
+// recorded, the gate refuses a fix with no witness nearer the datum, and a
+// before/after that moved both at once cannot say which one did the work.
+if (flags['adopt-chain'] !== undefined) opts.adoptChain = Number(flags['adopt-chain']);
+if (flags['anchored-refine'] !== undefined) {
+  opts.anchoredRefine = Number(flags['anchored-refine']);
+}
 if (flags['joint-min-offplane-m'] !== undefined) {
   opts.jointMinOffplaneM = Number(flags['joint-min-offplane-m']);
 }
@@ -190,6 +201,11 @@ const scratch = path.join(os.tmpdir(), `synora-replay-survey-${process.pid}.json
 //       question is whether the outliers are lopsided, and they are not — the
 //       angle between quatMean and quatMedian of a session's stream is
 //       0.21-1.16 deg at the median. See the note in survey.js's refine loop.
+//     - UNANCH: sightings that agreed with the map but had no witness nearer
+//       the datum than the tag under test, so they checked it without moving
+//       it. Read it beside DRIFT: a tag that stopped drifting because it
+//       converged and one that stopped because nothing was allowed to correct
+//       it draw the same flat trace, and this is what separates them.
 //     - DRIFT: how far the stored pose actually travelled over one session, in
 //       mm and degrees. The literal reading of "known-good tags self-heal too
 //       easily", and the only one taken from the module's output rather than
@@ -229,7 +245,7 @@ function fmtDist(vals) {
 
 function newTagStats() {
   return {
-    nudges: 0, disagrees: 0, ambig: 0, mirror: 0,
+    nudges: 0, disagrees: 0, unanchored: 0, nowitness: 0, ambig: 0, mirror: 0,
     dq: [], qs: [], inlier: [], driftMm: [], driftDeg: [], finals: [],
   };
 }
@@ -296,6 +312,8 @@ function refineTable(map, indent) {
     console.log(`${indent}tag ${String(id).padStart(2)}`
       + `  nudges ${String(s.nudges).padStart(6)}`
       + `  rejects ${String(s.disagrees).padStart(5)}`
+      + `  unanch ${String(s.unanchored).padStart(5)}`
+      + `  nowit ${String(s.nowitness).padStart(6)}`
       + `  ambig ${s.nudges ? (100 * s.ambig / s.nudges).toFixed(0) : '--'}%`
       + `  mirror ${s.ambig ? (100 * s.mirror / s.ambig).toFixed(0) : '--'}%`
       + `  dq ${dq.length ? `p50 ${pct(dq, 0.5).toFixed(2)} p90 ${pct(dq, 0.9).toFixed(2)} `
@@ -367,6 +385,20 @@ for (const file of journals) {
       const s = tagStats(jr, ev.id);
       if (ev.verdict === 'disagree') {
         s.disagrees++;
+        return;
+      }
+      // The two ways a sighting can check a tag without moving it: no witness
+      // at all (every other tag in frame descends from this one), or witnesses
+      // that all sit at this tag's own depth or further out. Counted apart from
+      // nudges and from each other, because "the tag stopped drifting" and "the
+      // tag stopped being refined" are the two readings of the same flat trace
+      // and these are the only figures that tell them apart.
+      if (ev.verdict === 'unanchored') {
+        s.unanchored++;
+        return;
+      }
+      if (ev.verdict === 'nowitness') {
+        s.nowitness++;
         return;
       }
       s.nudges++;
@@ -475,6 +507,8 @@ for (const file of journals) {
     const t = tagStats(total.refine, id);
     t.nudges += s.nudges;
     t.disagrees += s.disagrees;
+    t.unanchored += s.unanchored;
+    t.nowitness += s.nowitness;
     t.ambig += s.ambig;
     t.mirror += s.mirror;
     t.dq.push(...s.dq);

@@ -869,6 +869,13 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
   // down-weight head-on sightings 25x on no evidence. A reprojection-error term
   // was tried alongside and measured as nothing (under 0.05 deg on every tag).
   const REFINE_NOISE_SCALE = opts.refineNoiseScale ?? 1;
+  // The two halves of the fix for a refinement cycle — see `adoptChain` and the
+  // anchored gate in the refine loop. Separately switchable because they are
+  // independent and a replay has to be able to say which of them earned a
+  // result: adoption alone removes the cycle this room actually had, the gate
+  // alone makes that class of cycle unreachable whatever the provenance says.
+  const ADOPT_CHAIN = opts.adoptChain ?? 1;
+  const ANCHORED_REFINE = opts.anchoredRefine ?? 1;
   // How close two consecutive implied alignments have to sit to count as
   // agreeing. est is the alignment, not the camera, so it does not move with
   // the phone at all — the whole of this budget is fix noise, which runs to
@@ -1273,6 +1280,8 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
   // The same two questions asked of refinement instead of promotion: which tags
   // have checked this one since it entered the map, and how far from the datum
   // that puts it. `provenance` above is frozen at promotion and must stay frozen
+  // (`adoptChain` below is the one exception, and is not a widening either: it
+  // fills in a chain that was never recorded, once)
   // — `from` is also the descendant graph the refine loop filters on and `hops`
   // is the clip authority — so this is a second, read-only view rather than a
   // widening of that one. A tag promoted while ARCore carried the pose has no
@@ -1292,6 +1301,63 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
       .map((id) => markers.get(id)?.hops)
       .filter((h) => Number.isFinite(h));
     return { chainFrom, chainHops: depths.length ? Math.min(...depths) + 1 : null };
+  }
+
+  // Unknown chains are adopted once, and only once. A tag promoted while ARCore
+  // carried the pose has `from: []`, which `datumDepth` reads as "trust this
+  // least" and `descendsFrom` reads as "descendant of nothing" — the strongest
+  // standing in the map. The second reading is the dangerous one: such a tag
+  // votes at full weight in every other tag's refinement forever, including in
+  // the refinement of the tags that placed it. Measured on tag 5, promoted off
+  // ARCore four seconds before it was first seen beside tag 3: it refined tag 2
+  // while tag 2 refined it, and the pair walked 255 mm in one session with
+  // nothing tying either of them to the anchor.
+  //
+  // This is not the widening the note above `chainProvenance` forbids. Adoption
+  // replaces *unknown* with *measured* and then freezes exactly as a promotion
+  // does; a chain that already exists is never touched, so no two tags can take
+  // turns being each other's parent and `datumDepth` keeps one clip authority.
+  //
+  // The parents are the tags that have done the checking, ordered the way
+  // `provenance` orders the placing. Three things they must satisfy: still in
+  // the map, a founding depth of their own (an unknown chain cannot certify
+  // another — neither is evidence about the other, and both sit at Infinity),
+  // and not descended from this tag, which is the cycle guard: a tag promoted
+  // `via 5` must never become tag 5's parent.
+  function adoptChain(id) {
+    if (!ADOPT_CHAIN) return false;
+    const m = markers.get(id);
+    if (!m || id === anchorId || Number.isFinite(m.hops)) return false;
+    if (!m.chainFrom || !m.chainFrom.size) return false;
+    // The same bar a promotion clears, asked of each parent on its own rather
+    // than of the total. `provenance` needs no such threshold because it reads
+    // one promotion's inlier set, where a named parent really did place the
+    // tag; `chainFrom` is cumulative over thousands of sightings, so a count of
+    // one is a tag that happened to be in frame once. Naming it a founding
+    // parent would bar it from ever refining this tag again, on no evidence.
+    const parents = [...m.chainFrom.entries()]
+      .filter(([pid, n]) => {
+        const p = markers.get(pid);
+        return n >= PROMOTE_MIN_ESTIMATES && p && Number.isFinite(p.hops)
+          && !descendsFrom(pid, id);
+      })
+      .sort((a, b) => b[1] - a[1]);
+    if (!parents.length) return false;
+    const n = parents.reduce((a, [, c]) => a + c, 0);
+    const from = parents.map(([pid]) => pid);
+    m.from = from;
+    // One more hop than the shallowest parent, exactly as `provenance` counts
+    // it. Taking the *deepest* instead was the obvious hedge — an adopted chain
+    // is reconstructed after the fact and arguably claims less — and it was
+    // measured as inert: identical cross-session agreement on every tag but the
+    // adopted one, which came out 0.09 deg worse. So the hedge buys nothing and
+    // the two provenance paths stay the same rule.
+    m.hops = Math.min(...from.map((pid) => markers.get(pid).hops)) + 1;
+    log(`Marker ${id} adopted a chain: placed off ARCore, since checked ${n} times `
+      + `via ${from.join(' ')} — ${m.hops} hop(s) from the anchor`);
+    history.event(id, 'adopted', { from, hops: m.hops, n });
+    scheduleSave();
+    return true;
   }
 
   function tryPromote(id) {
@@ -1478,10 +1544,13 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
   // /client and XR paths is how the refine half came to be missing on one of
   // them.
   //
-  // One refine decision, reported to the diagnostics tap. Both terminal points
-  // of the loop below report through here so a harness sees the rejected
+  // One refine decision, reported to the diagnostics tap. Every terminal point
+  // of the loop below reports through here so a harness sees the rejected
   // sightings as well as the accepted ones — the rejects are half the answer to
-  // "is this tag being pulled around".
+  // "is this tag being pulled around". A sighting with no usable witness has no
+  // fix and therefore no `off`, `dq` or branches to report; it is still a
+  // terminal point and still has to be counted, or a tag that quietly stopped
+  // being refined is indistinguishable from one that converged.
   //
   // `branches` is the counterfactual: pickSolutions leaves o.sols intact, so
   // what the *other* mirror branch would have implied for this tag is still
@@ -1501,7 +1570,7 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
       px: o.px,
       others: others.map((x) => x.id),
       chosen: o.sols.findIndex((s) => s.camTag === o.camTag),
-      branches: o.sols.map((s) => {
+      branches: !fix ? [] : o.sols.map((s) => {
         const e = se3Compose(fix, s.camTag);
         return {
           off: Math.hypot(e.p[0] - m.pose.p[0], e.p[1] - m.pose.p[1],
@@ -1509,7 +1578,7 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
           dq: quatAngleDeg(m.pose.q, e.q),
         };
       }),
-      estQ: [...est.q],
+      estQ: est ? [...est.q] : null,
     });
   }
 
@@ -1607,7 +1676,16 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
         const fix = others.length
           ? (jointCameraPose(others, K) ?? fuseCameraPose(others))
           : null;
-        if (!fix) continue;
+        // Every other tag in frame was surveyed through this one, so there is
+        // nothing here that could correct it and no fix to build. Silent until
+        // it was measured: with the descendant filter doing its job this is the
+        // *usual* outcome for a tag whose whole neighbourhood descends from it,
+        // and 319 of tag 2's 439 sightings in one session left through here
+        // without appearing in any count.
+        if (!fix) {
+          reportRefine('nowitness', o, markers.get(o.id), null, null, null, null, others);
+          continue;
+        }
         const est = se3Compose(fix, o.camTag);
         const m = markers.get(o.id);
         const off = Math.hypot(
@@ -1676,7 +1754,6 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
         // itself so it reads as a trend rather than flickering per sighting.
         m.resid = m.resid === undefined ? off : m.resid + (off - m.resid) * RESID_ALPHA;
         m.residDeg = m.residDeg === undefined ? dq : m.residDeg + (dq - m.residDeg) * RESID_ALPHA;
-        m.refinedAtMs = Date.now();
         // Every check that got this far could have disagreed and did not — that
         // is a cross-check, and it must count as one. `verified` used to be
         // computed once at promotion (estimates whose fix used two known tags,
@@ -1691,9 +1768,43 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
         // other as each other's ancestors, drop both from `others`, and deadlock
         // refinement) and by `datumDepth` (where a chain that grows would let two
         // tags take turns as the clip authority — the undirected rule the note
-        // above `datumDepth` forbids). Nothing but the drawer reads this one.
+        // above `datumDepth` forbids). The drawer reads this one, and
+        // `adoptChain` reads it exactly once per tag, for a tag that has no
+        // founding chain to widen.
         if (!m.chainFrom) m.chainFrom = new Map();
         for (const x of others) m.chainFrom.set(x.id, (m.chainFrom.get(x.id) || 0) + 1);
+        // With this frame's witnesses counted, so a tag that has been checked
+        // enough adopts on the sighting that earns it rather than the next one.
+        adoptChain(o.id);
+
+        // Refinement flows down the chain from the datum, never sideways. A fix
+        // built only from tags at this tag's own depth or further out is a
+        // second opinion with no more claim to be right than the tag under
+        // test, and where those tags were themselves placed through it, it is
+        // not evidence at all. Measured: tags 2 and 5 refining each other at
+        // 10 Hz with no path to the anchor walked 255 mm in one session, while
+        // every individual disagreement stayed well inside RESEED_DISAGREE_M so
+        // nothing tripped.
+        //
+        // The same rule and the same authority `clipToPlane` uses — strictly
+        // nearer, so equal depth decides nothing and two unknown chains (both
+        // Infinity) leave each other alone. A tag that has not adopted is
+        // Infinity itself, so any placed tag clears the gate for it: an
+        // unplaced chain is always refinable and therefore always reaches
+        // `adoptChain` above.
+        //
+        // Late, and after every line above it, deliberately. A sighting that
+        // fails here still happened and still agreed — it is a check, just not
+        // a correction — and a tag whose checks all vanished at a gate reads on
+        // the dashboard as one never seen beside a known tag at all, which is
+        // the confusion `m.checkedAtMs` was added to end.
+        const depth = datumDepth(o.id, m);
+        if (ANCHORED_REFINE
+          && !others.some((x) => datumDepth(x.id, markers.get(x.id)) < depth)) {
+          reportRefine('unanchored', o, m, fix, est, off, dq, others);
+          continue;
+        }
+        m.refinedAtMs = Date.now();
 
         // Before the nudge, not after: every figure reported here — off, dq and
         // both branches — is measured against the stored pose as it stood when
