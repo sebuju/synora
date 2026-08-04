@@ -875,18 +875,17 @@ function landmarkMessage() {
       //
       // Rounded to the millimetre: this goes to the phone as well as the
       // dashboard, once a second, and full float precision more than doubles
-      // it for digits no one can see on a 2 px dot. The fourth element is
-      // the grade (1 = solve-grade, 0 = coarse consensus) and the fifth the
-      // region the point belongs to, so a hovered region card can light its
-      // own points rather than its client's whole cloud. Both appended rather
-      // than restructured, so the views' triple indexing stays valid.
+      // it for digits no one can see on a 2 px dot. The fourth element is the
+      // grade (1 = solve-grade, 0 = coarse consensus), appended rather than
+      // restructured so the views' triple indexing stays valid.
       landmarks: landmarks.forClient(clientId)
         .map((a) => [
-          ...a.p.map((v) => Math.round(v * 1000) / 1000), a.solid ? 1 : 0, a.group,
+          ...a.p.map((v) => Math.round(v * 1000) / 1000), a.solid ? 1 : 0,
         ]),
-      // The same cloud as regions rather than points, for the drawer. Tiny
-      // beside the landmark list and it is what a person can actually read.
-      groups: landmarks.groups(clientId),
+      // Two scalars the cloud cannot say: how many of those landmarks a track
+      // is on right now, and whether depth is trusted. The drawer's client
+      // card is the only reader — see landmarks.viewerState.
+      state: landmarks.viewerState(clientId),
       // The tracks that have not qualified, with the arc each has reached. Sent
       // alongside rather than folded in: they are a different claim entirely —
       // a landmark is a point the room has been shown to contain, a candidate is

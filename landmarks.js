@@ -112,35 +112,16 @@ const SOLVE_REASSOC_PX = 12;
 // low ones.
 const ALIAS_CAP = 4000;
 
-// Landmarks are individually meaningless — a corner of something, no identity, no
-// extent — and a list of 133 of them says nothing a person can act on. Grouped
-// by proximity they become the thing that was actually surveyed: the region of
-// the room whose features are being tracked. That is what the drawer shows
-// beside the tags, and the comparison is the point — a tag is one printed
-// square whose pose is known to millimetres, a group is a cloud of corners on
-// whatever furniture happens to be there.
-//
-// Membership is decided once, when an landmark qualifies, against the groups that
-// exist at that moment. Re-clustering the whole set on every push would be
-// tidier and would renumber the cards under the reader's hand every second.
-//
-// The radius is chosen on the *card* count, not the region count — singletons
-// collapse into one note, so those are already free. Measured on two recorded
-// walks (124 and 65 landmarks):
-//
-//   radius   cards        group sizes
-//   0.35 m   11 / 10      42/27/19/18/12/9/8/6/3/3/2  ·  19/13/7/6/5/4/4/3/2/2
-//   0.60 m    7 /  5      64/46/15/13/6/3/3           ·  23/19/15/6/4      <-
-//   0.90 m    3 /  4      105/27/18                   ·  25/23/15/4
-//   1.60 m    2 /  2      132/18                      ·  38/29
-//
-// 0.35 m produced a drawer of eleven cards nobody reads. Past 0.6 m the greedy
-// centroid growth starts chaining — at 0.9 m one group holds 105 of 124 landmarks,
-// i.e. most of the room in a single card, which is the failure mode that matters
-// here: a region is supposed to name a *place*, and one that spans the room
-// names nothing. 0.6 m halves the cards and keeps the largest group under half
-// the map.
-const GROUP_M = 0.6;
+// How far apart two candidate features may be and still be one thing worth
+// walking towards (`guide`). The value is inherited: it was tuned on the drawer's
+// region cards, which are gone — landmarks were founded by arc only when that
+// measurement was taken, and consensus and depth founding since raised supply
+// about twentyfold, so a fixed radius produced a card per 13 landmarks and the
+// drawer became unreadable. Nothing has measured it for *guidance*, which is now
+// its only consumer; it survives because a guidance cluster wants the same thing
+// the cards wanted — a knot of corners on one piece of furniture, not a wall's
+// worth of them.
+const GUIDE_CLUSTER_M = 0.6;
 
 // Landmark staleness. Nothing revalidated a qualified landmark: if the thing it was
 // a corner of is moved — a chair, a door, a laptop lid — the landmark keeps
@@ -584,7 +565,7 @@ function createLandmarks({ log = () => {}, opts = {}, trace = null } = {}) {
   const solveReassocPx = opts.solveReassocPx ?? SOLVE_REASSOC_PX;
   const stalePx = opts.stalePx ?? STALE_PX;
   const staleStreak = opts.staleStreak ?? STALE_STREAK;
-  const groupM = opts.groupM ?? GROUP_M;
+  const guideClusterM = opts.guideClusterM ?? GUIDE_CLUSTER_M;
   // The consensus gates, swept the same way: supply against ghosts, and only
   // a recorded walk can say where the trade sits.
   const voxelMinN = opts.voxelMinN ?? VOXEL_MIN_N;
@@ -695,7 +676,7 @@ function createLandmarks({ log = () => {}, opts = {}, trace = null } = {}) {
     if (!s) {
       s = {
         gen, tracks: new Map(), landmarks: new Map(), alias: new Map(),
-        groups: new Map(), bestSpan: 0, nextLandmark: 1, nextGroup: 1,
+        bestSpan: 0, nextLandmark: 1,
         depthErrs: [], depthTrustedWas: false,
         voxels: new Map(), reportSeq: 0, sinceSolve: Infinity,
         // Trace-only. `reportSeq` cannot serve as the trace clock: it is bumped
@@ -719,9 +700,9 @@ function createLandmarks({ log = () => {}, opts = {}, trace = null } = {}) {
       s.tracks.clear();
       s.landmarks.clear();
       s.alias.clear();
-      s.groups.clear();
       s.lastPose = null;
       s.bestSpan = 0;
+      s.liveNow = 0;
       s.guide = null;
       // A new session re-measures its own depth: the bias is per-session
       // state as much as the tracks are.
@@ -856,7 +837,7 @@ function createLandmarks({ log = () => {}, opts = {}, trace = null } = {}) {
     // CONSENSUS_ADOPT_PX: the position is depth-grade until the refinement
     // path has re-triangulated it, and the solve must not count it before.
     s.landmarks.set(landmarkId, {
-      P: med, n, span: 0, err: null, group: groupFor(s, j),
+      P: med, n, span: 0, err: null,
       depth, src: 'consensus', coarse: true, robs: [],
     });
     for (const key of keys) s.voxels.delete(key);
@@ -978,38 +959,7 @@ function createLandmarks({ log = () => {}, opts = {}, trace = null } = {}) {
     };
   }
 
-  // Which region of the room this landmark belongs to — the nearest existing
-  // group centroid within GROUP_M, or a new group. The centroid is a running
-  // mean, so a group settles onto the middle of whatever it is sitting on as it
-  // gains members.
-  function groupFor(s, j) {
-    let best = null;
-    let bestD = groupM;
-    for (const [id, g] of s.groups) {
-      const d = dist3(g.p, j.P);
-      if (d < bestD) { bestD = d; best = id; }
-    }
-    if (best === null) {
-      best = s.nextGroup++;
-      s.groups.set(best, { sum: [...j.P], n: 1, p: [...j.P], span: j.span });
-      return best;
-    }
-    const g = s.groups.get(best);
-    for (let k = 0; k < 3; k++) {
-      g.sum[k] += j.P[k];
-      g.p[k] = g.sum[k] / (g.n + 1);
-    }
-    g.n++;
-    // The widest arc any one member was seen through: how well this region has
-    // actually been looked at, which is what decides whether it grows.
-    if (j.span > g.span) g.span = j.span;
-    return best;
-  }
-
   // Take an landmark back out of the map, with everything that referred to it.
-  // The group keeps a running mean, so the member has to be subtracted from it
-  // rather than merely uncounted, or the region drifts towards a point that is
-  // no longer claimed to exist.
   function dropLandmark(s, landmarkId) {
     const a = s.landmarks.get(landmarkId);
     if (!a) return;
@@ -1020,18 +970,6 @@ function createLandmarks({ log = () => {}, opts = {}, trace = null } = {}) {
     if (a.src === 'consensus' && (a.checks ?? 0) < 50) stats.consensusEarly++;
     s.landmarks.delete(landmarkId);
     for (const [trackId, id] of s.alias) if (id === landmarkId) s.alias.delete(trackId);
-    const g = s.groups.get(a.group);
-    if (g) {
-      g.n--;
-      if (g.n <= 0) {
-        s.groups.delete(a.group);
-      } else {
-        for (let k = 0; k < 3; k++) {
-          g.sum[k] -= a.P[k];
-          g.p[k] = g.sum[k] / g.n;
-        }
-      }
-    }
     stats.dropped++;
     // Rare enough to say out loud every time, and worth saying: the map lost a
     // point it had qualified, which on a session where nothing was touched
@@ -1097,14 +1035,6 @@ function createLandmarks({ log = () => {}, opts = {}, trace = null } = {}) {
       return;
     }
     a.bad = 0;
-    // The group centroid was built from the coarse position; move its share.
-    const g = s.groups.get(a.group);
-    if (g) {
-      for (let k = 0; k < 3; k++) {
-        g.sum[k] += j.P[k] - a.P[k];
-        g.p[k] = g.sum[k] / g.n;
-      }
-    }
     a.P = j.P;
     a.n = j.n;
     a.span = j.span;
@@ -1388,6 +1318,14 @@ function createLandmarks({ log = () => {}, opts = {}, trace = null } = {}) {
       // the next report on (this report's reassociate already ran).
       added += consensusObserve(s, pts, camPose, K, foundDepth);
 
+      // How many solve-grade landmarks this frame's points are actually on. The
+      // aliases outlive their tracks by design (ALIAS_CAP prunes them by age,
+      // not by death), so the size of the alias map is a session total and says
+      // nothing about now — it reached 696 on a walk holding 764 landmarks.
+      // Counted per frame here and at the solve, which is where the number is
+      // consumed: against MIN_LANDMARKS_FOR_FIX it is the whole answer to
+      // whether this client could localize off landmarks at this instant.
+      let liveNow = 0;
       for (const p of pts) {
         // A track already looking at an landmark does not accumulate a second
         // candidate — but the sighting is not thrown away either: with a
@@ -1399,7 +1337,7 @@ function createLandmarks({ log = () => {}, opts = {}, trace = null } = {}) {
         if (on !== undefined) {
           const al = s.landmarks.get(on);
           if (al?.coarse) refineLandmark(s, on, al, p, camPose, K);
-          else checkLandmark(s, on, p, camPose, K);
+          else { checkLandmark(s, on, p, camPose, K); if (al) liveNow++; }
           continue;
         }
         let t = s.tracks.get(p.id);
@@ -1472,7 +1410,7 @@ function createLandmarks({ log = () => {}, opts = {}, trace = null } = {}) {
         // for replay and diagnostics only — downstream a landmark is a landmark.
         const landmarkId = s.nextLandmark++;
         s.landmarks.set(landmarkId, {
-          P: q.P, n: q.n, span: q.span, err: q.err, group: groupFor(s, q),
+          P: q.P, n: q.n, span: q.span, err: q.err,
           depth: foundDepth, src: viaDepth ? 'depth' : 'arc',
         });
         s.alias.set(p.id, landmarkId);
@@ -1480,8 +1418,12 @@ function createLandmarks({ log = () => {}, opts = {}, trace = null } = {}) {
         s.tracks.delete(p.id);
         stats.qualified++;
         if (viaDepth) stats.qualifiedDepth++;
+        // A landmark founded this frame is one the camera is looking at by
+        // definition — the track that founded it is still on it.
+        liveNow++;
         added++;
       }
+      s.liveNow = liveNow;
       return added;
     },
 
@@ -1569,6 +1511,12 @@ function createLandmarks({ log = () => {}, opts = {}, trace = null } = {}) {
         ({ objs, imgs, metas } = match());
         if (row) { row.adoptedWide = adoptedWide; row.matchedWide = objs.length; }
       }
+      // The matched set *is* the live count on this path, and it is the honest
+      // one to report even when it is short of the gate: "8 live of 15" is why
+      // the solve refused, and the dashboard has no other way to see it. Set
+      // before the refusal, or a client that never localizes reads as one that
+      // is looking at nothing.
+      s.liveNow = objs.length;
       if (objs.length < minLandmarks) {
         stats.refused++;
         emit('refused');
@@ -1789,34 +1737,39 @@ function createLandmarks({ log = () => {}, opts = {}, trace = null } = {}) {
       };
     },
 
-    // The landmark clouds as regions, for the drawer to show beside the tags.
-    // `live` is how many of the group's landmarks a track is currently sitting on
-    // — the difference between a region the map merely remembers and one it can
-    // localize against right now, which is the whole distinction between a
-    // landmark and a tag and should be visible as such.
-    groups(clientId) {
+    // What the dashboard needs beside the cloud it is already being sent. The
+    // cloud says where the landmarks are and says nothing about whether they can
+    // be used: `live` is how many of them a track is sitting on right now, and
+    // against MIN_LANDMARKS_FOR_FIX that is the whole answer to "can this client
+    // localize off landmarks at all". The rest of the pipeline's state is on the
+    // phone (`summary`) and in the log, neither of which the person at the
+    // dashboard is looking at.
+    //
+    // The drawer used to render the landmark clouds as *regions* — proximity
+    // groups, one card each. That is gone: the grouping radius was tuned when a
+    // walk produced ~100 landmarks, consensus and depth founding raised that to
+    // over 2000, and the card count is linear in supply with no cap, so the last
+    // run buried the tag cards under 58 of them.
+    viewerState(clientId) {
       const s = clients.get(clientId);
-      if (!s) return [];
-      // Distinct landmarks, not alias entries: a dead track leaves its alias
-      // behind, and several tracks can have looked at one landmark over a
-      // session, so counting entries reported more live landmarks than exist.
-      const seen = new Set();
-      const live = new Map();
-      for (const landmarkId of s.alias.values()) {
-        if (seen.has(landmarkId)) continue;
-        seen.add(landmarkId);
-        const a = s.landmarks.get(landmarkId);
-        if (a) live.set(a.group, (live.get(a.group) ?? 0) + 1);
-      }
-      return [...s.groups]
-        .map(([id, g]) => ({
-          id,
-          p: g.p.map((v) => Math.round(v * 1000) / 1000),
-          n: g.n,
-          live: live.get(id) ?? 0,
-          span: Math.round(g.span),
-        }))
-        .sort((a, b) => b.n - a.n);
+      if (!s) return null;
+      const ds = depthState(s);
+      return {
+        // Counted per frame as the reports come in, not from the alias map:
+        // aliases are pruned by age rather than by death, so their count is a
+        // session total (696 on a walk holding 764 landmarks) and would read as
+        // "the camera can see nearly everything" from anywhere in the room.
+        live: s.liveNow ?? 0,
+        // Depth trust decides which founding path is running — and, since
+        // `guide` falls silent once depth is trusted, whether the phone is
+        // being told anything at all. Arc is deliberately not here: measured
+        // on this room's journals it founds nothing (0 of 862 qualifications),
+        // so a progress bar against it describes a path nobody is on.
+        depth: {
+          trusted: ds.trusted,
+          residPct: ds.residRel === null ? null : Math.round(ds.residRel * 1000) / 10,
+        },
+      };
     },
 
     // The tracks that are not landmarks yet, with the arc each has been seen
@@ -1890,7 +1843,7 @@ function createLandmarks({ log = () => {}, opts = {}, trace = null } = {}) {
       const C = camPose.p;
       const losBlocked = (P) => !!blocked && blocked([C[0], C[2]], [P[0], P[2]]);
       let best = null;
-      for (const c of clusterLandmarks(est, groupM)) {
+      for (const c of clusterLandmarks(est, guideClusterM)) {
         if (c.length < GUIDE_MIN_MEMBERS) continue;
         const head = c[0];
         const P = head.P;
@@ -1914,9 +1867,9 @@ function createLandmarks({ log = () => {}, opts = {}, trace = null } = {}) {
       // a target the user has since put a wall between themselves and.
       const prev = s.guide;
       if (prev) {
-        const still = clusterLandmarks(est, groupM)
+        const still = clusterLandmarks(est, guideClusterM)
           .map((c) => c[0])
-          .find((h) => dist3(h.P, prev.P) < groupM);
+          .find((h) => dist3(h.P, prev.P) < guideClusterM);
         if (still && still !== best.head) {
           const held = dist3(C, still.P);
           if (held < GUIDE_MAX_M && !losBlocked(still.P)
@@ -1957,13 +1910,9 @@ function createLandmarks({ log = () => {}, opts = {}, trace = null } = {}) {
     forClient(clientId) {
       const s = clients.get(clientId);
       if (!s) return [];
-      // `group` is the cluster representative's, alongside its position, count
-      // and span — the map draws a point per cluster and needs to know which
-      // region card it belongs to, or a hovered region can only light a whole
-      // client's cloud.
       return clusterLandmarks([...s.landmarks.values()]).map((c) => ({
         p: c[0].P, n: c[0].n, span: Math.round(c[0].span), merged: c.length,
-        solid: c.some((a) => !a.coarse), group: c[0].group,
+        solid: c.some((a) => !a.coarse),
       }));
     },
 
