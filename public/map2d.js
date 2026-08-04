@@ -785,6 +785,19 @@ function createMap2dView(canvas, mode = 'top', {
       // as smoothing.
       m.hot = animFade(m.hot, hovered?.kind === 'tag' && id === hovered.id, dt, HOVER_MS);
       m.anchorMix = animFade(m.anchorMix, id === markerMap?.anchorId, dt);
+      // Whether the survey is still working on this tag, from the same verdict
+      // the drawer's dot is painted from (`tagSettleState`, common.js) — the
+      // two surfaces are looking at one tag and must not disagree about it.
+      // The datum is exempt: it is where it is by definition and there is no
+      // measurement to be settled. A tag on its way out is left alone rather
+      // than asked, so a forgotten tag fades out rather than growing a border
+      // on the way.
+      const settling = !m.dead && !!m.rec
+        && !['settled', 'datum'].includes(tagSettleState(m.rec, markerMap?.anchorId));
+      // Default speed, not HOVER_MS: this is a change in the survey rather than
+      // pointer feedback, and a border that snaps off reads as a glitch instead
+      // of as a tag arriving somewhere.
+      m.settleMix = animFade(m.settleMix ?? 0, settling, dt);
     }
 
     // Which legs are on screen changes with every card opened in the drawer, so
@@ -1353,6 +1366,21 @@ function createMap2dView(canvas, mode = 'top', {
       }
       ctx.fillStyle = tagColor;
       ctx.fillRect(-chipHalf, side * 9 - 7, chipHalf * 2, 14);
+      // The survey is not done with this tag. Absence is the resting state, so
+      // a converged room draws no borders at all and a border always means go
+      // and look — which is why it is the *unsettled* tag that is marked and
+      // not the settled one. On the chip rather than on the bar: the bar is the
+      // tag's identity colour, shared with the drawer, and the hover halo
+      // already owns the shape around it. One pixel out from the chip and the
+      // halo two, so a settling tag that is also hovered shows both rings
+      // concentrically instead of one overdrawing the other.
+      if (m.settleMix > 0.01) {
+        ctx.globalAlpha = m.fade * m.settleMix;
+        ctx.strokeStyle = ROOM_SETTLING_CSS;
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(-chipHalf - 1, side * 9 - 8, chipHalf * 2 + 2, 16);
+        ctx.globalAlpha = m.fade;
+      }
       ctx.fillStyle = '#fff';
       ctx.fillText(idText, 0, side * 9 + 4);
       // Underlined, because the chip turns with the bar: a heading-up map spins
@@ -1631,12 +1659,19 @@ function createMap2dView(canvas, mode = 'top', {
           had.tp = m.p;
           had.tq = m.q;
           had.dead = false;
+          had.rec = m;
         } else {
           markers.set(m.id, {
             pos: [...m.p], q: [...m.q], tp: m.p, tq: m.q,
             normal: quatRotate(m.q, [0, 0, 1]),
             ax3: quatRotate(m.q, [1, 0, 0]),
-            fade: 0, dead: false, hot: 0,
+            fade: 0, dead: false, hot: 0, settleMix: 0,
+            // The arriving record, kept whole. `tagSettleState` needs the
+            // residuals and the refinement timestamps, and it needs the tag's
+            // *stored* pose — `pos`/`q` here are the eased ones, and a tag
+            // still gliding to where the survey just put it would read as one
+            // the survey is still moving.
+            rec: m,
             // Seeded at the answer: a tag that arrives as the anchor is the
             // anchor, it did not become one.
             anchorMix: m.id === map.anchorId ? 1 : 0,

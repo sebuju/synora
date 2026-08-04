@@ -29,8 +29,9 @@ function poseUncertainty(msg) {
 function createRoomFeed(views) {
   let markerMap = null;
   let landmarks = [];
-  // clientId -> the tag ids its last *detection* reported. See applyPose.
-  const seenTags = new Map();
+  // clientId -> the last *detection* message reported. See applyPose and
+  // lastDetection (common.js).
+  const lastDet = new Map();
 
   return {
     // True if the message was a room message and has been applied. A page with
@@ -67,14 +68,11 @@ function createRoomFeed(views) {
     // reads the rest of it for the tile label.
     applyPose(clientId, msg) {
       if (!msg.room?.pose) return;
-      // A carry report has no detection behind it, so its empty tag list is not
-      // a statement that nothing is in view — it is the absence of a look. The
-      // client sends several of them between detections, and treating each as
-      // "no tags" made the sight lines to the tags blink out and back two or
-      // three times a second. What is still true is whatever the last actual
-      // detection said, so that is what stands.
-      if (!msg.carry) seenTags.set(clientId, (msg.tags || []).map((t) => t.id));
-      const seen = seenTags.get(clientId) || [];
+      // See lastDetection (common.js) for why a carry report cannot simply
+      // overwrite what the last detection saw.
+      const det = lastDetection(lastDet.get(clientId), msg);
+      if (det) lastDet.set(clientId, det);
+      const seen = (det?.tags || []).map((t) => t.id);
       // The whole room verdict rides along: a view that wants to say "this
       // pose is dead reckoning, not a fix" needs mapSafe/quality, and deriving
       // that here would be a second copy of a decision the survey already made.
@@ -83,7 +81,7 @@ function createRoomFeed(views) {
     },
 
     removeClient(clientId) {
-      seenTags.delete(clientId);
+      lastDet.delete(clientId);
       views.forEach((v) => v.removeClient(clientId));
     },
 
