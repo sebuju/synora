@@ -7,13 +7,18 @@ const muteBtn = document.getElementById('muteBtn');
 const stageEl = document.getElementById('stage');
 const drawerEl = document.getElementById('drawer');
 
-// clientId -> { pc, tile, video, label, camBtn }
+// clientId -> { pc, tile, video, label, camBtn, ghost }
+// `devices` means "is there a tile", not "is there a video feed" — a client
+// that went away keeps its entry, marked `ghost: <reason>`, holding its last
+// frame dimmed rather than being torn out (see ghostDevice). Anything that
+// means *live* has to check `!dev.ghost` too, not just `devices.has(id)`.
 const devices = new Map();
 // clientId -> the state the server reports for it. Separate from `devices`
-// because the two answer different questions: `devices` is "is there a video
-// feed", the roster is "is there a client at all". An XR client only ever
-// appears in the roster, and a client whose peer connection has not come up yet
-// appears there first.
+// because the two answer different questions: `devices` is "is there a tile",
+// the roster is "is there a client at all". An XR client only ever appears in
+// the roster, and a client whose peer connection has not come up yet appears
+// there first. Also what tells a ghost with nothing left to reconnect to (not
+// in the roster) from one still connected under a stopped stream.
 const roster = new Map();
 // clientId -> { at, ms } while that client's ARCore tracking is down. Kept
 // separately from `devices` because an XR client never opens a peer connection
@@ -47,7 +52,7 @@ const signaling = connectSignaling('viewer', {
     roster.clear();
     poses.clear();
     trackingLost.clear();
-    for (const id of [...devices.keys()]) removeDevice(id);
+    for (const id of [...devices.keys()]) ghostDevice(id, 'no server');
     refreshClientsPanel();
   },
   async onMessage(msg) {
@@ -133,19 +138,18 @@ const signaling = connectSignaling('viewer', {
       }
     } else if (msg.type === 'stream-stopped') {
       // The client is still here, it has just stopped sending video (the XR
-      // client's Stream switch). Only the tile goes: its roster entry, its dot
-      // and its pose are all still current, and a closed peer connection on its
-      // own would leave a tile frozen on the last frame it received — which
-      // looks exactly like a client that stopped moving.
-      removeDevice(msg.clientId);
+      // client's Stream switch). Its roster entry, its dot and its pose are all
+      // still current — only the tile ghosts, captioned so a frozen picture
+      // does not read as a client that stopped moving.
+      ghostDevice(msg.clientId, 'stream off');
     } else if (msg.type === 'client-gone') {
       trackingLost.delete(msg.clientId);
       poses.delete(msg.clientId);
-      // Not folded into removeDevice: a client with no tile has no device entry
-      // to remove, and an XR client never has one — it would have left its dot
+      // Not folded into ghostDevice: a client with no tile has no device entry
+      // to ghost, and an XR client never has one — it would have left its dot
       // sitting in the room views forever.
       roomFeed.removeClient(msg.clientId);
-      removeDevice(msg.clientId);
+      ghostDevice(msg.clientId, 'offline');
     } else if (msg.type === 'vcam-state') {
       if (msg.available !== undefined) vcamAvailable = msg.available;
       vcamClientId = msg.clientId;
@@ -169,7 +173,10 @@ function setVcam(clientId) {
 function tileLabel(clientId) {
   const name = roster.get(clientId)?.name;
   const dev = devices.get(clientId);
-  const state = dev?.pc && dev.pc.connectionState !== 'connected'
+  // A ghost's peer connection is closed on purpose, so its connectionState
+  // ("closed") is not news — the ghost note below the label already says what
+  // happened and covers this suffix's whole job.
+  const state = dev && !dev.ghost && dev.pc && dev.pc.connectionState !== 'connected'
     ? ` — ${dev.pc.connectionState}` : '';
   return `${name ? `${name} · client${clientId}` : `Client ${clientId}`}${state}`;
 }
@@ -179,9 +186,26 @@ function updateLabels() {
 }
 
 function updateCamBtn(clientId, dev) {
-  dev.camBtn.style.display = vcamAvailable ? '' : 'none';
+  // No webcam assignment for a ghost — there is no video behind it to feed.
+  dev.camBtn.style.display = !dev.ghost && vcamAvailable ? '' : 'none';
   dev.camBtn.textContent = clientId === vcamClientId ? 'Webcam ✓' : 'Webcam';
   dev.camBtn.classList.toggle('active', clientId === vcamClientId);
+}
+
+// How this client went away and how long ago — the load-bearing part of a
+// ghost tile, per the note above `devices`: a frozen picture with nothing
+// saying why is indistinguishable from a client that only stopped moving.
+// `GHOST_TEXT`/`ghostNote` (common.js) are shared with clients-panel.js, so
+// the tile and the drawer card can never disagree about the same client.
+function updateGhostNote(dev) {
+  dev.ghostNoteEl.textContent = dev.ghost ? ghostNote(dev.ghost, dev.ghostAt) : '';
+}
+
+// The note's age has to keep counting, so every ghost is re-stamped on the
+// same tick that already redraws the drawer (refreshClientsPanel) — no
+// second timer for one more piece of text.
+function tickGhostNotes() {
+  for (const dev of devices.values()) if (dev.ghost) updateGhostNote(dev);
 }
 
 // Camera-frame readout on the tile: which tags this client sees and how far
@@ -189,15 +213,29 @@ function updateCamBtn(clientId, dev) {
 // (disabled, backgrounded) must not keep showing a distance.
 const POSE_LABEL_TTL_MS = 2000;
 
-// clientId -> { msg, at } for the newest pose, whether or not that client has a
-// tile. A client with no tile is not a client with no position: the XR client
-// positions and maps without streaming, so it never opens a peer connection and
-// never gets a device entry — and it is the one whose position matters most.
+// clientId -> { msg, at, det, detAt, check, checkAt } for the newest pose,
+// whether or not that client has a tile. A client with no tile is not a
+// client with no position: the XR client positions and maps without
+// streaming, so it never opens a peer connection and never gets a device
+// entry — and it is the one whose position matters most.
+//
+// `det`/`detAt` are the pose latched through lastDetection (common.js): the
+// newest message with an actual detection behind it, held across carry
+// reports, so every reader of "what tags are in view" agrees with the map's
+// sight lines instead of blinking on the carry interleave. `check`/`checkAt`
+// latch the opposite way — `room.lmCheck` is written only on the carried
+// tag-less frames a detection report has none of (server.js, the xr-pose
+// 'tracked' branch), so it is held from what the detection latch discards.
 const poses = new Map();
 
 function updatePoseLabel(clientId, msg) {
-  poses.set(clientId, { msg, at: performance.now() });
-  const tags = msg.tags || [];
+  const prev = poses.get(clientId);
+  const now = performance.now();
+  const det = lastDetection(prev?.det, msg);
+  const detAt = det ? (det === prev?.det ? prev.detAt : now) : null;
+  const check = msg.room?.lmCheck ? msg.room : prev?.check;
+  const checkAt = check ? (check === prev?.check ? prev.checkAt : now) : null;
+  poses.set(clientId, { msg, at: now, det, detAt, check, checkAt });
   roomFeed.applyPose(clientId, msg);
   // Only the per-tile label below needs a tile to live on.
   const dev = devices.get(clientId);
@@ -213,6 +251,9 @@ function updatePoseLabel(clientId, msg) {
     updateFeedShape(dev);
   }
   clearTimeout(dev.poseLabelTimer);
+  // A client sending only carries (nothing detecting, not just nothing in
+  // view) must not hold a stale tag list on its tile forever.
+  const tags = detAt !== null && now - detAt < POSE_LABEL_TTL_MS ? (det.tags || []) : [];
   if (tags.length) {
     const ids = tags.map((t) => t.id).join(',');
     const room = msg.room?.pose
@@ -237,10 +278,16 @@ function updatePoseLabel(clientId, msg) {
 
 // Connected and streaming are different counts, and reporting only the second
 // made a room full of XR clients read as "no devices": they position without
-// ever opening a peer connection.
+// ever opening a peer connection. `devices.size` alone no longer means
+// streaming — it counts ghosts too — so the two are told apart explicitly.
 function updateStatus() {
-  const streaming = devices.size;
-  const total = Math.max(streaming, roster.size);
+  let streaming = 0;
+  for (const dev of devices.values()) if (!dev.ghost) streaming++;
+  // devices.size in the mix as well as roster.size: a client removed from the
+  // roster (client-gone) still sits on screen as a ghost until someone
+  // dismisses it, and the header should count what is visible, not just what
+  // the server currently lists.
+  const total = Math.max(streaming, roster.size, devices.size);
   setStatus(total === 0
     ? 'no clients'
     : `${total} client${total === 1 ? '' : 's'} · ${streaming} streaming`);
@@ -248,7 +295,19 @@ function updateStatus() {
 
 function ensureDevice(clientId) {
   let dev = devices.get(clientId);
-  if (dev) return dev;
+  if (dev) {
+    // The same client, back before its ghost was dismissed — the same shape as
+    // scene.js's `ph.dead = false`: revive what is already on screen rather
+    // than build a second copy of it.
+    if (dev.ghost) {
+      dev.ghost = null;
+      dev.ghostAt = null;
+      dev.tile.classList.remove('ghost');
+      dev.ghostNoteEl.textContent = '';
+      updateCamBtn(clientId, dev);
+    }
+    return dev;
+  }
 
   const tile = document.createElement('div');
   tile.className = 'tile';
@@ -262,6 +321,8 @@ function ensureDevice(clientId) {
   const label = document.createElement('div');
   label.className = 'label';
   label.textContent = tileLabel(clientId);
+  const ghostNoteEl = document.createElement('div');
+  ghostNoteEl.className = 'ghost-note';
   const camBtn = document.createElement('button');
   camBtn.className = 'cam-btn';
   camBtn.onclick = (ev) => {
@@ -270,7 +331,26 @@ function ensureDevice(clientId) {
   };
   const poseLabel = document.createElement('div');
   poseLabel.className = 'pose-label';
-  tile.append(wrap, label, poseLabel, camBtn);
+  // Meaningful only once the tile has ghosted — CSS reveals it on hover of
+  // `.tile.ghost` alone. A live tile's remove would take the feed away with no
+  // way to ask for it back, which is not what a corner button should do.
+  const rmBtn = document.createElement('button');
+  rmBtn.type = 'button';
+  rmBtn.className = 'icon-btn mini rm danger';
+  rmBtn.title = `Remove client ${clientId} from this dashboard`;
+  rmBtn.setAttribute('aria-label', `Remove client ${clientId} from this dashboard`);
+  rmBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"'
+    + ' stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+    + '<path d="M4 7h16"/><path d="M9.5 4h5"/>'
+    + '<path d="M6.5 7l.9 12.1A2 2 0 0 0 9.4 21h5.2a2 2 0 0 0 2-1.9L17.5 7"/></svg>';
+  // The tile's own click toggles zoom (below) — the same guard camBtn already
+  // needs, for the same reason.
+  rmBtn.addEventListener('click', (ev) => ev.stopPropagation());
+  confirmButton(rmBtn, () => forgetClient(clientId), {
+    armedTitle: `Click again to drop client ${clientId} from this dashboard — its video will `
+      + 'not come back until it reconnects',
+  });
+  tile.append(wrap, label, poseLabel, ghostNoteEl, camBtn, rmBtn);
   // Click a tile to enlarge it; click again to go back to the grid.
   tile.onclick = () => {
     const zoomed = tile.classList.contains('zoom');
@@ -280,10 +360,10 @@ function ensureDevice(clientId) {
   grid.append(tile);
 
   dev = {
-    pc: null, tile, wrap, video, label, camBtn, poseLabel,
+    pc: null, tile, wrap, video, label, camBtn, poseLabel, ghostNoteEl, rmBtn,
     frames: [], lastFrame: null, latency: null, capturing: false,
     rtpMap: null, rtpSamples: [], clockUnc: null,
-    poseLabelTimer: null, appliedRoll: 0,
+    poseLabelTimer: null, appliedRoll: 0, ghost: null, ghostAt: null,
   };
   devices.set(clientId, dev);
   // `resize` as well as `loadedmetadata`: a client that changes capture
@@ -310,16 +390,52 @@ function updateFeedShape(dev) {
   dev.tile.style.setProperty('--feed-ar', rotated ? `${vh} / ${vw}` : `${vw} / ${vh}`);
 }
 
-function removeDevice(clientId) {
+// Tears down everything the tile actively costs — the peer connection, the
+// buffered frames, the per-tag distance readout — but leaves the tile itself
+// in the grid, dimmed and captioned with why. See the `devices` comment above:
+// after this, the entry is still "there is a tile", just not "there is a
+// video feed". Called again on an already-ghosted device (a stopped stream
+// followed by a disconnect) it just overwrites the reason with the truer one.
+function ghostDevice(clientId, reason) {
   const dev = devices.get(clientId);
   if (!dev) return;
   dev.pc?.close();
   clearTimeout(dev.poseLabelTimer);
-  roomFeed.removeClient(clientId);
-  dev.tile.remove();
+  // A frozen "1.8 m to tag 4" is a live readout that has stopped being true.
+  dev.poseLabel.textContent = '';
   dropFrames(dev);
-  devices.delete(clientId);
+  dev.capturing = false;
+  roomFeed.removeClient(clientId);
+  dev.tile.classList.remove('zoom');
+  dev.tile.classList.add('ghost');
+  dev.ghost = reason;
+  dev.ghostAt = Date.now();
+  updateGhostNote(dev);
+  updateCamBtn(clientId, dev);
+  updateLabels();
   updateStatus();
+}
+
+// Removal as a deliberate act, not a consequence of anything the server says —
+// once a client only ever ghosts, this is the only way anything leaves the
+// dashboard. Drops every piece of local state for the id; the server and the
+// client itself are untouched, so a still-connected client's card is back
+// within a second (the next roster push) even though its tile is not — the
+// armed title on the button that calls this says so.
+function forgetClient(clientId) {
+  const dev = devices.get(clientId);
+  if (dev) {
+    dev.pc?.close();
+    clearTimeout(dev.poseLabelTimer);
+    dropFrames(dev);
+    dev.tile.remove();
+    devices.delete(clientId);
+  }
+  poses.delete(clientId);
+  trackingLost.delete(clientId);
+  roomFeed.removeClient(clientId);
+  updateStatus();
+  refreshClientsPanel();
 }
 
 async function acceptOffer(clientId, description) {
@@ -507,7 +623,11 @@ function startFrameCapture(clientId, dev) {
   dev.latency = null;
 
   const onFrame = (now, meta) => {
-    if (!devices.has(clientId)) {
+    // Either it left the grid entirely (forgetClient) or ghosted — its own
+    // pc.close() should stop the track on its own, but this is the backstop
+    // that keeps a frame that slips through from being buffered into a ghost's
+    // (still-truthy, empty) frame list.
+    if (!devices.has(clientId) || dev.ghost) {
       dev.capturing = false;
       return;
     }
@@ -618,7 +738,10 @@ function updateSyncLabel(feeds, latencies, worstErr) {
 function drawCombined() {
   if (!camsVisible()) return;
   const now = clockSync.now();
-  const feeds = [...devices.entries()].filter(([, d]) => d.video.videoWidth > 0);
+  // A ghost keeps a nonzero videoWidth and a stale `latency` from before it
+  // closed — left in, it would pin syncTargetLatency to a feed nobody is
+  // sending and drag every live feed's presentation instant behind it.
+  const feeds = [...devices.entries()].filter(([, d]) => !d.ghost && d.video.videoWidth > 0);
 
   const latencies = feeds.map(([, d]) => d.latency).filter((l) => l !== null);
   syncSupported = latencies.length === feeds.length && feeds.length > 0;
@@ -729,7 +852,13 @@ function clientInfo(id) {
     kind: 'client',
     ...(roster.get(id) || {}),
     vcamAvailable,
-    live: !!dev,
+    live: !!dev && !dev.ghost,
+    // Not in the roster at all: the drawer's own controls have nobody to talk
+    // to (client-gone already dropped the roster entry), unlike a ghosted-but-
+    // still-connected client whose stream merely stopped.
+    present: roster.has(id),
+    ghost: dev?.ghost ?? null,
+    ghostAt: dev?.ghostAt ?? null,
     landmarkState: lm ? {
       n: lm.landmarks?.length ?? 0,
       candidates: lm.candidates?.length ?? 0,
@@ -738,6 +867,30 @@ function clientInfo(id) {
     } : null,
     poseMsg: pose?.msg ?? null,
     poseAge: pose ? performance.now() - pose.at : null,
+    // The pose latched through lastDetection (common.js): what tags are
+    // actually in view, held across the XR carry interleave so this agrees
+    // with the map's sight lines instead of blinking on every carry report.
+    // See the `poses` comment above.
+    detMsg: pose?.det ?? null,
+    detAge: pose?.detAt !== null && pose?.detAt !== undefined
+      ? performance.now() - pose.detAt : null,
+    lmCheckRoom: pose?.check ?? null,
+    lmCheckAge: pose?.checkAt !== null && pose?.checkAt !== undefined
+      ? performance.now() - pose.checkAt : null,
+    // What the detection loop reported achieving (`cost`, from either capture
+    // page's rolling-window meter) against what this server is currently
+    // asking every client for — the drawer's own reading of "attempted, not
+    // achieved". Coerced through Number.isFinite so a garbage or absent report
+    // renders as no row rather than as NaN. Read off the latched detection,
+    // not the newest message — a carry report has no `cost` at all.
+    detect: pose?.det?.cost ? {
+      detHz: Number.isFinite(pose.det.cost.detHz) ? pose.det.cost.detHz : null,
+      detMs: Number.isFinite(pose.det.cost.detMs) ? pose.det.cost.detMs : null,
+      targetMs: Number.isFinite(pose.det.cost.targetMs) ? pose.det.cost.targetMs : null,
+      askedMs: Number.isFinite(pose.det.cost.askedMs) ? pose.det.cost.askedMs : null,
+      blocked: Number.isFinite(pose.det.cost.blocked) ? pose.det.cost.blocked : null,
+      serverAskedMs: Number.isFinite(settingsValues.poseRateMs) ? settingsValues.poseRateMs : null,
+    } : null,
     latency: dev?.latency ?? null,
     clockUnc: dev?.clockUnc ?? null,
     lostMs: stillLost ? stillLost.ms + performance.now() - stillLost.at : null,
@@ -782,7 +935,10 @@ setInterval(() => {
       color: info.poseAge > POSE_STALE_MS ? '#777' : roomClientColorCss(info.id),
       text: `P${info.id}  ${p.map((v) => v.toFixed(2)).join(', ')}`
         + `  yaw ${Math.round(yaw)}°  pitch ${Math.round(pitch)}°`
-        + `  ${(info.poseMsg.tags || []).length} tags  ${fmtAge(info.poseAge)}`,
+        // Tag count off the latched detection (see the `poses` comment
+        // above), position and age off the pose itself — a carry report is
+        // still a fresh position, just not a fresh look.
+        + `  ${(info.detMsg?.tags || []).length} tags  ${fmtAge(info.poseAge)}`,
     });
   }
   syncTextRows(roomStats, rows);
@@ -801,6 +957,7 @@ const clientsPanel = createClientsPanel(drawerEl, {
   onHover: setHovered,
   onTagOpen: setOpenedTag,
   onTagRemove: forgetMarker,
+  onClientRemove: forgetClient,
   // What a tag has been doing, asked for by the card that is open. The panel
   // decides when — it is the only thing that knows which card that is — and the
   // answer goes straight back to it.
@@ -816,8 +973,12 @@ function refreshClientsPanel() {
 }
 
 // Recording byte counts and pose ages move on their own; the roster message
-// only arrives when something changes.
-setInterval(refreshClientsPanel, 400);
+// only arrives when something changes. Ghost notes ride the same tick — see
+// tickGhostNotes.
+setInterval(() => {
+  tickGhostNotes();
+  refreshClientsPanel();
+}, 400);
 
 function refreshViews() {
   const room = show3d || show2d || showSide || showFront;

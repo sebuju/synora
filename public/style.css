@@ -299,8 +299,10 @@ button.toggle.on::before {
 /* Smaller again, for an icon that sits inside a card rather than in a row of
    controls: it is an escape hatch, not something being reached for. */
 .icon-btn.mini {
-  padding: 2px;
-  border-radius: 5px;
+    padding: 0px;
+    border-radius: 5px;
+    width: 16px;
+    height: 18.4px;
 }
 
 .icon-btn.mini svg {
@@ -668,6 +670,67 @@ body.paused #pauseOverlay {
   font-size: 12px;
 }
 
+/* A client that went away leaves a ghost tile rather than a gap — see
+   ghostDevice in viewer.js. The dimming goes on the picture and the caption,
+   not on the tile itself: a corner button and a note that explain the ghost
+   must stay as legible as anything else on screen, not fade with it. */
+.tile .vwrap,
+.tile .label {
+  transition: opacity 400ms ease, filter 400ms ease;
+}
+
+.tile.ghost .vwrap {
+  opacity: 0.35;
+  filter: grayscale(1);
+}
+
+.tile.ghost .label {
+  opacity: 0.5;
+}
+
+/* Sinks below the live feeds; .tile.zoom's order: -1 still wins over this. */
+.tile.ghost {
+  order: 1;
+}
+
+/* Says how this client went and how long ago — the one thing that tells a
+   ghost apart from a client that merely stopped moving. Centred rather than
+   tucked into a corner: it is the whole reason a frozen picture is still on
+   screen. */
+.tile .ghost-note {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  padding: 6px 12px;
+  background: rgba(0, 0, 0, 0.72);
+  border-radius: 6px;
+  font-size: 13px;
+  color: #d8d8d8;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+.tile .ghost-note:empty {
+  display: none;
+}
+
+/* Same escape hatch as the drawer card's .rm, and only worth reaching for on a
+   ghost — removing a live tile would take the feed away with no way to ask for
+   it back. Kept visible while armed for the same reason as the drawer's: the
+   pointer can be within the confirm slack but off the tile. */
+.tile .rm {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  visibility: hidden;
+}
+
+.tile.ghost:hover .rm,
+.tile .rm.confirm {
+  visibility: visible;
+}
+
 .tile.zoom {
   grid-column: 1 / -1;
   grid-row: 1;
@@ -825,7 +888,7 @@ body.paused #pauseOverlay {
   padding: 8px;
   background: #0c0c0c;
   border-left: 1px solid #333;
-  overflow-y: auto;
+  overflow-y: scroll;
 }
 
 #drawer.active {
@@ -843,7 +906,7 @@ body.paused #pauseOverlay {
    about it", and giving the second one its own class is how the two drift
    apart. Which is why this is not named after clients. */
 .drawer-card {
-  /* Anchors the tag card's remove button to the corner. */
+  /* Anchors the tag and client cards' own remove buttons to the corner. */
   position: relative;
   margin-bottom: 8px;
   padding: 8px 10px;
@@ -857,6 +920,22 @@ body.paused #pauseOverlay {
   opacity: 0.55;
 }
 
+/* Not in the roster at all — the client card's controls have nobody left to
+   talk to. Dimmer than .gone (which is merely quiet) and, unlike it, disables
+   the controls in JS too (paint(), clients-panel.js): a button that silently
+   does nothing is the one thing this drawer must not offer. The remove button
+   is deliberately excluded from that and stays live. */
+.drawer-card.absent {
+  opacity: 0.35;
+}
+
+/* Room for the remove button in the corner: the tag card's head ends in a
+   short position readout that happens to clear it, but the client card's ends
+   in the Webcam toggle, which would otherwise sit directly under the bin. */
+.drawer-card:not(.tag) .head {
+  padding-right: 22px;
+}
+
 /* The same tag, pointed at here or in a room view. White rather than the tag's
    own colour, matching the halo the map draws: the card carries no tag colour
    to reinforce, and a highlight that changed hue per tag would read as a state
@@ -868,7 +947,7 @@ body.paused #pauseOverlay {
 
 .drawer-card .head {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 8px;
   margin-bottom: 4px;
 }
@@ -876,11 +955,6 @@ body.paused #pauseOverlay {
 .drawer-card .name {
   font-weight: 600;
   font-size: 14px;
-  cursor: text;
-}
-
-.drawer-card .name:hover {
-  text-decoration: underline dotted;
 }
 
 .drawer-card .rename {
@@ -918,8 +992,8 @@ body.paused #pauseOverlay {
    measure against for that slack. */
 .drawer-card .rm {
   position: absolute;
-  top: 5px;
-  right: 6px;
+  top: 8px;
+  right: 9px;
   visibility: hidden;
 }
 
@@ -1013,6 +1087,10 @@ body.paused #pauseOverlay {
   font-size: 11px;
   line-height: 1.5;
   color: #9a9a9a;
+
+  & > div:before {
+    content: "\2022" " ";
+  }
 }
 
 /* Full width and a fixed height: the canvas is sized from its own layout box in
@@ -1041,12 +1119,15 @@ body.paused #pauseOverlay {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 10px;
   color: #8a8a8a;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .drawer-card .hist .spark-key .sw {
   width: 8px;
   height: 2px;
   border-radius: 1px;
+  flex: 0 0 8px;
 }
 
 /* The gap before the next entry's swatch: without it a two-series key reads as
@@ -1080,7 +1161,7 @@ body.paused #pauseOverlay {
    holds. The label takes what is left. */
 .drawer-card.settings .setting {
   display: grid;
-  grid-template-columns: 1fr 68px 20px auto;
+  grid-template-columns: 1fr 7ch 20px auto;
   align-items: center;
   gap: 6px;
   padding: 3px 0;
@@ -1103,7 +1184,7 @@ body.paused #pauseOverlay {
 .drawer-card.settings .setting .toggle {
   grid-column: 2 / -1;
   justify-self: end;
-  min-width: 34px;
+  width: 32px;
 }
 
 /* The shared dot leaves room for the wording it normally sits beside; there is
@@ -1119,9 +1200,8 @@ body.paused #pauseOverlay {
   color: #eee;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px;
-  text-align: right;
   background: #2d2d2d;
-  border: 1px solid #444;
+  border: unset;
   border-radius: 4px;
 }
 
@@ -1135,8 +1215,9 @@ body.paused #pauseOverlay {
   align-items: center;
   justify-content: center;
   height: 24px;
-  padding: 0 7px;
+  padding: 0px;
   font-size: 12px;
+  width: 32px;
 }
 
 /* The room's only metric datum, in the header. Monospace and boxed like the

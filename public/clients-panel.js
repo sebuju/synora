@@ -23,8 +23,18 @@ const PANEL_RESOLUTIONS = ['480p', '720p', '1080p', '1440p', '4K'];
 // A pose older than this says nothing about where the client is now.
 const PANEL_POSE_STALE_MS = 2000;
 
+// The detection-rate row rides the same pose message, so it goes stale on the
+// same clock — but wider than PANEL_POSE_STALE_MS, or exactly the client that
+// is falling behind (fewer reports a second) is the one whose row disappears
+// first.
+const PANEL_DETECT_STALE_MS = 10000;
+// Achieved-vs-target ratio below which a client reads as unable to keep up.
+// Matches the server's own BEHIND_ON (server.js) so the card and server.log
+// never disagree about which side of the line a client is on.
+const PANEL_DETECT_BEHIND_RATIO = 0.75;
+
 function createClientsPanel(el,
-  { onControl, onVcam, onRename, onHover, onTagOpen, onTagRemove, onTagHistory }) {
+  { onControl, onVcam, onRename, onHover, onTagOpen, onTagRemove, onTagHistory, onClientRemove }) {
   const cards = new Map();   // clientId -> card DOM
 
   // Pointing at a card here points at the same entity in the room views, and
@@ -119,6 +129,27 @@ function createClientsPanel(el,
     vcamBtn.onclick = () => onVcam(id, !vcamBtn.classList.contains('on'));
     head.append(name, rename, kind, spacer, vcamBtn);
 
+    // The escape hatch for a client this dashboard no longer needs to track —
+    // same primitive, same corner, as the tag card's remove button below. On a
+    // still-connected client this drops the tile and its state but not the
+    // client itself: the roster brings the card straight back on the next
+    // push, which is why the armed title has to say so rather than promise a
+    // clean goodbye.
+    const rm = document.createElement('button');
+    rm.type = 'button';
+    rm.className = 'icon-btn mini rm danger';
+    rm.title = `Remove client ${id} from this dashboard`;
+    rm.setAttribute('aria-label', `Remove client ${id} from this dashboard`);
+    rm.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"'
+      + ' stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+      + '<path d="M4 7h16"/><path d="M9.5 4h5"/>'
+      + '<path d="M6.5 7l.9 12.1A2 2 0 0 0 9.4 21h5.2a2 2 0 0 0 2-1.9L17.5 7"/></svg>';
+    confirmButton(rm, () => onClientRemove?.(id), {
+      armedTitle: 'Click again to drop this client from the dashboard — a still-connected '
+        + 'client comes back on the next roster push, but its tile will not until it reconnects',
+    });
+    head.append(rm);
+
     const lines = document.createElement('div');
     lines.className = 'lines';
 
@@ -154,15 +185,31 @@ function createClientsPanel(el,
 
     root.append(head, lines, ctrls);
     return {
-      root, name, rename, kind, lines, vcamBtn,
+      root, name, rename, kind, lines, vcamBtn, ctrls,
       res, mic, pose, paused, blank, lm, stream, flip, rec,
       deviceName: null,
     };
   }
 
+  // A row that has nothing to say this tick, but must still occupy its line —
+  // see the comment on `statusLines` below for why an empty string will not do.
+  const BLANK_ROW = ' ';   // NBSP: a real glyph, so the line box does not collapse
+
   // The status block. Kept as text rather than a row of chips: this is the same
   // diagnostic readout the room overlay and the server log carry, and it is
   // read as prose more often than it is scanned.
+  //
+  // Every row below is pushed unconditionally, once, in a fixed order — never
+  // skipped and never doubled. `syncTextRows` (common.js) keys a row by its
+  // *position* in this array, so a row that comes and goes with the data (tags
+  // toggled off, ARCore tracking lost and regained, a landmark solve arriving
+  // mid-session) used to shift every row after it, growing and shrinking the
+  // card under the pointer while it was being read. A row's presence is now
+  // gated on what is structurally true of *this client* — its kind, which
+  // never changes while it stays connected — and its *content* on what is
+  // true this tick; the two are never conflated. `BLANK_ROW` is what a
+  // reserved row prints when it has nothing to say, standing in exactly where
+  // "no video"/"not recording" already do further down for the same reason.
   function statusLines(info) {
     const out = [];
     const size = info.capture ? `${info.capture.w}x${info.capture.h}` : null;
@@ -178,69 +225,147 @@ function createClientsPanel(el,
     if (!info.pose) bits.push('tags off');
     if (info.landmarks === false) bits.push('landmarks off');
     out.push(bits.join(' · '));
+
     // Reconnaissance, XR only: which WebXR features the session granted.
     // plane-detection or anchors turning up here is ARCore offering geometry
-    // the CV pipeline currently computes by hand.
-    if (info.kind === 'xr' && info.xrFeatures?.length) {
-      out.push(`xr: ${info.xrFeatures.join(' ')}`);
+    // the CV pipeline currently computes by hand. Reserved for the session
+    // rather than only while there is something to report — a phone that
+    // asked for nothing extra is not missing a row, it answered "nothing".
+    if (info.kind === 'xr') {
+      out.push(info.xrFeatures?.length ? `xr: ${info.xrFeatures.join(' ')}` : BLANK_ROW);
     }
 
-    if (info.lostMs !== null) {
-      out.push(`NO ARCORE TRACK ${fmtAge(info.lostMs)} — tags only`);
+    // ARCore tracking loss, XR only: silent while tracking holds (that is the
+    // ordinary state and saying so on every tick would be the noise), a
+    // warning while it does not — but the row is reserved either way, since
+    // this is exactly the row that toggles mid-session.
+    if (info.kind === 'xr') {
+      out.push(info.lostMs !== null
+        ? `NO ARCORE TRACK ${fmtAge(info.lostMs)} — tags only`
+        : BLANK_ROW);
     }
 
     const room = info.poseMsg?.room;
     if (room?.pose) {
       const p = room.pose.p.map((v) => v.toFixed(2)).join(', ');
-      const n = info.poseMsg.tags?.length ?? 0;
+      // Tag count off the latched detection (lastDetection, common.js), not
+      // the newest message — a carry report's empty tags would otherwise
+      // flash this row between "N tags" and "0 tags" on the XR interleave.
+      const n = info.detMsg?.tags?.length ?? 0;
       out.push(`room ${p} · ${room.quality} · ${n} tags · ${fmtAge(info.poseAge)}`);
     } else {
       out.push(info.pose ? 'no room fix' : 'not localizing');
+    }
+
+    // Detection rate — the setting is named "interval", not a promise: a phone
+    // that takes longer per frame than asked just runs as fast as it can, and
+    // until now nothing said whether that was happening. Rides the latched
+    // detection (lastDetection, common.js), not the newest pose, and goes
+    // stale on that latch's own age — a carry report has no `cost` at all, so
+    // gating on poseAge instead flashed this row "not detecting" on every
+    // other repaint on the XR interleave. Always renders exactly one row:
+    // real figures when there is a fresh report, the same "not localizing"
+    // shape of fallback when there is not (tags off, or nothing has arrived
+    // yet).
+    const detect = info.detect;
+    const detectFresh = detect && info.detAge !== null && info.detAge < PANEL_DETECT_STALE_MS;
+    if (detectFresh) {
+      const hz = (v) => (v === null ? '?' : v.toFixed(1));
+      if (detect.askedMs !== null && detect.serverAskedMs !== null
+        && detect.askedMs !== detect.serverAskedMs) {
+        // The client is pacing itself to an interval this server did not ask
+        // for — a config push that never landed, or landed before a change.
+        out.push(`det ${hz(detect.detHz)}/s · asked ${detect.serverAskedMs} ms, `
+          + `client on ${detect.askedMs} ms`);
+      } else if (detect.targetMs !== null) {
+        const targetHz = 1000 / detect.targetMs;
+        // Idle backoff (detect-core.js IDLE_SCAN_MS) widens the interval a
+        // client enforces once nothing has been seen for a while — that is a
+        // phone looking at a blank wall, not one that cannot keep up, so it
+        // reads "idle rate" against its own backed-off target rather than
+        // "BEHIND" against the ask it is not currently trying to hit.
+        const idle = detect.askedMs !== null && detect.targetMs > detect.askedMs;
+        const behind = !idle && detect.detHz !== null
+          && detect.detHz < targetHz * PANEL_DETECT_BEHIND_RATIO;
+        const bits = [`det ${hz(detect.detHz)}/s of ${hz(targetHz)}`];
+        if (detect.detMs !== null) bits.push(`${detect.detMs} ms`);
+        if (detect.blocked) bits.push(`${detect.blocked} late`);
+        if (behind) bits.push('BEHIND');
+        else if (idle) bits.push('idle rate');
+        out.push(bits.join(' · '));
+      } else {
+        out.push('not detecting');   // reported, but with nothing usable in it
+      }
+    } else {
+      out.push('not detecting');    // no fresh report at all (tags off, or none yet)
     }
 
     // The landmark cross-check: the camera solved from landmarks alone, and this
     // is how far that landed from the pose being reported. It is the pipeline's
     // only accuracy measurement and it has never been anywhere but server.log —
     // the map draws where the landmarks are, which says nothing about whether
-    // they agree with anything. Absent until a solve survives, and that is the
-    // honest reading of a client that has not built a usable map yet.
-    const check = room?.lmCheck;
-    if (check) {
-      const bits = [`landmarks ${check.dpMm} mm`, `${check.deg}°`,
-        `${check.inliers} in`, `rms ${check.rms} px`];
-      // Neither of these is an aside. A takeover means the pose on the map is
-      // the landmarks' answer rather than ARCore's; a rescue means mapSafe —
-      // what gates every permanent thing the walls module writes — is standing
-      // on landmarks past the point the tags stopped vouching for it.
-      if (room.lmFix) bits.push('TOOK OVER');
-      else if (room.safeVia === 'landmark') bits.push('held safe');
-      out.push(bits.join(' · '));
+    // they agree with anything. Blank until a solve survives, and that is the
+    // honest reading of a client that has not built a usable map yet — XR only,
+    // reserved for the session rather than only once the first solve lands.
+    //
+    // `room.lmCheck` only exists on the carried tag-less frames
+    // landmarks.check() runs on (server.js), the reports lastDetection
+    // discards — so this reads the check latch (info.lmCheckRoom), the
+    // opposite of every other row on this card, and holds it as long as
+    // PANEL_DETECT_STALE_MS: a 2 s window would blank it every time a tag
+    // came back into view, since that is exactly when checks stop running.
+    if (info.kind === 'xr') {
+      const checkRoom = info.lmCheckAge !== null && info.lmCheckAge < PANEL_DETECT_STALE_MS
+        ? info.lmCheckRoom : null;
+      const check = checkRoom?.lmCheck;
+      if (check) {
+        const bits = [`landmarks ${check.dpMm} mm`, `${check.deg}°`,
+          `${check.inliers} in`, `rms ${check.rms} px`, fmtAge(info.lmCheckAge)];
+        // Neither of these is an aside. A takeover means the pose on the map is
+        // the landmarks' answer rather than ARCore's; a rescue means mapSafe —
+        // what gates every permanent thing the walls module writes — is
+        // standing on landmarks past the point the tags stopped vouching for it.
+        if (checkRoom.lmFix) bits.push('TOOK OVER');
+        else if (checkRoom.safeVia === 'landmark') bits.push('held safe');
+        out.push(bits.join(' · '));
+      } else {
+        out.push(BLANK_ROW);
+      }
     }
 
     // What the cloud on the map cannot say: how much of it anything is looking
     // at right now. `live` against the solve's own count gate is the whole
     // answer to "can this client localize off landmarks at all", and it is a far
-    // smaller number than the cloud — the map remembers thousands.
-    const lm = info.landmarkState;
-    if (lm && (lm.n || lm.candidates)) {
-      const bits = [];
-      if (lm.n) {
-        bits.push(`${lm.n} landmarks · ${lm.live} live`
-          + (lm.live < ROOM_LANDMARK_MIN_FOR_FIX ? ` of ${ROOM_LANDMARK_MIN_FOR_FIX}` : ''));
+    // smaller number than the cloud — the map remembers thousands. XR only, and
+    // reserved the same way as the cross-check above — its own row, split from
+    // the depth verdict below, so a client with a landmark count but no depth
+    // residual yet (or the reverse) does not lose one number to make room for
+    // the other in a joined line.
+    if (info.kind === 'xr') {
+      const lm = info.landmarkState;
+      if (lm && (lm.n || lm.candidates)) {
+        const bits = [];
+        if (lm.n) {
+          bits.push(`${lm.n} landmarks · ${lm.live} live`
+            + (lm.live < ROOM_LANDMARK_MIN_FOR_FIX ? ` of ${ROOM_LANDMARK_MIN_FOR_FIX}` : ''));
+        }
+        if (lm.candidates) {
+          bits.push(`${lm.candidates} candidate${lm.candidates === 1 ? '' : 's'}`);
+        }
+        out.push(bits.join(' · '));
+      } else {
+        out.push(BLANK_ROW);
       }
-      if (lm.candidates) {
-        bits.push(`${lm.candidates} candidate${lm.candidates === 1 ? '' : 's'}`);
-      }
+
       // Depth trust, not arc. Measured on this room's journals the arc gate
-      // founds nothing at all (0 of 862 qualifications; depth and consensus did
-      // the rest), so arc progress describes a path nobody is on — and trusted
-      // depth is also what silences the phone's walk guidance, which otherwise
-      // reads as guidance that has given up.
-      const d = lm.depth;
-      if (d && d.residPct !== null) {
-        bits.push(d.trusted ? `depth trusted ±${d.residPct}%` : `depth ±${d.residPct}% unproven`);
-      }
-      out.push(bits.join(' · '));
+      // founds nothing at all (0 of 862 qualifications; depth and consensus
+      // did the rest), so arc progress describes a path nobody is on — and
+      // trusted depth is also what silences the phone's walk guidance, which
+      // otherwise reads as guidance that has given up.
+      const d = lm?.depth;
+      out.push(d && d.residPct !== null
+        ? (d.trusted ? `depth trusted ±${d.residPct}%` : `depth ±${d.residPct}% unproven`)
+        : BLANK_ROW);
     }
 
     const link = [];
@@ -251,6 +376,10 @@ function createClientsPanel(el,
       if (info.clockUnc !== null && info.clockUnc !== undefined) {
         link.push(`clock ±${Math.round(info.clockUnc)} ms`);
       }
+    } else if (info.ghost) {
+      // Same sentence as the tile's own note (ghostNote, common.js) — this and
+      // the tile are two views of one client and must not disagree about it.
+      link.push(ghostNote(info.ghost, info.ghostAt));
     } else if (info.kind !== 'xr' || info.stream) {
       // An XR client with the switch off is not missing anything; one that says
       // it is streaming and has no feed here is.
@@ -280,6 +409,16 @@ function createClientsPanel(el,
     // nothing is coming from it, and that is worth looking different.
     const fresh = info.poseAge !== null && info.poseAge < PANEL_POSE_STALE_MS;
     card.root.classList.toggle('gone', !info.live && !fresh);
+    // Not in the roster at all: every control here talks to a client the
+    // server no longer knows about, so — unlike `.gone`, where the client is
+    // merely quiet — those controls must not pretend to work. The remove
+    // button is deliberately left out of `ctrls` and stays live: it is the one
+    // thing worth pressing on a card in this state.
+    const absent = !info.present;
+    card.root.classList.toggle('absent', absent);
+    card.ctrls.inert = absent;
+    card.vcamBtn.disabled = absent;
+    card.name.style.pointerEvents = absent ? 'none' : '';
 
     // Only the room line is coloured, and only while it is fresh: a stale
     // position reading in the same green as a live one is the one thing this
@@ -293,7 +432,11 @@ function createClientsPanel(el,
             // camera is. It is rare, it is consequential, and it must not read
             // as one more figure in a row of figures.
             : text.endsWith('TOOK OVER') ? 'warn'
-              : '',
+              // A client stuck behind its own asked rate, or working to a rate
+              // this server never asked for — both are the same kind of
+              // "something is wrong with this client's detection", not routine.
+              : text.startsWith('det ') && (text.endsWith('BEHIND') || text.includes('asked ') && text.includes('client on ')) ? 'warn'
+                : '',
     })));
 
     // An XR client has no mic, no lens and no resolution to pick — ARCore
@@ -337,14 +480,10 @@ function createClientsPanel(el,
   // new parent is a re-parenting of the node it sits in, not a rebuild of it.
   const tagNodes = new Map();   // tag id -> { node, plain, chained }
   let tagsFrom = null;
-  // Whether each tag's stored pose is still walking anywhere. `resid` alone
-  // cannot answer that — it is one fix's disagreement, and the fixes are noisy,
-  // so it never falls to the few millimetres that read as converged and every
-  // tag showed "settling" forever. What settling means is that refinement is
-  // still moving the pose, so that is what is measured: the stored pose against
-  // where it was, held here because the map object is replaced wholesale on
-  // every message and carries no history of itself.
-  const settleHist = new Map();   // tag id -> { p, q, stillAtMs }
+  // Whether each tag's stored pose is still walking anywhere is `tagSettleState`
+  // in common.js, not a copy here: the 2D map outlines the same tags from the
+  // same verdict, and a second history sampled on a different tick would have
+  // the card's dot and the map's chip disagreeing about one tag.
   // Last hover the viewer told this panel about, as { kind, id } | null. Held
   // rather than read back off the cards: what is hot is one entity across the
   // whole dashboard, and a card arriving under a pointer that has not moved
@@ -353,9 +492,6 @@ function createClientsPanel(el,
   const isHot = (kind, id) => !!hot && hot.kind === kind && hot.id === id;
   let agesPaintedAt = 0;
   const AGE_TICK_MS = 1000;
-  const SETTLE_WINDOW_MS = 20000;
-  const SETTLE_MOVE_M = 0.001;
-  const SETTLE_MOVE_DEG = 0.1;
 
   // Which tag card is open, and the record the server sent for it. One at a
   // time: a tag's history is the thing being compared *against the room*, not
@@ -371,20 +507,6 @@ function createClientsPanel(el,
   // Polled while a card is open. A sample a second is what the server records,
   // so asking faster only re-sends the same array.
   const HIST_POLL_MS = 1000;
-
-  function settleState(tag) {
-    const prev = settleHist.get(tag.id);
-    const now = Date.now();
-    const moved = !prev
-      || Math.hypot(tag.p[0] - prev.p[0], tag.p[1] - prev.p[1], tag.p[2] - prev.p[2]) > SETTLE_MOVE_M
-      || quatAngleDeg(tag.q, prev.q) > SETTLE_MOVE_DEG;
-    const stillAtMs = moved ? now : prev.stillAtMs;
-    settleHist.set(tag.id, { p: tag.p, q: tag.q, stillAtMs });
-    // Tiny residual settles it immediately — otherwise a freshly opened viewer
-    // calls an obviously converged tag unsettled for the first window.
-    return (tag.resid ?? 0) <= 0.005 && (tag.residDeg ?? 0) <= 1
-      || now - stillAtMs >= SETTLE_WINDOW_MS;
-  }
 
   // Every line on a tag card is one fact, written `label: value` with the
   // labels down the left edge and the colons in one column: a card is read down
@@ -434,20 +556,23 @@ function createClientsPanel(el,
   // cards are rebuilt only when a new map arrives, which is never once a survey
   // stops moving.
   function settleRows(tag) {
-    if (tag.refinedAtMs) {
+    // The verdict is `tagSettleState` (common.js); what is written about it is
+    // this card's business. The anchor never reaches here — paintSettle is
+    // skipped for it — so `datum` is not a case this has to print.
+    const state = tagSettleState(tag, tagsFrom?.anchorId);
+    if (state === 'settled' || state === 'settling') {
       const mm = Math.round((tag.resid ?? 0) * 1000);
       const deg = (tag.residDeg ?? 0).toFixed(1);
-      const settled = settleState(tag);
       return {
         rows: [
-          ['state', settled ? 'settled' : 'settling'],
+          ['state', state],
           ['off by', `${mm} mm / ${deg}°`],
           ['nudged', `${fmtAge(Date.now() - tag.refinedAtMs)} ago`],
         ],
-        warn: !settled,
+        warn: state !== 'settled',
       };
     }
-    if (tag.checkedAtMs) {
+    if (state === 'disputed') {
       // It has been seen beside a known tag — every check just landed too far
       // away to average toward (past the reseed threshold refinement refuses,
       // by design). Saying "needs another known tag in the same frame" here is
@@ -490,8 +615,9 @@ function createClientsPanel(el,
   // drawn on a dashed rail because that link is where the tag is being corrected
   // from, not where it came from. The same cycle argument covers it, one step
   // further on: the server derives `chainHops` from the parents' founding depth
-  // only, so a chained tag (founding depth null) can never satisfy either parent
-  // test and is always a leaf.
+  // only, so a link is always to something strictly nearer the anchor. (Such a
+  // tag stays on the dashed rail only until `adoptChain` gives it a founding
+  // chain of its own, at which point it moves onto the solid one.)
   function tagTree(markers, anchorId) {
     const byId = new Map(markers.map((t) => [t.id, t]));
     const kids = new Map(markers.map((t) => [t.id, []]));
@@ -547,7 +673,7 @@ function createClientsPanel(el,
       tagCards.delete(id);
       // A removed tag that comes back is a re-survey, not a continuation, so
       // its old stillness is not evidence about the new pose.
-      settleHist.delete(id);
+      forgetTagSettle(id);
     }
     for (const tag of markers) {
       const isAnchor = tag.id === markerMap.anchorId;
@@ -968,6 +1094,14 @@ function createClientsPanel(el,
       return `placed ${age} ago on ${ev.n}/${ev.of} estimates`
         + (ev.from?.length ? ` via ${ev.from.join(', ')}` : ' off ARCore alone');
     }
+    // The tag was placed with no chain at all and has since earned one. Worth a
+    // line of its own rather than folding into the placement above: until this
+    // happens the tag is the least attested thing in the map and the most
+    // freely believed, which is the pair of readings the adoption resolves.
+    if (ev.kind === 'adopted') {
+      return `adopted a chain ${age} ago — placed off ARCore, since checked `
+        + `${ev.n} times via ${(ev.from || []).join(', ')}`;
+    }
     return `${ev.kind} ${age} ago`;
   }
 
@@ -1340,8 +1474,12 @@ function createClientsPanel(el,
     if (!tagCards.size) return;
     const bySeen = new Map();
     for (const info of list) {
-      if (info.poseAge === null || info.poseAge > PANEL_POSE_STALE_MS) continue;
-      for (const t of info.poseMsg?.tags || []) {
+      // The latched detection (lastDetection, common.js), gated on its own
+      // age rather than poseAge — a carry report is a fresh pose with a
+      // stale look, and reading poseMsg here is what made a tag continuously
+      // in view flash to "no" on every carry in the XR interleave.
+      if (info.detAge === null || info.detAge > PANEL_POSE_STALE_MS) continue;
+      for (const t of info.detMsg?.tags || []) {
         if (!bySeen.has(t.id)) bySeen.set(t.id, []);
         // Distance from the tag's own camera-frame translation. The wire format
         // carries tvec and px; `dist` is derived server-side in buildObs and
