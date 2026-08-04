@@ -10,9 +10,16 @@ const {
 // Free-space carving from tag sightings. Every accepted camera→tag ray proves
 // the line of sight was empty — the camera decoded the tag through it — and
 // that the tag's wall is at the far end. That is the entire evidence model:
-// no depth (the removed mapping pipeline showed the available depth error puts
-// walls metres out), no assumption that unseen space is empty. Unknown stays
-// unknown; the output only ever claims "attested free".
+// no depth, no assumption that unseen space is empty. Unknown stays unknown;
+// the output only ever claims "attested free".
+//
+// The depth exclusion is measured, not inherited: past 3 m ARCore's depth is
+// 0.9-1.7 m out (.claude/rules/depth.md), which is the removed mapping
+// pipeline's failure on a newer source, and a wall is exactly the far-range
+// claim that error lands on. Landmark rays are the one route by which
+// anything depth-derived could reach this grid and they ship inert
+// (landmarkScale 0); even switched on they carve line of sight only and their
+// far end asserts nothing.
 //
 // The grid is as permanent as markers.json, so evidence is gated the way the
 // survey gates map growth, not the way the viewer gates display: a report must

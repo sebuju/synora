@@ -987,12 +987,13 @@ async function start() {
   gl = canvas.getContext('webgl', { xrCompatible: true, alpha: true });
   try {
     session = await navigator.xr.requestSession('immersive-ar', {
-      // 'plane-detection' and 'depth-sensing' ride along as reconnaissance:
-      // everything here is optional, so asking costs nothing on a device
-      // without them. Depth is *measurement-only* — the depth pipeline is
-      // banned until a measurement shows the source good enough (CLAUDE.md),
-      // and sampling it at the tags, whose distance the solver already knows,
-      // is exactly that measurement.
+      // 'plane-detection' and 'depth-sensing' ride along: everything here is
+      // optional, so asking costs nothing on a device without them, and every
+      // path downstream works without depth. Sampling depth at the tags, whose
+      // distance the solver already knows, is the measurement that readmitted
+      // it — it now also serves as a founding prior on the server, under a
+      // trust gate the session re-earns from those same pairs
+      // (`.claude/rules/depth.md`).
       optionalFeatures: ['camera-access', 'anchors', 'dom-overlay', 'hit-test',
         'plane-detection', 'depth-sensing'],
       depthSensing: {
@@ -1322,9 +1323,10 @@ function ensureDetectWorker() {
 // valid — the XRDepthInformation object dies with the frame callback, but the
 // points it will be sampled for come back from the worker long after. Inert
 // bytes survive; ~38 KB at ARCore's usual 160x120, copied only while a
-// detection is being dispatched (~4/s). Measurement-only: nothing consumes
-// these numbers except the journal and replay-depth.js — the depth pipeline
-// stays banned until that replay says the source is good enough.
+// detection is being dispatched (~4/s). These numbers reach the journal (so
+// replay-depth.js can score them against the tags) and, through it, landmark
+// founding on the server — as a prior only, behind that session's own trust
+// gate. Nothing here decides anything; the page just samples.
 function grabDepth(frame, view) {
   if (!frame.getDepthInformation) return null;
   let di;

@@ -148,7 +148,9 @@ Expected accuracy is decimeter-level at room scale, dependent on calibration, ta
 
 The grid persists to `walls.json` (refused on a marker-size or cell-size mismatch) and resets with the survey when the anchor is removed — it was measured in that room frame.
 
-**Depth-based room mapping was removed** (depth models, voxel occupancy, `/depth-calibrate`). At the depth error available, walls landed metres out and no filtering fixed it. This feature replaces it from a different source — tag-localized poses — and depth stays out without a measurement showing the depth source is good enough.
+**Depth-based room mapping was removed** (a monocular depth model, voxel occupancy, `/depth-calibrate`). At the depth error available, walls landed metres out and no filtering fixed it. This feature replaces it from a different source — tag-localized poses — and **walls still take no depth evidence at all**.
+
+The ban that removal left behind asked for a measurement, and `replay-depth.js` is it: every detected tag carries both a depth sample and the distance the tag solver already knows for that same pixel, so the error distribution can be read straight off the recorded journals. Measured over 4534 sampled sightings, ARCore's depth is good to a median 60-74 mm out to 3 m — about one grid cell — and to 0.9-1.7 m beyond that, reproducing the old failure on a new source. So depth is readmitted only where the near half of that holds and something else can cross-check it: as a scale-calibrated prior for founding landmarks, described below. It never places a surface.
 
 ## Landmarks
 
