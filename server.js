@@ -1132,8 +1132,9 @@ function handleSignal(ws, msg) {
     if (msg.role === 'client') {
       ws.role = 'client';
       ws.clientId = clientIdFor(msg.deviceId);
-      // Kept as well as the clientId: depth calibration is a property of the
-      // physical camera, so it outlives the session-scoped small integer.
+      // Kept as well as the clientId: the camera calibration and capture
+      // settings stored under it are properties of the physical device, so it
+      // outlives the session-scoped small integer.
       ws.deviceId = msg.deviceId;
       ws.connectedAt = Date.now();
       // The page has normally introduced itself over /api/device/hello already;

@@ -1,7 +1,7 @@
 'use strict';
 
 // Downloads the large third-party assets that are deliberately not committed
-// (public/vendor/ and models/ are gitignored, like tools/). Safe to re-run:
+// (public/vendor/ is gitignored, like tools/). Safe to re-run:
 // existing files are kept unless they are smaller than the sanity threshold,
 // which catches interrupted downloads.
 //
