@@ -405,6 +405,89 @@ function fmtAge(ms) {
   return `${(s / 86400).toFixed(1)}${u}day`;
 }
 
+// A client that left the dashboard leaves a ghost behind rather than a gap —
+// see ghostDevice in viewer.js. The reason and sentence live here, shared with
+// clients-panel.js, so the tile and the drawer card describing the same client
+// cannot end up saying two different things about it.
+const GHOST_TEXT = {
+  'stream off': 'stream switched off',
+  offline: 'client disconnected',
+  'no server': 'dashboard lost the server',
+};
+
+function ghostNote(reason, at) {
+  return `${GHOST_TEXT[reason] || reason} · ${fmtAge(Date.now() - at)}`;
+}
+
+// A rolling-window rate/cost meter, shared by both capture pages' detection
+// loops. Read live, a chip or a message sent every frame would mostly be
+// dividing by a window a fifth of a second old, so the accumulators roll on
+// the caller's own loop and a completed window stands until the next one
+// closes — a partial only ever fills in before the first roll.
+//
+// `shape(win, prevReport)` turns the closed window into whatever the caller
+// publishes; `win.count(name)`/`win.rate(name)`/`win.mean(name, digits)` read
+// the accumulators, and `mean` returns null rather than 0 for an empty bucket
+// — "nothing finished in the window" is not "finished at zero cost".
+function createCostMeter({ windowMs = 5000, shape }) {
+  let from = 0;
+  let counts = {};
+  let sums = {};
+  let out = null;
+  let span = windowMs;   // the window `count`/`rate`/`mean` currently describe
+
+  function count(name) {
+    return counts[name] || 0;
+  }
+  function mean(name, digits = 0) {
+    const n = counts[name] || 0;
+    if (!n) return null;
+    const f = 10 ** digits;
+    return Math.round((sums[name] || 0) * f / n) / f;
+  }
+  function rate(name) {
+    return Math.round((counts[name] || 0) * 1e4 / Math.max(1, span)) / 10;
+  }
+  const win = { count, mean, rate };
+
+  return {
+    // A count-only event (`blocked`, a dropped frame) has no duration; a timed
+    // one (`dets`, `flips`) sums it for `mean` too.
+    bump(name, ms) {
+      counts[name] = (counts[name] || 0) + 1;
+      if (ms !== undefined) sums[name] = (sums[name] || 0) + ms;
+    },
+    roll(now) {
+      if (!from) {
+        from = now;
+        return;
+      }
+      if (now - from < windowMs) return;
+      span = now - from;
+      out = shape(win, out);
+      from = now;
+      counts = {};
+      sums = {};
+    },
+    report() {
+      if (out) return out;
+      if (!from) return null;
+      // A partial window, for the reader that asks before the first roll.
+      span = Math.max(1, performance.now() - from);
+      return shape(win, null);
+    },
+    // The window belongs to whatever was being measured (a session, a track);
+    // carried over, its first report after a restart would describe the thing
+    // that just ended.
+    reset() {
+      from = 0;
+      counts = {};
+      sums = {};
+      out = null;
+    },
+  };
+}
+
 // Screen blanking. A capture device runs for hours with a wake lock holding the
 // display on, and the display is the largest single draw on the phone — nothing
 // else a page can switch off comes close. Blanking costs nothing: the camera,
@@ -714,6 +797,19 @@ function roomTagColorCss(id) {
 }
 const ROOM_POSE_STALE_MS = 2000;
 
+// A carry report has no detection behind it, so its empty tag list is not a
+// statement that nothing is in view — it is the absence of a look. The XR
+// client sends several of them between detections; treating each as "no
+// tags" made the sight lines to the tags, and every drawer row derived from
+// them, blink out and back two or three times a second. What is still true
+// is whatever the last actual detection said, so that is what every reader
+// of a pose message latches onto instead of the newest message. Shared by
+// room-feed.js (the map's sight lines) and viewer.js (the drawer and tile
+// label) so the two can never disagree about what is in view.
+function lastDetection(prev, msg) {
+  return msg.carry ? prev : msg;
+}
+
 // The viewing arc a tracked feature has to be seen through before it can become
 // an anchor. Mirrored from MIN_ARC_DEG in landmark-math.js, which no page loads
 // — the server sends each candidate's measured arc, this is only what it is
@@ -773,6 +869,79 @@ function roomAngleColor(angleDeg) {
   const badness = Math.min(1, Math.max(0, angleDeg / 75));
   return `hsl(${Math.round(120 * (1 - badness))}, 85%, 55%)`;
 }
+
+// ---------------------------------------------------------------------------
+// Is the survey still moving this tag? Two surfaces ask — the drawer card's dot
+// and the 2D map's tag chip — and they must never answer differently about the
+// same tag at the same moment, which is the rule `clientInfo` already holds the
+// line on for clients. So it lives here, as one shared instance rather than one
+// implementation used twice: the test needs per-tag history, and two histories
+// sampled at different instants would settle a tag at two different times.
+//
+// What settling means is that *refinement is still moving the stored pose*, so
+// that is what is measured. Residual alone will not do it: `resid` is smoothed
+// and never falls to the few millimetres that read as converged, and reading it
+// as the whole answer had every tag saying "settling" forever.
+const ROOM_SETTLE_WINDOW_MS = 20000;
+const ROOM_SETTLE_MOVE_M = 0.001;
+const ROOM_SETTLE_MOVE_DEG = 0.1;
+// The marker map is replaced wholesale by every message and carries no history
+// of itself, so where each tag was last time is held here. id -> { p, q, stillAtMs }.
+const roomSettleHist = new Map();
+
+// 'datum' | 'settled' | 'settling' | 'disputed' | 'unchecked'. A state rather
+// than a boolean because the drawer prints a different sentence for each of the
+// last three, while the map only needs to know that it is not `settled`.
+function tagSettleState(tag, anchorId) {
+  // The anchor is where it is by definition and is never refined; a settle
+  // verdict on it would be a claim about a measurement that was never made.
+  // Decided here rather than at each call site, or the map would re-derive it.
+  if (tag.id === anchorId) return 'datum';
+  if (!tag.refinedAtMs) {
+    // Seen beside a known tag, but every check landed past the reseed
+    // threshold — mis-placed, not unobserved. The distinction sends whoever is
+    // holding the phone to the right problem.
+    return tag.checkedAtMs ? 'disputed' : 'unchecked';
+  }
+  const prev = roomSettleHist.get(tag.id);
+  const now = Date.now();
+  const moved = !prev
+    || Math.hypot(tag.p[0] - prev.p[0], tag.p[1] - prev.p[1], tag.p[2] - prev.p[2]) > ROOM_SETTLE_MOVE_M
+    || quatAngleDeg(tag.q, prev.q) > ROOM_SETTLE_MOVE_DEG;
+  // The baseline is the pose as of the last *detected move*, and it is left
+  // alone until then — so the question asked is "how long since it moved a
+  // millimetre", not "did it move a millimetre since the last time anyone
+  // asked". Those differ by the caller's rate: the map queries every frame and
+  // the drawer once a second, and against a per-call baseline the tag that
+  // walked 255 mm over one session did it at 0.015 mm a frame and would have
+  // read as settled throughout on the map while the drawer called it settling.
+  if (moved) roomSettleHist.set(tag.id, { p: tag.p, q: tag.q, stillAtMs: now });
+  const stillAtMs = moved ? now : prev.stillAtMs;
+  // Tiny residual settles it immediately — otherwise a freshly opened viewer
+  // calls an obviously converged tag unsettled for the first window.
+  const settled = (tag.resid ?? 0) <= 0.005 && (tag.residDeg ?? 0) <= 1
+    || now - stillAtMs >= ROOM_SETTLE_WINDOW_MS;
+  return settled ? 'settled' : 'settling';
+}
+
+// A forgotten tag takes its history with it. If that id ever comes back it is a
+// different tag on a different wall, and its predecessor's stillness says
+// nothing about it — the same rule `tag-history.js` follows for a hand-removed
+// tag.
+function forgetTagSettle(id) {
+  roomSettleHist.delete(id);
+}
+
+// What a surface uses to say "the survey is not done with this one". The
+// drawer paints a dot, the 2D map outlines the tag's id chip; nothing at all is
+// the resting state, so a mark always means go and look.
+//
+// Amber because that is what `.warn` and `.dot.warn` already are in style.css —
+// the two must not drift, and the map draws to a canvas and cannot read the
+// stylesheet. It does sit near the anchor's gold (`#d4b34c`) and the guide's
+// (`#ffd166`), which is survivable only because the anchor is `datum` and never
+// carries this mark: the two can never appear on the same glyph.
+const ROOM_SETTLING_CSS = '#e0a03a';
 
 // ---------------------------------------------------------------------------
 // Surveyed tag geometry, as right-angle distances. A map's own coordinates
