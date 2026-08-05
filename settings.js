@@ -11,7 +11,7 @@
 //
 // This module is the store, the schema and the validator, and deliberately
 // knows nothing about what any setting *does*: the effects belong with the
-// things they affect — the survey, the walls grid, the landmark map — and are
+// things they affect — the survey, the walls grid — and are
 // registered here as `on(key, fn)` callbacks by server.js. Nothing in here can
 // reach any of them, so a settings change cannot grow a second version of a
 // reset that already exists elsewhere.
@@ -39,7 +39,7 @@ const SPEC = [
     step: 1,
     unit: 'mm',
     scale: 1000,
-    danger: 'Rescales the room — the survey, the carve and the landmarks are all cleared',
+    danger: 'Rescales the room — the survey and the carve are both cleared',
     help: 'Outer edge of the black square on the printed tag, not the sheet and not the '
       + 'quiet zone. Measure a printed one: "fit to page" silently returns a 150 mm tag at '
       + 'about 142 mm, and nothing downstream can see it — the room simply comes out '
@@ -60,16 +60,6 @@ const SPEC = [
       + 'longer than this per frame runs as fast as it can.',
   },
   {
-    key: 'landmarksEnabled',
-    label: 'Landmarks',
-    type: 'bool',
-    def: true,
-    help: 'Triangulate natural image features from tag-derived poses, to carry a client '
-      + 'that has walked out of tag view. Off, the server ignores the points clients send, '
-      + 'reports no landmark summary or guidance, and forgets the anchors it had — the '
-      + 'client has its own toggle for the tracker cost on the phone.',
-  },
-  {
     key: 'wallsEnabled',
     label: 'Wall carving',
     type: 'bool',
@@ -83,8 +73,8 @@ const SPEC = [
     type: 'bool',
     def: true,
     help: 'Record every observation and the pose the survey made of it to '
-      + 'recordings/*.pose.jsonl. This is what the replay tools re-run, so survey, wall and '
-      + 'landmark tuning is measured rather than argued. Off, a long session stops writing '
+      + 'recordings/*.pose.jsonl. This is what the replay tools re-run, so survey and wall '
+      + 'tuning is measured rather than argued. Off, a long session stops writing '
       + 'tens of megabytes it will never be asked for.',
   },
 ];
