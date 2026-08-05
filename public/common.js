@@ -630,7 +630,7 @@ function confirmButton(el, onConfirm, { armedTitle = 'Click again to confirm', o
 
 // --- Reusing the elements already on screen ---------------------------------
 // Every list on the dashboard arrives as a whole new snapshot — a roster, a
-// marker map, a landmark push, a history record — and the obvious rendering of
+// marker map, a history record — and the obvious rendering of
 // a snapshot is to throw the children away and build new ones. That is wrong
 // here for the same reason it is wrong in the room views (anim.js): what is on
 // screen carries state the snapshot does not. A rebuilt subtree loses the text
@@ -770,22 +770,6 @@ function roomClientColorCss(id, alpha = null) {
   return `rgba(${(c >> 16) & 255}, ${(c >> 8) & 255}, ${c & 255}, ${alpha})`;
 }
 
-// Whether the pose about to be drawn came off the landmark map rather than off
-// the tags or ARCore's carry. Three states say so and they are one fact to
-// whoever is reading the map: the last-resort fix ('landmark'), the coarse
-// tier ('coarse'), and a takeover ('lmFix'), where the reported pose *is* the
-// solve's and ARCore's carry has been set aside beside it. It lives here for
-// the same reason the palette does — a client reading as landmark-held on one
-// surface and tag-held on another is worse than neither saying so.
-//
-// Deliberately not `safeVia === 'landmark'`: that is a landmark solve agreeing
-// with ARCore and rescuing its trust, and the pose drawn is still ARCore's.
-function roomPoseOffLandmarks(room) {
-  if (!room) return false;
-  return room.lmFix === true
-    || room.quality === 'landmark' || room.quality === 'coarse';
-}
-
 // Room axes, indexed the way a position is: x, y, z. Near three.js's own
 // AxesHelper defaults, and the helper is told them explicitly rather than left
 // on its defaults — the 2D views and the drawer read the same three numbers,
@@ -824,59 +808,6 @@ const ROOM_POSE_STALE_MS = 2000;
 // label) so the two can never disagree about what is in view.
 function lastDetection(prev, msg) {
   return msg.carry ? prev : msg;
-}
-
-// The viewing arc a tracked feature has to be seen through before it can become
-// an anchor. Mirrored from MIN_ARC_DEG in landmark-math.js, which no page loads
-// — the server sends each candidate's measured arc, this is only what it is
-// measured against. Here rather than in either page because both the XR
-// overlay's landmark line and the maps' candidate shading read it, and a
-// candidate that looked nearly ready on one and barely started on the other
-// would be worse than showing neither.
-const ROOM_LANDMARK_ARC_DEG = 20;
-
-// How many landmarks the solve has to match before it will localize from them
-// at all. Mirrored from MIN_LANDMARKS_FOR_FIX in landmarks.js, which no page
-// loads — the server sends how many are live, this is what that is read
-// against, and without it "22 live" is a number with no scale.
-const ROOM_LANDMARK_MIN_FOR_FIX = 15;
-
-// Candidates get a colour of their own rather than a dimmer version of the
-// client's. A client colour is an *identity* — the same hue carries that
-// client's dot, its landmarks and its drawer cards — and using it for tracks that
-// may never become anything says "this client has these landmarks" when the
-// truth is "this client is working on these". A neutral grey belongs to nobody
-// and reads as provisional, which is exactly what a candidate is.
-//
-// Deliberately not amber: that is the guidance and the walls module's deduced
-// class, both of which mean "inferred, act on it". Nor any client hue, nor the
-// anchor tag's gold.
-const ROOM_CANDIDATE_COLOR = 0x9aa4ad;
-
-function roomCandidateColorCss(alpha = null) {
-  if (alpha === null) return `#${ROOM_CANDIDATE_COLOR.toString(16).padStart(6, '0')}`;
-  const c = ROOM_CANDIDATE_COLOR;
-  return `rgba(${(c >> 16) & 255}, ${(c >> 8) & 255}, ${c & 255}, ${alpha})`;
-}
-
-// One shared colour for all landmarks, like the candidates' grey: the
-// landmark cloud used to borrow the owning client's colour, which put dots
-// the exact colour of the pose marker all over the map — the two mean
-// entirely different things and were being read as one. Teal: not any client
-// hue, not the candidates' grey, not the anchor's gold, not the amber that
-// means "inferred, act on it". Ownership is not drawn at all: a cloud belongs
-// to whoever built it, and that is a fact about the session rather than about
-// the room — the drawer's client card carries the counts instead.
-const ROOM_LANDMARK_COLOR = 0x2dd4bf;
-
-function roomLandmarkColor() {
-  return ROOM_LANDMARK_COLOR;
-}
-
-function roomLandmarkColorCss(alpha = null) {
-  if (alpha === null) return `#${ROOM_LANDMARK_COLOR.toString(16).padStart(6, '0')}`;
-  const c = ROOM_LANDMARK_COLOR;
-  return `rgba(${(c >> 16) & 255}, ${(c >> 8) & 255}, ${c & 255}, ${alpha})`;
 }
 
 // Green head-on sliding to red as the view of a tag gets oblique — pose

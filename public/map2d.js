@@ -107,25 +107,6 @@ function createMap2dView(canvas, mode = 'top', {
   // enough to fit anything else between them is a gap wide enough to read it as
   // belonging to whatever lands there.
   const CLIENT_LABEL_PIN_PX = 14;
-  // Smaller than anything else on the map that means something, on purpose.
-  const LANDMARK_DOT_PX = 1.4;
-  // A candidate is not a landmark: it is one track's current guess at where a
-  // feature is, and most of them never become anything. Drawn as an open ring
-  // rather than a dot so the two never read as the same class of thing at a
-  // glance, and dimmer again than the landmarks are.
-  const CANDIDATE_DOT_PX = 2.2;
-  // How far a candidate's arc has to have come before it is drawn at full
-  // strength. Faint means barely seen, solid means nearly a landmark — which is
-  // the whole reason to draw candidates at all, since the number of them says
-  // nothing and their progress says everything.
-  const CANDIDATE_MIN_ALPHA = 0.18;
-  // The guidance. Deliberately a colour nothing else on the map uses: it is an
-  // instruction, not a thing in the room, and it must not read as a tag, a
-  // client or a wall. White would be the hover halo; a client colour would say
-  // "this belongs to that client".
-  const GUIDE_CSS = '#ffd166';
-  const GUIDE_RING_M = 0.35;
-  const GUIDE_RING_MIN_PX = 9;
   const HOVER_MS = 120;
   let rafPending = false;
   let lastFrameAt = 0;
@@ -184,31 +165,6 @@ function createMap2dView(canvas, mode = 'top', {
   let nextWallKey = 1;
   let showWalls = true;
   let wallsAlpha = 1;
-  // Per-client landmarks: clientId -> [[x,y,z], ...]. Points only, and
-  // drawn as such — a landmark has no orientation, no extent and no identity
-  // worth a label, and it is a great deal less trustworthy than a surveyed tag.
-  // The whole point of the styling below is that the two can never be confused.
-  let landmarks = [];
-  let showLandmarks = true;
-  let landmarksAlpha = 1;
-  // Whether coarse (not yet solve-grade) consensus landmarks are drawn at
-  // all. The phone map turns this off: there a dot must mean "can localize
-  // you", and five hundred depth-grade guesses drowned the hundred points
-  // that can. The dashboard keeps them — watching the coarse cloud refine
-  // into solid dots is how the feature's progress is read.
-  let showCoarse = true;
-  // Candidates ride the same message but a separate toggle: there are an order
-  // of magnitude more of them than landmarks and they move as they are refined, so
-  // a reader who wants to see the map the survey has settled on wants them off,
-  // and one asking why nothing is qualifying wants only them.
-  let showCandidates = false;
-  let candidatesAlpha = 0;
-  // Where to walk next, as the server worked it out for this client (see
-  // `guide` in landmarks.js). Only the phone sets one — it is an instruction to
-  // the person holding the camera, and an instruction on the dashboard would be
-  // addressed to someone who cannot follow it.
-  let guide = null;
-  let guideAlpha = 0;
   // The dark backdrop and the 1 m grid it carries: everything that is only
   // there to be drawn *on*. Turned off, the canvas is cleared instead of
   // filled, so whatever is behind it shows through — on the XR client that is
@@ -517,35 +473,6 @@ function createMap2dView(canvas, mode = 'top', {
     return true;
   }
 
-  // The guidance: a ring on the ground under the target cluster, and nothing
-  // else. The instruction itself — walk around it, get closer, keep it in view
-  // — is words on the overlay chip; this only answers *which* feature it is
-  // talking about, which is the one thing words cannot say.
-  //
-  // The arc and the dashed approach line that used to be drawn here were cut:
-  // the phone map is heading-up and centred on the reader's own dot, so a line
-  // to the ring said what the ring already said, and the arc's instruction is
-  // one the survey stopped asking for (see `guide` in landmarks.js — it says
-  // nothing at all once depth is trusted).
-  //
-  // Sized in world metres and pushed through the view's own projection, never
-  // in screen-space: this renderer serves three projections and a rotating
-  // phone screen, and the ring has to read as a place on the floor rather than
-  // as a decoration stuck to the glass.
-  function drawGuide(px, g, alpha) {
-    ctx.globalAlpha = alpha * 0.9;
-    ctx.strokeStyle = GUIDE_CSS;
-    ctx.lineWidth = 2;
-    ctx.lineCap = 'round';
-    ctx.setLineDash([]);
-    const [tx, ty] = px(g.p);
-    ctx.beginPath();
-    ctx.arc(tx, ty, Math.max(GUIDE_RING_MIN_PX, GUIDE_RING_M * shown.scale), 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.globalAlpha = 1;
-    ctx.lineCap = 'butt';
-  }
-
   function draw(now) {
     rafPending = false;
     if (!active) return;
@@ -753,12 +680,6 @@ function createMap2dView(canvas, mode = 'top', {
       // Dead reckoning is a state the reader acts on (walk back toward a
       // tag), so it fades like staleness does rather than snapping.
       ph.drMix = animFade(ph.drMix ?? 0, !!ph.dr, dt);
-      // Faded for a reason, not for polish: a takeover fires only on the
-      // frames whose solve disagrees, so `lm` flips off and on through the
-      // detection/carry interleave. Snapped, that is a strobe; on the fade's
-      // clock a single frame's flip barely moves the colour and a real stretch
-      // on landmarks goes fully teal.
-      ph.lmMix = animFade(ph.lmMix ?? 0, !!ph.lm, dt);
       ph.shownRadius = animApproach(ph.shownRadius,
         ph.uncertaintyM * UNCERTAINTY_SIGMA, dt, RADIUS_TAU_MS);
       // The circle's centre is a measurement in its own right and moves on the
@@ -829,9 +750,6 @@ function createMap2dView(canvas, mode = 'top', {
 
     poseMix = animFade(poseMix, showPose, dt);
     wallsAlpha = animFade(wallsAlpha, showWalls, dt);
-    landmarksAlpha = animFade(landmarksAlpha, showLandmarks, dt);
-    candidatesAlpha = animFade(candidatesAlpha, showCandidates, dt);
-    guideAlpha = animFade(guideAlpha, !!guide, dt);
     backdropAlpha = animFade(backdropAlpha, showBackdrop, dt);
     pairsAlpha = animFade(pairsAlpha, showPairs, dt);
     // With the backdrop gone there is nothing behind the text but the camera
@@ -921,10 +839,6 @@ function createMap2dView(canvas, mode = 'top', {
           if (!m || m.dead) continue;
           const [ta, tb] = proj(m.pos);
           rad = Math.max(rad, Math.hypot(ta - fa, tb - fb));
-        }
-        if (guide && guideAlpha > 0.01) {
-          const [ga, gb] = proj(guide.p);
-          rad = Math.max(rad, Math.hypot(ga - fa, gb - fb));
         }
         rad *= NEAR_FIT_MARGIN;
       } else {
@@ -1240,62 +1154,6 @@ function createMap2dView(canvas, mode = 'top', {
     ctx.globalAlpha = 1;
     ctx.setLineDash([]);
 
-    // Landmarks, under the tags and everything else that carries a
-    // claim: a small dot in the owning client's colour, no label, no ring, no
-    // extent. They are per-session, are thrown away whenever the tracker
-    // resets, and are a good deal less trustworthy than a surveyed tag — so
-    // they are drawn as the faintest thing on the map that is still legible,
-    // and nothing about them reads as a measurement.
-    // The instruction, under everything that describes the room: it is the one
-    // thing here that is not a measurement, and it must never be mistaken for
-    // one. Drawn before the tags and the landmarks so it sits behind them.
-    if (guideAlpha > 0.01 && guide) drawGuide(px, guide, guideAlpha);
-
-    // Candidates first, so a landmark sitting on one is drawn over its own ring
-    // rather than under it — that is the moment the reader is looking for.
-    if (candidatesAlpha > 0.01 && landmarks.length) {
-      ctx.lineWidth = 1;
-      // One colour for every client's candidates, and not their own: see
-      // ROOM_CANDIDATE_COLOR. A candidate is not yet anybody's landmark.
-      ctx.strokeStyle = roomCandidateColorCss();
-      for (const c of landmarks) {
-        if (!c.candidates?.length) continue;
-        for (const k of c.candidates) {
-          const [x, y] = px(k.p);
-          // Arc progress, not confidence: a candidate at 55° is one that has
-          // been looked at from nearly enough angles, not one that is nearly
-          // right. Floored so a barely-seen feature still marks its place.
-          const t = Math.min(1, (k.span || 0) / ROOM_LANDMARK_ARC_DEG);
-          ctx.globalAlpha = candidatesAlpha * (CANDIDATE_MIN_ALPHA + 0.5 * t);
-          ctx.beginPath();
-          ctx.arc(x, y, CANDIDATE_DOT_PX, 0, Math.PI * 2);
-          ctx.stroke();
-        }
-      }
-      ctx.globalAlpha = 1;
-    }
-
-    if (landmarksAlpha > 0.01 && landmarks.length) {
-      for (const c of landmarks) {
-        if (!c.landmarks?.length) continue;
-        ctx.fillStyle = roomLandmarkColorCss();
-        for (const p of c.landmarks) {
-          // p[3] is the grade: solve-grade landmarks draw bright and a size
-          // up, coarse consensus ones as faint specks (or, on the phone, not
-          // at all — see showCoarse). A guess the solve may not count yet
-          // must not read as the thing it is a guess about.
-          const solid = p[3] !== 0;
-          if (!solid && !showCoarse) continue;
-          const [x, y] = px(p);
-          ctx.globalAlpha = landmarksAlpha * (solid ? 0.85 : 0.3);
-          ctx.beginPath();
-          ctx.arc(x, y, solid ? LANDMARK_DOT_PX + 1 : LANDMARK_DOT_PX, 0, Math.PI * 2);
-          ctx.fill();
-        }
-      }
-      ctx.globalAlpha = 1;
-    }
-
     // Markers: a stroke along the tag's x axis, projected.
     const half = (markerMap?.sizeM || 0.15) / 2;
     lastGlyphs = [];
@@ -1428,12 +1286,7 @@ function createMap2dView(canvas, mode = 'top', {
       if (!ph.target) continue;
       const fade = ph.fade;
       const stale = ph.staleMix;
-      // Identity first, then which map is holding it, then staleness last —
-      // stale has to win, or a client that stopped reporting keeps announcing
-      // it is on landmarks when nothing is being solved at all.
-      const lm = ph.lmMix ?? 0;
-      const idColor = animMixCss(ph.color, roomLandmarkColorCss(), lm);
-      const color = animMixCss(idColor, '#555', stale);
+      const color = animMixCss(ph.color, '#555', stale);
       // With the pose hidden, heading, label, tag lines and distances all
       // anchor on the circle's centre — a line from an invisible point would
       // read as a stray mark. The two points are metres apart, so the switch
@@ -1466,12 +1319,7 @@ function createMap2dView(canvas, mode = 'top', {
         ctx.globalAlpha = fade * ringAlpha;
         ctx.beginPath();
         ctx.arc(ux, uy, rPx, 0, Math.PI * 2);
-        // The same three-way mix as the dot, built in rgba rather than by
-        // suffixing hex: animMixCss returns rgba() the moment it interpolates,
-        // and `${mixed}22` would silently produce garbage.
-        ctx.fillStyle = animMixCss(
-          animMixCss(roomClientColorCss(ph.id, 0.133), roomLandmarkColorCss(0.133), lm),
-          'rgba(85,85,85,0.10)', stale);
+        ctx.fillStyle = animMixCss(`${ph.color}22`, 'rgba(85,85,85,0.10)', stale);
         ctx.fill();
         ctx.strokeStyle = color;
         ctx.globalAlpha = fade * ringAlpha * 0.5;
@@ -1728,19 +1576,11 @@ function createMap2dView(canvas, mode = 'top', {
       ph.uncertaintyM = uncertainty?.r ?? 0;
       ph.ringTarget = uncertainty?.p ?? pose.p;
       // Dead reckoning, by the survey's own verdict: mapSafe is true exactly
-      // when it stands behind this pose (a fresh tag fix, the alignFresh
-      // carry, or a landmark confirmation), so the flag holds steady across
-      // the detection/carry interleave instead of flickering per report.
-      // A landmark takeover (`lmFix`) is optically anchored too — the pose
-      // being drawn is the solve's, not the drift — so it is not DR, even
-      // though it earns no carve trust. A message with no room verdict
+      // when it stands behind this pose (a fresh tag fix or the alignFresh
+      // carry), so the flag holds steady across the detection/carry interleave
+      // instead of flickering per report. A message with no room verdict
       // (older server) keeps the last state.
-      if (room) ph.dr = room.mapSafe !== true && room.lmFix !== true;
-      // Running off the landmark map: the dot takes the landmark cloud's own
-      // teal, so the colour says which map is holding this client rather than
-      // only which client it is. Same verdict for all three ways that happens
-      // — see roomPoseOffLandmarks.
-      if (room) ph.lm = roomPoseOffLandmarks(room);
+      if (room) ph.dr = room.mapSafe !== true;
       ph.at = performance.now();
     },
 
@@ -1928,30 +1768,9 @@ function createMap2dView(canvas, mode = 'top', {
       schedule();
     },
 
-    setLandmarks(next) {
-      landmarks = next || [];
-      schedule();
-    },
-
-    // The walk to do next, or null for "nothing worth saying" — which is the
-    // common answer and must draw nothing rather than the last instruction.
-    setGuide(next) {
-      guide = next || null;
-      schedule();
-    },
-
     setLayer(name, on) {
       if (name === 'walls') {
         showWalls = on;
-        schedule();
-      } else if (name === 'landmarks') {
-        showLandmarks = on;
-        schedule();
-      } else if (name === 'candidates') {
-        showCandidates = on;
-        schedule();
-      } else if (name === 'coarse') {
-        showCoarse = on;
         schedule();
       } else if (name === 'backdrop') {
         showBackdrop = on;

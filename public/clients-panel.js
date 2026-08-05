@@ -168,11 +168,6 @@ function createClientsPanel(el,
     const pose = toggle('Tags', 'pose', id, 'Marker tracking — off makes it a plain camera');
     const paused = toggle('Pause', 'paused', id, 'Freeze the feed; the recording stays open');
     const blank = toggle('Blank', 'blank', id, 'Black out the screen to save battery');
-    // XR only — the tracker cost lives on the phone, so this drives the
-    // phone's own switch and, like every control here, renders only what the
-    // client reports back.
-    const lm = toggle('Landmarks', 'landmarks', id,
-      'Landmark collection — off saves most of the phone\'s per-frame cost');
     // XR only — that page's camera is a GL texture with no stream behind it, so
     // sending video is work it does on purpose rather than something it is
     // always doing. Off costs it nothing.
@@ -181,12 +176,12 @@ function createClientsPanel(el,
     const flip = button('Flip', 'Switch between the front and rear camera');
     const rec = button('New rec', 'Close the current recording and start the next');
     rec.onclick = () => onControl(id, 'record', true);
-    ctrls.append(res, mic, pose, paused, blank, lm, stream, flip, rec);
+    ctrls.append(res, mic, pose, paused, blank, stream, flip, rec);
 
     root.append(head, lines, ctrls);
     return {
       root, name, rename, kind, lines, vcamBtn, ctrls,
-      res, mic, pose, paused, blank, lm, stream, flip, rec,
+      res, mic, pose, paused, blank, stream, flip, rec,
       deviceName: null,
     };
   }
@@ -202,8 +197,8 @@ function createClientsPanel(el,
   // Every row below is pushed unconditionally, once, in a fixed order — never
   // skipped and never doubled. `syncTextRows` (common.js) keys a row by its
   // *position* in this array, so a row that comes and goes with the data (tags
-  // toggled off, ARCore tracking lost and regained, a landmark solve arriving
-  // mid-session) used to shift every row after it, growing and shrinking the
+  // toggled off, ARCore tracking lost and regained) used to shift every row
+  // after it, growing and shrinking the
   // card under the pointer while it was being read. A row's presence is now
   // gated on what is structurally true of *this client* — its kind, which
   // never changes while it stays connected — and its *content* on what is
@@ -223,7 +218,6 @@ function createClientsPanel(el,
     if (info.paused) bits.push('PAUSED');
     if (info.blank) bits.push('screen blank');
     if (!info.pose) bits.push('tags off');
-    if (info.landmarks === false) bits.push('landmarks off');
     out.push(bits.join(' · '));
 
     // Reconnaissance, XR only: which WebXR features the session granted.
@@ -300,74 +294,6 @@ function createClientsPanel(el,
       out.push('not detecting');    // no fresh report at all (tags off, or none yet)
     }
 
-    // The landmark cross-check: the camera solved from landmarks alone, and this
-    // is how far that landed from the pose being reported. It is the pipeline's
-    // only accuracy measurement and it has never been anywhere but server.log —
-    // the map draws where the landmarks are, which says nothing about whether
-    // they agree with anything. Blank until a solve survives, and that is the
-    // honest reading of a client that has not built a usable map yet — XR only,
-    // reserved for the session rather than only once the first solve lands.
-    //
-    // `room.lmCheck` only exists on the carried tag-less frames
-    // landmarks.check() runs on (server.js), the reports lastDetection
-    // discards — so this reads the check latch (info.lmCheckRoom), the
-    // opposite of every other row on this card, and holds it as long as
-    // PANEL_DETECT_STALE_MS: a 2 s window would blank it every time a tag
-    // came back into view, since that is exactly when checks stop running.
-    if (info.kind === 'xr') {
-      const checkRoom = info.lmCheckAge !== null && info.lmCheckAge < PANEL_DETECT_STALE_MS
-        ? info.lmCheckRoom : null;
-      const check = checkRoom?.lmCheck;
-      if (check) {
-        const bits = [`landmarks ${check.dpMm} mm`, `${check.deg}°`,
-          `${check.inliers} in`, `rms ${check.rms} px`, fmtAge(info.lmCheckAge)];
-        // Neither of these is an aside. A takeover means the pose on the map is
-        // the landmarks' answer rather than ARCore's; a rescue means mapSafe —
-        // what gates every permanent thing the walls module writes — is
-        // standing on landmarks past the point the tags stopped vouching for it.
-        if (checkRoom.lmFix) bits.push('TOOK OVER');
-        else if (checkRoom.safeVia === 'landmark') bits.push('held safe');
-        out.push(bits.join(' · '));
-      } else {
-        out.push(BLANK_ROW);
-      }
-    }
-
-    // What the cloud on the map cannot say: how much of it anything is looking
-    // at right now. `live` against the solve's own count gate is the whole
-    // answer to "can this client localize off landmarks at all", and it is a far
-    // smaller number than the cloud — the map remembers thousands. XR only, and
-    // reserved the same way as the cross-check above — its own row, split from
-    // the depth verdict below, so a client with a landmark count but no depth
-    // residual yet (or the reverse) does not lose one number to make room for
-    // the other in a joined line.
-    if (info.kind === 'xr') {
-      const lm = info.landmarkState;
-      if (lm && (lm.n || lm.candidates)) {
-        const bits = [];
-        if (lm.n) {
-          bits.push(`${lm.n} landmarks · ${lm.live} live`
-            + (lm.live < ROOM_LANDMARK_MIN_FOR_FIX ? ` of ${ROOM_LANDMARK_MIN_FOR_FIX}` : ''));
-        }
-        if (lm.candidates) {
-          bits.push(`${lm.candidates} candidate${lm.candidates === 1 ? '' : 's'}`);
-        }
-        out.push(bits.join(' · '));
-      } else {
-        out.push(BLANK_ROW);
-      }
-
-      // Depth trust, not arc. Measured on this room's journals the arc gate
-      // founds nothing at all (0 of 862 qualifications; depth and consensus
-      // did the rest), so arc progress describes a path nobody is on — and
-      // trusted depth is also what silences the phone's walk guidance, which
-      // otherwise reads as guidance that has given up.
-      const d = lm?.depth;
-      out.push(d && d.residPct !== null
-        ? (d.trusted ? `depth trusted ±${d.residPct}%` : `depth ±${d.residPct}% unproven`)
-        : BLANK_ROW);
-    }
-
     const link = [];
     if (info.live) {
       if (info.latency !== null && info.latency !== undefined) {
@@ -428,15 +354,11 @@ function createClientsPanel(el,
       cls: i === 0 && (info.paused || info.blank) ? 'warn'
         : text.startsWith('NO ARCORE TRACK') ? 'bad'
           : text.startsWith('room ') && info.poseAge < PANEL_POSE_STALE_MS ? 'room'
-            // A takeover is the landmarks overruling ARCore about where the
-            // camera is. It is rare, it is consequential, and it must not read
-            // as one more figure in a row of figures.
-            : text.endsWith('TOOK OVER') ? 'warn'
-              // A client stuck behind its own asked rate, or working to a rate
-              // this server never asked for — both are the same kind of
-              // "something is wrong with this client's detection", not routine.
-              : text.startsWith('det ') && (text.endsWith('BEHIND') || text.includes('asked ') && text.includes('client on ')) ? 'warn'
-                : '',
+            // A client stuck behind its own asked rate, or working to a rate
+            // this server never asked for — both are the same kind of
+            // "something is wrong with this client's detection", not routine.
+            : text.startsWith('det ') && (text.endsWith('BEHIND') || text.includes('asked ') && text.includes('client on ')) ? 'warn'
+              : '',
     })));
 
     // An XR client has no mic, no lens and no resolution to pick — ARCore
@@ -449,7 +371,6 @@ function createClientsPanel(el,
     }
     // The XR page's switches. A client that never reported the state (old
     // build, capture client) gets no button rather than a lying one.
-    card.lm.style.display = reported(info.landmarks) ? '' : 'none';
     card.stream.style.display = reported(info.stream) ? '' : 'none';
     // A recording to cut exists on any client that is sending one.
     card.rec.style.display = full || info.stream ? '' : 'none';
@@ -461,7 +382,6 @@ function createClientsPanel(el,
     card.pose.classList.toggle('on', !!info.pose);
     card.paused.classList.toggle('on', !!info.paused);
     card.blank.classList.toggle('on', !!info.blank);
-    card.lm.classList.toggle('on', !!info.landmarks);
     card.stream.classList.toggle('on', !!info.stream);
     card.flip.textContent = info.facing === 'user' ? 'To rear' : 'To front';
     card.flip.onclick = () =>

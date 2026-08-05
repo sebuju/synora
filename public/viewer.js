@@ -222,10 +222,7 @@ const POSE_LABEL_TTL_MS = 2000;
 // `det`/`detAt` are the pose latched through lastDetection (common.js): the
 // newest message with an actual detection behind it, held across carry
 // reports, so every reader of "what tags are in view" agrees with the map's
-// sight lines instead of blinking on the carry interleave. `check`/`checkAt`
-// latch the opposite way — `room.lmCheck` is written only on the carried
-// tag-less frames a detection report has none of (server.js, the xr-pose
-// 'tracked' branch), so it is held from what the detection latch discards.
+// sight lines instead of blinking on the carry interleave.
 const poses = new Map();
 
 function updatePoseLabel(clientId, msg) {
@@ -233,9 +230,7 @@ function updatePoseLabel(clientId, msg) {
   const now = performance.now();
   const det = lastDetection(prev?.det, msg);
   const detAt = det ? (det === prev?.det ? prev.detAt : now) : null;
-  const check = msg.room?.lmCheck ? msg.room : prev?.check;
-  const checkAt = check ? (check === prev?.check ? prev.checkAt : now) : null;
-  poses.set(clientId, { msg, at: now, det, detAt, check, checkAt });
+  poses.set(clientId, { msg, at: now, det, detAt });
   roomFeed.applyPose(clientId, msg);
   // Only the per-tile label below needs a tile to live on.
   const dev = devices.get(clientId);
@@ -480,8 +475,6 @@ const sideBtn = document.getElementById('sideBtn');
 const frontBtn = document.getElementById('frontBtn');
 const poseBtn = document.getElementById('poseBtn');
 const wallsBtn = document.getElementById('wallsBtn');
-const landmarksBtn = document.getElementById('landmarksBtn');
-const candidatesBtn = document.getElementById('candidatesBtn');
 const clearTagsBtn = document.getElementById('clearTagsBtn');
 const clearCarveBtn = document.getElementById('clearCarveBtn');
 
@@ -812,11 +805,6 @@ let showPoseMarker = false;
 // layer only exists where evidence was accepted, so an empty room draws
 // nothing rather than noise.
 let showWalls = true;
-let showLandmarks = true;
-// Off by default, unlike the landmarks: candidates are numerous, transient and
-// mostly never become anything, so they are a diagnostic someone asks for
-// ("why is nothing qualifying?") rather than part of the room.
-let showCandidates = false;
 
 // ---------------------------------------------------------------------------
 // One description of a client, merged from everything that knows part of one:
@@ -841,12 +829,6 @@ function clientInfo(id) {
   if (lost && performance.now() - lost.at > LOST_STALE_MS) trackingLost.delete(id);
   const stillLost = trackingLost.get(id);
   const pose = poses.get(id);
-  // The landmark row belongs here rather than being passed to the drawer
-  // alongside: this is the one description of a client, and a panel assembling
-  // its own would be the second. `candidates` is the length of the cloud the
-  // maps are already drawing, so only `live` and the depth verdict come off the
-  // wire as their own numbers.
-  const lm = (roomFeed.getLandmarks() || []).find((c) => c.clientId === id);
   return {
     id,
     kind: 'client',
@@ -859,12 +841,6 @@ function clientInfo(id) {
     present: roster.has(id),
     ghost: dev?.ghost ?? null,
     ghostAt: dev?.ghostAt ?? null,
-    landmarkState: lm ? {
-      n: lm.landmarks?.length ?? 0,
-      candidates: lm.candidates?.length ?? 0,
-      live: lm.state?.live ?? 0,
-      depth: lm.state?.depth ?? null,
-    } : null,
     poseMsg: pose?.msg ?? null,
     poseAge: pose ? performance.now() - pose.at : null,
     // The pose latched through lastDetection (common.js): what tags are
@@ -874,9 +850,6 @@ function clientInfo(id) {
     detMsg: pose?.det ?? null,
     detAge: pose?.detAt !== null && pose?.detAt !== undefined
       ? performance.now() - pose.detAt : null,
-    lmCheckRoom: pose?.check ?? null,
-    lmCheckAge: pose?.checkAt !== null && pose?.checkAt !== undefined
-      ? performance.now() - pose.checkAt : null,
     // What the detection loop reported achieving (`cost`, from either capture
     // page's rolling-window meter) against what this server is currently
     // asking every client for — the drawer's own reading of "attempted, not
@@ -990,12 +963,8 @@ function refreshViews() {
   drawerBtn.classList.toggle('on', showDrawer);
   poseBtn.classList.toggle('on', showPoseMarker);
   wallsBtn.classList.toggle('on', showWalls);
-  landmarksBtn.classList.toggle('on', showLandmarks);
-  candidatesBtn.classList.toggle('on', showCandidates);
   roomViewList.forEach((v) => v.setShowPose(showPoseMarker));
   roomViewList.forEach((v) => v.setLayer?.('walls', showWalls));
-  roomViewList.forEach((v) => v.setLayer?.('landmarks', showLandmarks));
-  roomViewList.forEach((v) => v.setLayer?.('candidates', showCandidates));
   clientsPanel.setActive(showDrawer);
   refreshClientsPanel();
   // The backdrop hides the tile grid behind a full-bleed view. The combined
@@ -1040,8 +1009,6 @@ const viewToggles = [
   { key: 'front', btn: frontBtn, get: () => showFront, set: (v) => { showFront = v; } },
   { key: 'pose', btn: poseBtn, get: () => showPoseMarker, set: (v) => { showPoseMarker = v; } },
   { key: 'walls', btn: wallsBtn, get: () => showWalls, set: (v) => { showWalls = v; } },
-  { key: 'landmarks', btn: landmarksBtn, get: () => showLandmarks, set: (v) => { showLandmarks = v; } },
-  { key: 'candidates', btn: candidatesBtn, get: () => showCandidates, set: (v) => { showCandidates = v; } },
   // Key stays 'clients' although the button no longer is: it names a stored
   // value, and renaming it would read every existing viewer's saved layout as
   // "not stored" and reopen the drawer on someone who closed it.

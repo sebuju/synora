@@ -136,25 +136,7 @@ function createSceneView(canvas) {
     const markerGroup = new THREE.Group();
     scene.add(markerGroup);
 
-    // Landmarks. One THREE.Points per client rather than a mesh each:
-    // there are hundreds of them, they are position-only, and they are replaced
-    // wholesale on every push — a scene graph node per landmark would cost more
-    // to maintain than the points cost to draw.
-    const landmarkGroup = new THREE.Group();
-    landmarkGroup.visible = showLandmarks;
-    scene.add(landmarkGroup);
-
-    // The tracks that have not qualified. Its own group and its own toggle:
-    // there are far more of them than landmarks, and the two answer different
-    // questions — the landmarks are what the room has, the candidates are what it
-    // is working on.
-    const candidateGroup = new THREE.Group();
-    candidateGroup.visible = showCandidates;
-    scene.add(candidateGroup);
-
-    three = {
-      renderer, scene, camera, controls, markerGroup, landmarkGroup, candidateGroup,
-    };
+    three = { renderer, scene, camera, controls, markerGroup };
 
     // Clients whose poses arrived before the 3D view was first opened already
     // have groups — they were parked outside any scene until now.
@@ -164,95 +146,6 @@ function createSceneView(canvas) {
     }
   }
 
-
-  // Anchor clouds, as they last arrived. Held even while the 3D view has never
-  // been opened, for the same reason the marker map is: a view that opens later
-  // must not show an empty room until the next push.
-  let landmarkData = [];
-  let showLandmarks = true;
-  let showCandidates = false;
-
-  // Rebuilt rather than diffed: the server sends every client's whole set on
-  // each push, the sets are small in bytes and large in count, and a landmark
-  // has no identity across pushes to diff against — an anchor that was dropped
-  // and one that moved are the same event here.
-  //
-  // Drawn deliberately subordinate to the tags: small, dim, no label. A tag is
-  // a surveyed, persistent, metric datum; a landmark is a per-session guess
-  // that disappears when the tracker resets. The view has to say which is
-  // which at a glance.
-  function clearPoints(group) {
-    for (const child of [...group.children]) {
-      child.geometry.dispose();
-      child.material.dispose();
-      group.remove(child);
-    }
-  }
-
-  // Candidates, in the same style one step further down: smaller, dimmer, and
-  // shaded per point by how much of the qualifying arc that feature has been
-  // seen through — a dark speck has been glanced at, a bright one is nearly an
-  // anchor. Per-vertex colour rather than per-point opacity, which THREE.Points
-  // has no notion of; against this backdrop scaling the colour reads the same.
-  function syncCandidates() {
-    const group = three.candidateGroup;
-    clearPoints(group);
-    for (const c of landmarkData) {
-      if (!c.candidates?.length) continue;
-      const n = c.candidates.length;
-      const pos = new Float32Array(n * 3);
-      const col = new Float32Array(n * 3);
-      // Not the client's colour — see ROOM_CANDIDATE_COLOR. The shading below
-      // is arc progress, so the one hue varies only in how far along it is.
-      const base = new THREE.Color(ROOM_CANDIDATE_COLOR);
-      for (let i = 0; i < n; i++) {
-        const k = c.candidates[i];
-        pos[i * 3] = k.p[0];
-        pos[i * 3 + 1] = k.p[1];
-        pos[i * 3 + 2] = k.p[2];
-        const t = Math.min(1, (k.span || 0) / ROOM_LANDMARK_ARC_DEG);
-        const w = 0.3 + 0.7 * t;
-        col[i * 3] = base.r * w;
-        col[i * 3 + 1] = base.g * w;
-        col[i * 3 + 2] = base.b * w;
-      }
-      const geom = new THREE.BufferGeometry();
-      geom.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-      geom.setAttribute('color', new THREE.BufferAttribute(col, 3));
-      group.add(new THREE.Points(geom, new THREE.PointsMaterial({
-        vertexColors: true,
-        size: 0.018,
-        sizeAttenuation: true,
-        transparent: true,
-        opacity: 0.5,
-        depthWrite: false,
-      })));
-    }
-  }
-
-  function syncLandmarks() {
-    const group = three.landmarkGroup;
-    clearPoints(group);
-    for (const c of landmarkData) {
-      if (!c.landmarks?.length) continue;
-      const pos = new Float32Array(c.landmarks.length * 3);
-      for (let i = 0; i < c.landmarks.length; i++) {
-        pos[i * 3] = c.landmarks[i][0];
-        pos[i * 3 + 1] = c.landmarks[i][1];
-        pos[i * 3 + 2] = c.landmarks[i][2];
-      }
-      const geom = new THREE.BufferGeometry();
-      geom.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-      group.add(new THREE.Points(geom, new THREE.PointsMaterial({
-        color: roomLandmarkColor(),
-        size: 0.035,
-        sizeAttenuation: true,
-        transparent: true,
-        opacity: 0.55,
-        depthWrite: false,
-      })));
-    }
-  }
 
   // id -> the live tag, including the pos/normal the client→tag lines read.
   // Those are the *drawn* position and normal, updated every frame from the
@@ -593,12 +486,6 @@ function createSceneView(canvas) {
           syncMarkers(markerMapPending);
           markerMapPending = null;
         }
-        // Anchors that arrived while this view had never been opened: the
-        // group is built in init(), so they could not be applied then.
-        if (landmarkData.length) {
-          syncLandmarks();
-          syncCandidates();
-        }
         lastFrameAt = 0;
         scheduleDraw();
       }
@@ -609,30 +496,8 @@ function createSceneView(canvas) {
       else markerMapPending = map;
     },
 
-    setLandmarks(next) {
-      landmarkData = next || [];
-      if (three) {
-        syncLandmarks();
-        syncCandidates();
-      }
-      scheduleDraw();
-    },
-
     setShowPose(on) {
       showPose = on;
-    },
-
-    // Only the layers this view actually draws; the 2D map owns the rest and
-    // the caller sends every toggle to every view.
-    setLayer(name, on) {
-      if (name === 'landmarks') {
-        showLandmarks = on;
-        if (three) three.landmarkGroup.visible = on;
-      } else if (name === 'candidates') {
-        showCandidates = on;
-        if (three) three.candidateGroup.visible = on;
-      } else return;
-      scheduleDraw();
     },
 
 

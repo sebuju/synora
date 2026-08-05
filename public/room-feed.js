@@ -21,21 +21,13 @@
 // Only the XR path reports any of it (it needs the phone's own pose to separate
 // real motion from fix noise), so anything else gets radius 0 and draws no ring
 // rather than inventing one.
-// A coarse-tier fix reports its own radius (`poseR`, metres) and has no jitter
-// behind it — it is not an ARCore-carried pose at all, so there is no motion to
-// divide out and no centre distinct from the dot. It is checked first because
-// a frame that reaches the tier may still carry a stale jitter reading from
-// before the survey lost the room, and that reading describes nothing here.
 function poseUncertainty(msg) {
-  const room = msg.room;
-  if (room?.poseR != null) return { r: room.poseR, p: null };
-  const j = room?.jitter;
+  const j = msg.room?.jitter;
   return { r: (j?.jitterMm ?? 0) / 1000, p: j?.centre ?? null };
 }
 
 function createRoomFeed(views) {
   let markerMap = null;
-  let landmarks = [];
   // clientId -> the last *detection* message reported. See applyPose and
   // lastDetection (common.js).
   const lastDet = new Map();
@@ -57,14 +49,6 @@ function createRoomFeed(views) {
       }
       if (msg.type === 'walls') {
         views.forEach((v) => v.setWalls?.(msg.walls));
-        return true;
-      }
-      // The per-client landmark cloud. Sent whole, so a client whose landmarks were
-      // dropped says so by appearing with fewer — the renderers replace rather
-      // than merge.
-      if (msg.type === 'landmarks') {
-        landmarks = msg.clients;
-        views.forEach((v) => v.setLandmarks?.(msg.clients));
         return true;
       }
       return false;
@@ -97,13 +81,6 @@ function createRoomFeed(views) {
     // which survey they are showing.
     getMarkerMap() {
       return markerMap;
-    },
-
-    // The anchor clouds as they last arrived, for the drawer. Held here for the
-    // same reason the marker map is: the views and the panel must not be able
-    // to disagree about which collection they are showing.
-    getLandmarks() {
-      return landmarks;
     },
   };
 }
