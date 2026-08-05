@@ -55,7 +55,7 @@ function numFlag(flags, key, dflt, usage) {
 // final line of a journal cut off mid-write is torn and is skipped rather than
 // killing the run, and the `meta` line is handed to the caller instead of being
 // swallowed — walls has to refuse a marker size that does not match its map,
-// landmarks has nothing to check.
+// while other callers have nothing to check.
 function* readJournals(files, { onMeta, onError } = {}) {
   const fail = onError || ((msg) => { console.error(msg); process.exit(1); });
   for (const file of files) {

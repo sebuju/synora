@@ -15,9 +15,8 @@
 //
 // So this opens a real WebSocket, presents itself as a client, and sends the
 // journal's own pose messages back at the server verbatim. With `--watch` it
-// also connects as the viewer and reports what comes back: the landmark cloud, the
-// candidate clouds, the regions. Nothing is simulated and nothing is stubbed —
-// if this prints landmarks, the live path builds landmarks.
+// also connects as the viewer and reports what comes back: the marker map and
+// the carved floor. Nothing is simulated and nothing is stubbed.
 //
 // **Point it at a throwaway server.** It drives the survey and the walls grid
 // with recorded data, and those write `markers.json` and `walls.json`. Start one
@@ -63,7 +62,7 @@ const opts = { rejectUnauthorized: false };
 // chain, and the only honest place to check it.
 function startWatcher() {
   const ws = new WebSocket(url, opts);
-  const seen = { landmarks: 0, markerMap: 0, floor: 0 };
+  const seen = { markerMap: 0, floor: 0 };
   let last = null;
   ws.on('open', () => ws.send(JSON.stringify({ type: 'role', role: 'viewer' })));
   ws.on('message', (buf) => {
@@ -73,17 +72,8 @@ function startWatcher() {
     } catch {
       return;   // binary frame: recorder chunks, not ours
     }
-    if (msg.type === 'marker-map') seen.markerMap++;
+    if (msg.type === 'marker-map') { seen.markerMap++; last = msg; }
     else if (msg.type === 'floor') seen.floor++;
-    else if (msg.type === 'landmarks') {
-      seen.landmarks++;
-      last = msg;
-      for (const c of msg.clients || []) {
-        if (!c.landmarks?.length && !c.candidates?.length) continue;
-        console.log(`  [viewer] client ${c.clientId}: ${c.landmarks.length} landmark(s), `
-          + `${c.candidates?.length ?? 0} candidate(s), ${c.state?.live ?? 0} live`);
-      }
-    }
   });
   ws.on('error', (e) => console.error(`  [viewer] ${e.message}`));
   return { ws, seen, get last() { return last; } };
@@ -92,14 +82,11 @@ function startWatcher() {
 function feed() {
   const ws = new WebSocket(url, opts);
   const watcher = watch ? startWatcher() : null;
-  const guides = { closer: 0, arc: 0, dwell: 0, none: 0 };
   const quality = {};
   let withJitter = 0;
   let roomPoses = 0;
   let sent = 0;
   let carried = 0;
-  let lastGuide = null;
-  let lastSummary = null;
 
   ws.on('message', (buf) => {
     let msg;
@@ -114,9 +101,6 @@ function feed() {
       roomPoses++;
       quality[msg.quality ?? 'none'] = (quality[msg.quality ?? 'none'] ?? 0) + 1;
       if (msg.jitter) withJitter++;
-      lastSummary = msg.landmarks;
-      guides[msg.guide ? msg.guide.mode : 'none']++;
-      if (msg.guide) lastGuide = msg.guide;
     } else if (msg.type === 'client-id') {
       console.log(`connected as client ${msg.clientId} (device ${deviceId})`);
     }
@@ -174,33 +158,25 @@ function feed() {
       ws.send(JSON.stringify({ ...msg, type: entry.kind, t: Date.now() }));
       sent++;
       if (sent % 200 === 0) {
-        console.log(`  ${sent} report(s) sent · `
-          + `${lastSummary ? `${lastSummary.landmarks} landmark(s), arc ${lastSummary.arc}°` : 'no summary yet'}`
-          + (lastGuide ? ` · guide ${lastGuide.mode} (${lastGuide.n} corners at ${lastGuide.dist} m)` : ''));
+        console.log(`  ${sent} report(s) sent`);
       }
     }
 
-    // The landmark push is debounced by a second; the last one has to be
-    // allowed to land or this reports the state from before the final reports.
+    // The walls push is debounced by a second; the last one has to be allowed
+    // to land or this reports the state from before the final reports.
     await new Promise((r) => setTimeout(r, 1500));
     console.log(`\nsent ${sent} detection report(s)`
       + (carried ? ` + ${carried} carry report(s)` : ''));
-    // The jitter share is the number this tool exists to watch now: the survey
+    // The jitter share is the number this tool exists to watch: the survey
     // needs 8 samples in 1500 ms, and a client reporting below 5.3/s never has
-    // one — which is what shut the landmark gate.
+    // one.
     console.log(`room-pose back: ${roomPoses}, with a jitter measurement `
       + `${withJitter} (${roomPoses ? Math.round(100 * withJitter / roomPoses) : 0}%)`);
     console.log(`quality: ${Object.entries(quality)
       .map(([k, v]) => `${k} ${v}`).join(', ') || 'none'}`);
-    console.log(`server said: ${lastSummary
-      ? `${lastSummary.landmarks} landmark(s) from ${lastSummary.candidates} live candidate(s), `
-        + `best arc ${lastSummary.arc}°`
-      : 'nothing — no room-pose ever came back'}`);
-    console.log(`guidance: closer ${guides.closer}, arc ${guides.arc}, `
-      + `dwell ${guides.dwell}, silent ${guides.none}`);
     if (watcher) {
-      console.log(`viewer received: ${watcher.seen.landmarks} landmark push(es), `
-        + `${watcher.seen.markerMap} marker map(s), ${watcher.seen.floor} floor(s)`);
+      console.log(`viewer received: ${watcher.seen.markerMap} marker map(s), `
+        + `${watcher.seen.floor} floor(s)`);
     }
     ws.close();
     watcher?.ws.close();

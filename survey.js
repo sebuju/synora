@@ -2527,7 +2527,7 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
       // and every permanence decision see; `roomPose` is the same thing through
       // the eased alignment and is only ever reported. See reportedT.
       // rawRoom is where the camera was when the tags were seen — the pose the
-      // survey, the walls grid and the landmark map are entitled to. roomPose is
+      // survey and the walls grid are entitled to. roomPose is
       // where it is *now*, which is the only honest thing to draw.
       const rawRoom = A ? se3Compose(A.T, xrT) : null;
       const roomPose = A
@@ -2601,12 +2601,9 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
       // and quality alone cannot stand in for it: 'good' is reported while an
       // unresolved alignment is still being tested.
       const mapSafe = !!extPose;
-      // The quarantine on its own, distinct from mapSafe: on a tag-less
-      // 'tracked' frame mapSafe:false conflates "alignment stale" — which an
-      // agreeing landmark solve may rescue — with "the room frame itself is in
-      // doubt", which no number of landmarks can fix (they were founded against
-      // this very frame and would confirm its flip). The rescue in server.js
-      // needs the two told apart, and a replay needs it journalled.
+      // The quarantine on its own, distinct from mapSafe: it separates
+      // "alignment stale" from "the room frame itself is in doubt". Journalled
+      // so a replay can tell the two apart.
       const quarantined = founding || !!(A && A.unresolved) || slipping;
       if (!A) return { pose: null, quality: 'unaligned', mapChanged, mapSafe, quarantined };
       if (slipping) {
@@ -2627,8 +2624,8 @@ function createSurvey({ file, markerSizeM, log, onRefine = null, opts = {} }) {
       return {
         pose: roomPose,
         // The same fix without the display easing. Anything building state that
-        // outlives the frame takes this one — the landmark map and the walls
-        // grid both do — for the reason the tag-only path keeps its raw fix out
+        // outlives the frame takes this one — the walls grid does — for the
+        // reason the tag-only path keeps its raw fix out
         // of the filter: evidence smoothed by a filter agrees with the filter.
         // Only what a person looks at gets the eased pose.
         rawPose: rawRoom,

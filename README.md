@@ -16,7 +16,6 @@ No build step, no app install: vanilla JS served as static files. A client is an
 - [Tag detection](#tag-detection)
 - [Survey and localization](#survey-and-localization)
 - [Walls and free space](#walls-and-free-space)
-- [Landmarks](#landmarks)
 - [Room views](#room-views)
 - [Devices and calibration](#devices-and-calibration)
 - [Server settings](#server-settings)
@@ -65,14 +64,12 @@ flowchart LR
     D["detect-worker.js — ArUco detect + per-tag PnP"]
     S["survey.js — marker map, joint PnP, pose filter"]
     W["walls.js — free-space carve, wall inference"]
-    L["landmarks.js — triangulated feature anchors"]
     V["room views — dashboard + phone map"]
 
     X --> D
     C --> D
     D --> S
     S --> W
-    S --> L
     S --> V
     W --> V
 ```
@@ -150,23 +147,7 @@ The grid persists to `walls.json` (refused on a marker-size or cell-size mismatc
 
 **Depth-based room mapping was removed** (a monocular depth model, voxel occupancy, `/depth-calibrate`). At the depth error available, walls landed metres out and no filtering fixed it. This feature replaces it from a different source — tag-localized poses — and **walls still take no depth evidence at all**.
 
-The ban that removal left behind asked for a measurement, and `replay-depth.js` is it: every detected tag carries both a depth sample and the distance the tag solver already knows for that same pixel, so the error distribution can be read straight off the recorded journals. Measured over 4534 sampled sightings, ARCore's depth is good to a median 60-74 mm out to 3 m — about one grid cell — and to 0.9-1.7 m beyond that, reproducing the old failure on a new source. So depth is readmitted only where the near half of that holds and something else can cross-check it: as a scale-calibrated prior for founding landmarks, described below. It never places a surface.
-
-## Landmarks
-
-`landmarks.js`. Natural image features, tracked by optical flow on the client and triangulated from tag-derived camera poses, so a client stays localized briefly after walking out of tag view.
-
-The scope is narrower than it looks, and deliberately so. **Within one tracking session only** — correspondence comes from optical flow, which is free and reliable while a feature stays in frame and means nothing once it does not; re-identifying an anchor in a *later* session was measured and failed outright (0 usable fixes, ORB matching a median of 4 descriptors with all 12 map anchors geometrically in shot). Nothing is written to disk. **Not a replacement for tags** — an anchor can only be created where a tag supplied the pose, and information flows tags → landmarks, one way.
-
-The fix does not degrade gracefully, which is the number that matters:
-
-| anchors | median position error | median orientation error |
-|---|---|---|
-| 4–5 | 1781 mm | 56.63° |
-| 15–24 | 17 mm | 0.34° |
-| 25+ | 36 mm | 0.82° |
-
-Landmarks are bearing-only points and tend to be near-coplanar, which is the weak PnP configuration, and a point carries no orientation so nothing analogous to per-tag mirror resolution exists. Below 15 anchors the honest output is nothing at all: a missing pose falls back on prediction and is recoverable, a confidently wrong one poisons everything downstream.
+The ban that removal left behind asked for a measurement, and `replay-depth.js` is it: every detected tag carries both a depth sample and the distance the tag solver already knows for that same pixel, so the error distribution can be read straight off the recorded journals. Measured over 4534 sampled sightings, ARCore's depth is good to a median 60-74 mm out to 3 m — about one grid cell — and to 0.9-1.7 m beyond that, reproducing the old failure on a new source. The one consumer that ever read it — a founding prior for the landmark feature — went with that feature when it was removed, so nothing in the product reads depth today. The phone still journals the samples, so the measurement stays available to whatever asks next. It never places a surface.
 
 ## Room views
 
@@ -194,9 +175,8 @@ The knobs that belong to the *room* rather than to a device, in the dashboard dr
 
 | Setting | Default | What it does |
 | --- | --- | --- |
-| Tag size | 150 mm | Printed tag edge, the room's only metric datum. **Clears the survey, the carve and the landmarks** — every tag position was measured at the old scale. |
+| Tag size | 150 mm | Printed tag edge, the room's only metric datum. **Clears the survey and the carve** — every tag position was measured at the old scale. |
 | Detection interval | 100 ms | How often a client attempts a tag detection. Pushed to every connected client at once. |
-| Landmarks | on | Server-side master switch for the feature. Off, it forgets the anchors it had; the phone has its own toggle for the tracker's per-frame cost. |
 | Wall carving | on | Whether accepted pose reports carve free space. Off, the grid stops growing but is kept — the wipe that throws it away is its own control. |
 | Pose journal | on | Whether observations are recorded to `recordings/*.pose.jsonl`. This is what the replay harnesses re-run, so it is on by default. |
 
@@ -289,7 +269,7 @@ Positioning tuning is measured against recorded journals, not argued. Each harne
 replay-survey.js     marker map + pose: map error, joint-PnP coverage, jumps
 replay-walls.js      carve + walls: leak count, extent audit, sight crossings
 replay-tagbias.js    per-tag mirror-branch and orientation statistics
-replay-landmarks.js  anchor count vs fix error
+replay-depth.js      ARCore depth against the tag solver's own distance
 ```
 
 Compare replays only against a *fixed* `markers.json` — the live server rewrites it mid-session, and a moved map silently invalidates a "before" number.
@@ -300,7 +280,6 @@ Compare replays only against a *fixed* `markers.json` — the live server rewrit
 server.js              HTTPS + WS: signaling relay, recording sink, vcam
 survey.js              marker map, joint PnP, localization, pose filter
 walls.js               free-space carve, wall inference, negative evidence
-landmarks.js           in-session feature anchors
 devices.js             device registry: settings, calibration, fingerprints
 settings.js            persisted server settings: schema, store, validation
 replay-*.js            offline measurement harnesses
@@ -312,7 +291,6 @@ public/
   detect-worker.js     worker thread: camera frames in, tag poses out
   detect-core.js       detector objects, scan strategy, PnP, mirror branch
   pose-math.js         quaternion / SE(3) helpers, solvePose (shared with server)
-  landmark-math.js     track qualification + clustering (shared with server)
   cv-common.js         opencv loading, intrinsics store, detector + luma factories
   common.js            signaling socket, liveness, clock sync, screen blank,
                        device identity + fingerprint + picker, room palette
@@ -326,7 +304,6 @@ public/
   markers.js/.html     printable tag sheet
   digital.js/.html     exact-size on-screen tag
   xr-probe.js/.html    WebXR capability + drift measurement
-  probe.js/.html       offline landmark feasibility probe
   viewer.html · index.html · style.css
 certs/                 self-signed cert, generated on first run   (gitignored)
 recordings/            video + pose journals                      (gitignored)
