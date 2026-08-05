@@ -28,14 +28,6 @@ let rgbaSource = null;
 // frame that turns out to be anything else goes through a canvas from then on.
 let planeReadable = true;
 
-// Feature tracking for landmarks. Built on the first frame that wants it.
-// `trackFeatures` is not a setting — it is a latch that trackFrame drops if the
-// tracker ever throws, so a broken tracker stops costing anything without
-// taking tag detection down with it.
-let tracker = null;
-let trackerKind = '';
-let trackFeatures = true;
-
 let mainTimeOrigin = 0;
 let poseRateMs = 100;
 let enabled = true;
@@ -97,8 +89,6 @@ async function onFrame(frame) {
   const result = await core.detect(source, frame, fw, fh, now);
   if (!result) return;
 
-  const tracked = await trackFrame('frame', frame, result.boxes);
-
   postMessage({
     type: 'pose',
     at,
@@ -114,76 +104,11 @@ async function onFrame(frame) {
     idle: result.idle,
     scanned: result.scanned,
     timing: result.timing,
-    points: wirePoints(tracked),
-    // Track ids only mean anything within one generation — see the tracker.
-    gen: tracked?.gen,
-    trackMs: tracked?.ms,
-    churn: tracked?.churn,
     // The interval this detection was gated on, for the page's cost meter —
     // detect-core.js is not loaded on the page on this path, so it cannot
     // recompute idle backoff itself.
     targetMs,
   });
-}
-
-// Feature tracking, for whichever way frames arrive. Both capture pages want
-// the same thing out of it, so neither gets its own copy — the only difference
-// is how a frame becomes pixels, and that is the luma source.
-//
-// The tracker cannot share the detector's source: on an ROI scan the detector's
-// Mat is a crop of the frame, and following points between crops of different
-// regions is meaningless. Its own source at TRACK_WIDTH is also what keeps this
-// cheap.
-//
-// Wrapped because it must never be able to cost a pose report: a tracker that
-// throws loses landmarks, not tags, and it does not get a second chance.
-async function trackFrame(kind, frame, boxes, view) {
-  if (!trackFeatures || !core.ready) return null;
-  try {
-    if (!tracker || trackerKind !== kind) {
-      tracker?.dispose();
-      trackerKind = kind;
-      // On the XR path the tracker shares the detector's source. That source
-      // keeps its fill keyed on the pixel buffer and its grays per size, so the
-      // second call in a frame skips the 6.6 MB copy and the flip entirely and
-      // neither consumer reallocates — measured, doing that work twice was most
-      // of a 117 ms median tracker cost, and the cost was what let the camera
-      // move far enough between frames to break the tracking it was paying for.
-      //
-      // The canvas path keeps its own: there the "copy" is a GPU blit that
-      // already downscales, so there is nothing to share and a shared one would
-      // only fight over the canvas size.
-      tracker = createFeatureTracker(core.cv, kind === 'rgba'
-        ? trackerViewOf(rgbaSource)
-        : createCanvasLumaSource(core.cv, { maxWidth: TRACK_WIDTH }));
-    }
-    return await tracker.track(frame, boxes ?? [], view ?? null);
-  } catch (err) {
-    trackFeatures = false;
-    tracker?.dispose();
-    tracker = null;
-    // With the reason. There are no devtools on a phone, and "landmarks stopped"
-    // without a message is a whole session spent guessing which of several
-    // things went wrong — as one already was.
-    postMessage({ type: 'track-failed', message: err?.message || String(err) });
-    return null;
-  }
-}
-
-// The tracker's view of a shared luma source: the same pixels, asked for at the
-// tracking width. Only the size differs, so only the size is overridden.
-function trackerViewOf(shared) {
-  return { luma: (image, rect) => shared.luma(image, rect, { maxWidth: TRACK_WIDTH }) };
-}
-
-// Rounded as tag corners are: the sub-centipixel digits are noise, and there
-// are two orders of magnitude more of these numbers than of those.
-function wirePoints(tracked) {
-  return tracked?.points.map((p) => ({
-    id: p.id,
-    u: Math.round(p.u * 100) / 100,
-    v: Math.round(p.v * 100) / 100,
-  }));
 }
 
 // The XR client's frames arrive one at a time, already paced by the page (it
@@ -199,10 +124,6 @@ async function onRgbaFrame(msg) {
   const { w, h } = msg;
   if (msg.intr) core.setIntrinsics(w, h, msg.intr);
   if (!core.hasIntrinsics(w, h)) return done();
-  // A new XR session is a new picture, and the page is the only side that knows
-  // one started. An id carried across it would fuse two different physical
-  // features into one landmark, which is worse than losing both.
-  if (msg.reset) tracker?.reset();
   try {
     const image = { data: new Uint8Array(buf), w, h, flipY: !!msg.flipY };
     const result = await core.detect(rgbaSource, image, w, h, performance.now());
@@ -213,19 +134,6 @@ async function onRgbaFrame(msg) {
       reply.grab = result.grab;
       reply.detect = result.detect;
       reply.solve = result.solve;
-      // ARCore's orientation for this frame, when the page had one: the flow is
-      // seeded from the rotation between frames rather than from "it did not
-      // move", which is where a walking phone loses most of its tracks.
-      // `track: false` is the page's landmark toggle — the tracker is the
-      // expensive half of this frame, and off means genuinely not run, not
-      // run-and-discarded. Tags are unaffected.
-      const tracked = msg.track === false ? null
-        : await trackFrame('rgba', image, result.boxes,
-          msg.view ? { q: msg.view.q, K: msg.intr } : null);
-      reply.points = wirePoints(tracked);
-      reply.gen = tracked?.gen;
-      reply.trackMs = tracked?.ms;
-      reply.churn = tracked?.churn;
     }
   } catch (err) {
     reply.error = err.message;
@@ -284,11 +192,9 @@ onmessage = async (ev) => {
   } else if (msg.type === 'xr-frame') {
     await onRgbaFrame(msg);
   } else if (msg.type === 'track') {
-    // A new track is a new picture: the crop from the old one means nothing,
-    // and neither does any point being followed through it.
+    // A new track is a new picture: the crop from the old one means nothing.
     generation++;
     core.resetScan();
-    tracker?.reset();
     intrinsicsAsked = '';
     consume(msg.readable, generation);
   } else if (msg.type === 'intrinsics') {
@@ -301,24 +207,16 @@ onmessage = async (ev) => {
     intrinsicsAsked = '';
     core.clearIntrinsics();
     core.resetScan();
-    tracker?.reset();
   } else if (msg.type === 'config') {
     if (msg.poseRateMs) poseRateMs = msg.poseRateMs;
     if (msg.markerSizeM) core.setMarkerSize(msg.markerSizeM);
   } else if (msg.type === 'enabled') {
     enabled = msg.on;
-    if (msg.on) {
-      core.resetScan();
-      tracker?.reset();
-    }
+    if (msg.on) core.resetScan();
   } else if (msg.type === 'paused') {
     // A paused client has its tracks disabled, so the frames still arriving are
-    // black — detecting on them is pure waste, and following a point into a
-    // black frame is worse than waste.
+    // black — detecting on them is pure waste.
     paused = msg.paused;
-    if (!msg.paused) {
-      core.resetScan();
-      tracker?.reset();
-    }
+    if (!msg.paused) core.resetScan();
   }
 };

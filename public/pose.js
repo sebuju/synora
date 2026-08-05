@@ -67,7 +67,6 @@ const posePipeline = (() => {
   let core = null;
   let coreStarting = null;
   let canvasSource = null;
-  let tracker = null;
   let armed = false;
   let busy = false;
   let lastDetect = 0;
@@ -117,12 +116,9 @@ const posePipeline = (() => {
       from: res.from,
       unc: clockSync.synced ? Math.round(clockSync.uncertaintyMs * 10) / 10 : null,
       tags: res.tags,
-      points: res.points,
-      gen: res.gen,
       // The camera model. Tag poses are solved on this side, but the server
-      // needs one too — to turn a landmark pixel into a bearing, and for the
-      // survey's joint multi-tag PnP — and it has no access to this client's
-      // stored calibration.
+      // needs one too — for the survey's joint multi-tag PnP — and it has no
+      // access to this client's stored calibration.
       //
       // Sent on every message, unconditionally. Tracking when it changed would
       // be false economy at six numbers, a mid-session resolution switch is
@@ -165,11 +161,6 @@ const posePipeline = (() => {
       `(grab ${Math.round(t.grab)} · find ${Math.round(t.detect)} · pnp ${Math.round(t.solve)})` +
       (worker ? '' : ' · on-page'),
     ];
-    // Feature tracking is new per-cycle cost on the one path this project
-    // deliberately spends CPU on, so it is as visible as the rest of it.
-    if (res.points) {
-      lines.push(`track ${res.points.length} pts · ${Math.round(res.trackMs ?? 0)} ms`);
-    }
     lines.push(roomPose?.pose
       ? `room: ${roomPose.pose.p.map((v) => v.toFixed(2)).join(', ')} · ${roomPose.quality}`
       : 'room: unlocalized');
@@ -199,10 +190,6 @@ const posePipeline = (() => {
       worker?.postMessage({
         type: 'intrinsics', w: msg.w, h: msg.h, intr: intrinsicsAt(msg.w, msg.h),
       });
-    } else if (msg.type === 'track-failed') {
-      // Landmarks are gone for this session; detection is not, so the worker
-      // stays exactly where it is.
-      setStatus('feature tracking failed; landmarks off');
     } else if (msg.type === 'fatal') {
       failWorker();
     }
@@ -267,10 +254,6 @@ const posePipeline = (() => {
       core ??= createDetectCore();
       await core.ensureReady();
       canvasSource ??= createCanvasLumaSource(core.cv);
-      // The tracker's own source, at its own width — see createFeatureTracker
-      // for why it cannot share the detector's.
-      tracker ??= createFeatureTracker(core.cv,
-        createCanvasLumaSource(core.cv, { maxWidth: TRACK_WIDTH }));
       core.setMarkerSize(config.markerSizeM);
     })().finally(() => {
       coreStarting = null;
@@ -285,31 +268,7 @@ const posePipeline = (() => {
     if (!core.hasIntrinsics(w, h)) core.setIntrinsics(w, h, intrinsicsAt(w, h));
     const res = await core.detect(canvasSource, video, w, h, now);
     if (!res) return;
-    // The same tracking the worker does, so the two paths cannot silently
-    // differ in what they collect — and the same containment: a tracker that
-    // throws costs landmarks, never the pose report.
-    let tracked = null;
-    if (tracker) {
-      try {
-        tracked = await tracker.track(video, res.boxes);
-      } catch {
-        tracker.dispose();
-        tracker = null;
-        setStatus('feature tracking failed; landmarks off');
-      }
-    }
-    publishPose({
-      ...res,
-      at: now,
-      points: tracked?.points.map((p) => ({
-        id: p.id,
-        u: Math.round(p.u * 100) / 100,
-        v: Math.round(p.v * 100) / 100,
-      })),
-      gen: tracked?.gen,
-      trackMs: tracked?.ms,
-      targetMs,
-    });
+    publishPose({ ...res, at: now, targetMs });
   }
 
   function armLoop() {
@@ -380,12 +339,8 @@ const posePipeline = (() => {
     get enabled() {
       return enabled;
     },
-    // A paused client has its tracks disabled, so every frame is black — and a
-    // point followed into a black frame and out the other side is a point that
-    // has silently changed what it means.
     setPaused(on) {
       paused = on;
-      if (!on) tracker?.reset();
       worker?.postMessage({ type: 'paused', paused: on });
     },
     // Called after startCamera(): new track, maybe new lens or resolution.
@@ -395,10 +350,6 @@ const posePipeline = (() => {
       intr = null;
       core?.clearIntrinsics();
       core?.resetScan();
-      // New lens or new size: every point in flight describes a picture that no
-      // longer exists, and an id carried across that would fuse two different
-      // physical features into one landmark.
-      tracker?.reset();
       worker?.postMessage({ type: 'reset-intrinsics' });
       if (!enabled) return;
       if (worker) feedWorker();

@@ -27,7 +27,6 @@ const overlayText = document.getElementById('overlayText');
 const overlayTextBody = document.getElementById('overlayTextBody');
 const btnToast = document.getElementById('btnToast');
 const blankBtn = document.getElementById('blankBtn');
-const lmBtn = document.getElementById('lmBtn');
 const streamBtn = document.getElementById('streamBtn');
 const mapCanvas = document.getElementById('mapCanvas');
 const camCanvas = document.getElementById('camCanvas');
@@ -56,22 +55,19 @@ window.addEventListener('error', (ev) => {
 let poseRateMs = 100;
 // How often this client reports where it is, which is no longer the same thing.
 //
-// Detection costs 300 ms a frame on this phone (tag scan plus feature tracking),
-// so tying the report to it dropped the report rate to 3/s — measured, against
-// 6.4/s before feature tracking existed. Two things broke that nobody connected
-// to it at the time:
+// Tag detection costs a frame far more than a report does, so tying the report
+// to it dropped the report rate to 3/s — measured. Two things broke that nobody
+// connected to it at the time:
 //
 //   - The room views ease toward the last reported pose, so at 3/s the client's
 //     dot moves in visible steps. The animation was never the problem; its input
 //     was.
 //   - `trackJitter` needs 8 samples inside a 1500 ms window — 5.3/s — so the
-//     steadiness measurement simply stopped existing (93% of good frames carried
-//     one at 6.4/s, 5% at 3/s). That is what shut the landmark gate for three
-//     whole sessions (see the note on landmarkGate).
+//     steadiness measurement simply stopped existing.
 //
 // ARCore has a pose every single frame, and the *carry* report costs nothing to
-// produce: no camera read, no scan, no tracking. So the report runs on its own
-// clock and detection results ride on whichever report they are ready for.
+// produce: no camera read, no scan. So the report runs on its own clock and
+// detection results ride on whichever report they are ready for.
 const CARRY_INTERVAL_MS = 100;
 
 let session = null;
@@ -90,9 +86,6 @@ let core = null;
 // The server's declared printed marker size, held until the detector exists.
 let markerSizeM = 0.15;
 let lumaSource = null;
-// Landmark feature tracking on the on-page fallback only; on the worker path
-// the tracker lives over there with the detector.
-let pageTracker = null;
 let readCanvas = null;
 let readCtx = null;
 let pixels = null;
@@ -111,17 +104,6 @@ let lastIntr = null;
 // where it was.
 let lastXrNow = null;
 let lastTags = [];
-let lastTrack = null;
-// Set when the worker reports the tracker shut itself off. Sticky for the
-// session: it does not get a second chance, so neither should the message.
-let trackFailed = null;
-// The landmarking feature as a whole, user-switchable. Off is the state that
-// matters: the feature tracker costs 178-206 ms a frame on this page, and it
-// is the single biggest thing between a 10 Hz detection request and the ~4/s
-// actually delivered. Off, no points ride the reports and the server's
-// maintainLandmarks is a structural no-op for this client. Session-scoped on
-// purpose — the XR page never persists settings to the device registry.
-let landmarksOn = true;
 // Video out, off by default — see setStreaming. `streamOn` is what was asked
 // for and outlives a session; the rest exists only while frames are flowing.
 let streamOn = false;
@@ -130,7 +112,7 @@ let camTrack = null;
 let mediaW = 0;
 let mediaH = 0;
 let mediaStarted = false;
-// Sticky for the session, like trackFailed: a browser that cannot drive a
+// Sticky for the session: a browser that cannot drive a
 // canvas stream frame by frame does not get a second chance, and silence would
 // look exactly like a feature nobody switched on.
 let streamFailed = null;
@@ -195,14 +177,6 @@ const signaling = connectSignaling('client', {
     if (msg.type === 'room-pose') {
       roomPose = msg;
       if (msg.pose) lastFix = msg.pose;
-      // Where to walk next, drawn on the map this page is already carrying
-      // around the room. Null clears it — "nothing worth saying" is the common
-      // answer and must not leave the last instruction standing.
-      mapView.setGuide(msg.guide || null);
-      // The walk coach. A sound and not a line, because this arrives while the
-      // phone is being carried at arm's length through a room and the overlay
-      // is five lines of diagnostics nobody reads mid-stride.
-      if (msg.cue) playCue(msg.cue);
       // Which of the dots on the map is this phone. Only the server knows — the
       // clientId is its own numbering — and the near fit has to be able to ask
       // what *this* client is looking at rather than guess from the geometry.
@@ -227,7 +201,6 @@ const signaling = connectSignaling('client', {
       else if (msg.action === 'map') setMapMode(msg.value);
       // Wanted state, never a toggle — the dashboard's view is up to a second
       // old, and a toggle raced against a stale view lands inverted.
-      else if (msg.action === 'landmarks') setLandmarks(!!msg.value);
       else if (msg.action === 'stream') setStreaming(!!msg.value);
       // Cut the current recording and open the next one, when there is one.
       else if (msg.action === 'record') { if (mediaStarted) tx.startRecorder(); }
@@ -304,84 +277,6 @@ const MAP_FRAME_MS = 16;
 const CHIP_INTERVAL_MS = 200;
 let chipAt = 0;
 
-// `track N pts` is this phone's own tracker; `landmarks`/`arc` are the server's
-// map, which arrives on room-pose. Either half can be missing — the tracker
-// before the first frame, the server state before the first report — and the
-// line says only what it actually knows.
-function landmarkLine() {
-  // Both of these used to be an empty string, which is the one thing this line
-  // must never be: a tracker that shut itself off and a tracker that was never
-  // asked to run look identical when the answer is silence.
-  if (trackFailed) return `landmarks OFF — ${trackFailed}\n`;
-  // Switched off by the user (or the dashboard) — distinct from failed, and
-  // said in the button's own words so the state has one name.
-  if (!landmarksOn) return 'landmarks off\n';
-  if (!lastTrack && !roomPose?.landmarks) return 'landmarks — no tracker output yet\n';
-  const lm = roomPose?.landmarks;
-  // Two lines, because this is a phone: what the tracker is doing, then what
-  // survived and what the room has made of it.
-  const c = lastTrack?.churn;
-  const first = [];
-  if (lastTrack) first.push(`track ${lastTrack.n}pts ${Math.round(lastTrack.ms)}ms`);
-  // Churn, when there is any: how many of the previous set survived this frame
-  // and how far they moved. A track has to live a second or two to be worth
-  // anything, and when it does not, this is the only thing on the phone that
-  // says so.
-  // `pred` beside `moved` is how the rotation seed is read: the two tracking
-  // close together says the flow was started next to the answer, a large `moved`
-  // against a near-zero `pred` says the camera orientation is not reaching the
-  // tracker at all — which is silent otherwise, since an unseeded flow is not an
-  // error, only a worse one.
-  if (c?.in) {
-    first.push(`kept ${c.kept}/${c.in} · moved ${c.moved}px`
-      + (c.pred == null ? '' : `/pred ${c.pred}`));
-  }
-
-  const second = [];
-  // Which stage is killing them — the flow giving up, points leaving frame, or
-  // the round-trip check. They call for opposite fixes, so the split matters
-  // more than the total.
-  if (c?.in) second.push(`drop lk${c.status} edge${c.edge} fb${c.fb}`);
-  if (lm) {
-    // solid = solve-grade (what a fix can actually use); the rest is the
-    // coarse consensus backlog still waiting to be looked at and refined.
-    second.push(lm.solid !== undefined && lm.solid !== lm.landmarks
-      ? `${lm.solid}✓ of ${lm.landmarks} landmarks`
-      : `${lm.landmarks} landmark${lm.landmarks === 1 ? '' : 's'}`);
-    // Against the threshold while it matters, on its own once it does not: a
-    // target already met is not information.
-    second.push(lm.landmarks ? `arc ${lm.arc}°` : `arc ${lm.arc}/${ROOM_LANDMARK_ARC_DEG}°`);
-    // The depth verdict: trusted means landmarks qualify from a glance and a
-    // step; off means the orbit rules are back in force. Warming is the first
-    // few tag sightings of a session.
-    const dp = lm.depth;
-    if (dp) {
-      second.push(!dp.n ? 'depth —'
-        : dp.residPct === null ? `depth warming ${dp.n}/10`
-          : dp.trusted ? `depth ±${dp.residPct}%`
-            : `depth OFF ±${dp.residPct}%`);
-    }
-  }
-  return [first.join(' · '), second.join(' · '), guideLine()]
-    .filter(Boolean).join('\n') + '\n';
-}
-
-// The instruction, in words, beside the same instruction drawn on the map. Both
-// because they answer different questions: the map says *where*, the line says
-// *what* and how far off it is — and the map is off in `off` mode, where this
-// line is the only thing left.
-//
-// Written as something to do, not as a state to interpret. "22/60°" is a
-// readout; "walk around it" is an instruction, and this page is read by someone
-// walking a room, usually at arm's length and moving.
-function guideLine() {
-  const g = roomPose?.guide;
-  if (!g) return '';
-  const what = `${g.n} corner${g.n === 1 ? '' : 's'} at ${g.dist} m`;
-  if (g.mode === 'closer') return `→ get closer: ${what}`;
-  if (g.mode === 'arc') return `→ walk around it: ${what}, ${g.need}° more`;
-  return `→ keep it in view: ${what}, ${g.span}° seen`;
-}
 
 function chipDue(now) {
   if (now - chipAt < CHIP_INTERVAL_MS) return false;
@@ -501,14 +396,6 @@ const mapRaf = (cb) => {
 const MAP_MAX_PX = 1.2e6;
 const mapView = createMap2dView(mapCanvas, 'top', { raf: mapRaf, maxPixels: MAP_MAX_PX });
 const roomFeed = createRoomFeed([mapView]);
-// Candidates stay off here (dashboard default): they were the phone's orbit
-// instruction back when founding needed the split-arc walk, and with trusted
-// depth that whole premise is gone — on this screen they were three hundred
-// rings of noise over the map being walked. Coarse consensus landmarks are
-// off for the same reason: a dot on the phone map means "a point that can
-// localize you", nothing weaker — the dashboard keeps the full picture.
-mapView.setLayer('coarse', false);
-
 // off -> the AR passthrough alone, as before; split -> map over the lower half;
 // full -> map over the passthrough entirely. One button cycles them.
 //
@@ -726,15 +613,6 @@ function setTransparent(on) {
   updateCamInset();
 }
 
-// The landmark toggle's one setter — the button and the dashboard control both
-// land here, so there is no second implementation to drift. Reported so the
-// roster shows the state and the (non-optimistic) dashboard button can follow.
-function setLandmarks(on) {
-  landmarksOn = on;
-  lmBtn.classList.toggle('active', on);
-  sendClientState();
-}
-
 // ---------------------------------------------------------------------------
 // Video out. The camera on this page is a GL texture the detector reads back
 // every detection frame; the stream is that same readback, flipped into the
@@ -829,7 +707,6 @@ function sendClientState() {
     // preference that outlives a session, and the server should not be sending
     // the room to a page with no overlay to draw it in.
     map: session ? mapMode : 'off',
-    landmarks: landmarksOn,
     // What was asked for, not whether frames are flowing — `session` already
     // says whether anything can be flowing at all.
     stream: streamOn,
@@ -957,50 +834,6 @@ function pixelsToCanvas(w, h) {
   return readCanvas;
 }
 
-// The walk coach's cues, as tones. A sound for the same reason `guideLine` is
-// words and not a number: what this page says has to be usable by someone
-// walking a room with the phone held out in front of them, and a glance is the
-// one thing they cannot spare. The server decides *when* (landmarks.walkCue);
-// this only decides what it sounds like.
-//
-//   solved — low   : a solve landed with the tags out of view. Turn around.
-//   banked — high  : the run back has converged. The event is measurable; go again.
-//   move   — two   : the run has the frames but not the motion. Keep walking.
-//
-// Pitch carries the meaning rather than rhythm, because the two states that
-// matter are opposites and a walker should not have to count anything.
-let audio = null;
-const CUES = {
-  solved: [[440, 0.12]],
-  banked: [[880, 0.12]],
-  move: [[660, 0.06], [660, 0.06]],
-  // Falling, and the only one that repeats: everything walked from here is
-  // void until AR is re-entered, so it has to be unmistakable and it has to
-  // keep saying so.
-  dead: [[330, 0.18], [220, 0.24]],
-};
-
-function playCue(cue) {
-  const notes = CUES[cue];
-  if (!audio || !notes) return;
-  let t = audio.currentTime;
-  for (const [hz, dur] of notes) {
-    const osc = audio.createOscillator();
-    const gain = audio.createGain();
-    osc.frequency.value = hz;
-    // Gating an oscillator on and off clicks at both ends, and a click is
-    // exactly what a room full of pose measurement does not need to be
-    // announced with. The ramp is what makes it a blip.
-    gain.gain.setValueAtTime(0, t);
-    gain.gain.linearRampToValueAtTime(0.3, t + 0.01);
-    gain.gain.linearRampToValueAtTime(0, t + dur);
-    osc.connect(gain).connect(audio.destination);
-    osc.start(t);
-    osc.stop(t + dur + 0.02);
-    t += dur + 0.05;
-  }
-}
-
 async function start() {
   const canvas = document.createElement('canvas');
   gl = canvas.getContext('webgl', { xrCompatible: true, alpha: true });
@@ -1030,15 +863,6 @@ async function start() {
   xrFeatures = session.enabledFeatures ? [...session.enabledFeatures] : null;
   console.log('XR session features:', xrFeatures ?? 'unreported');
   sessionId = crypto.randomUUID();
-  trackReset = true;
-  // Here and nowhere else: this function runs from the tap that opens the
-  // session, and an AudioContext created off a user gesture is born suspended
-  // — its first cue would be dropped without a sound and without an error.
-  try {
-    const Ctx = window.AudioContext || window.webkitAudioContext;
-    if (Ctx && !audio) audio = new Ctx();
-    audio?.resume?.();
-  } catch { audio = null; }
   await gl.makeXRCompatible();
   session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
   binding = new XRWebGLBinding(session, gl);
@@ -1072,11 +896,6 @@ async function start() {
     // The cost window belongs to the session that was measured; carried over,
     // the next session's first reports would describe the last one's.
     costMeter.reset();
-    // Nothing left to cue, and a live context holds the device's audio focus
-    // for as long as the page stays open. The next session opens its own from
-    // its own gesture.
-    audio?.close?.();
-    audio = null;
     // No more frames are coming, and a canvas track that stops being fed keeps
     // its last one — the dashboard would hold a tile that looks live for as
     // long as the page stayed open. `streamOn` survives: it is a standing
@@ -1182,8 +1001,6 @@ function onFrame(t, frame) {
 
   // Five short lines, in the order they are read while walking a room: where,
   // what the camera is, what it sees, where that puts you, how steady it is.
-  // Plus landmarks, which is the one line that is a *task* rather than a
-  // readout — see landmarkLine.
   // Every field here is one that cannot be read anywhere else on the phone —
   // the explanations that used to sit beside them are in this file's comments,
   // which is where a sentence belongs.
@@ -1206,16 +1023,6 @@ function onFrame(t, frame) {
       ? lastTags.map((x) => `${x.id}@${x.err.toFixed(1)}px/`
         + `${Math.hypot(x.tvec[0], x.tvec[1], x.tvec[2]).toFixed(1)}m`).join(' ')
       : 'none'}\n`
-    // Landmarks, both halves on one line: what this phone is tracking right now
-    // (its own cost, which nothing else can see) and what the server has made of
-    // it (the map, which this phone cannot see).
-    //
-    // The arc is the number worth walking to. Anchors qualify on how wide a
-    // viewing arc a feature has been seen through, which is the one thing the
-    // person holding the phone controls — so it is shown against the threshold
-    // it has to beat, and it is the difference between knowing to orbit a spot
-    // and concluding the feature is broken.
-    + landmarkLine()
     + (roomPose?.pose
       ? `room ${roomPose.pose.p.map((v) => v.toFixed(2)).join(' ')} · ${roomPose.quality}`
       : 'room —')
@@ -1258,10 +1065,6 @@ let detectWorker = null;
 let detectWorkerFailed = false;
 let detectSeq = 0;
 let detectPending = null;
-// Set when a session starts, cleared on the frame that carries it to the
-// worker: a new session is a new picture, and the tracker's ids have to stop
-// meaning what they meant in the last one.
-let trackReset = false;
 
 function failDetectWorker() {
   detectWorker?.terminate();
@@ -1284,12 +1087,6 @@ function ensureCore() {
     await core.ensureReady();
     core.setMarkerSize(markerSizeM);
     lumaSource = createCanvasLumaSource(core.cv);
-    // The tracker's own source, at its own width — see createFeatureTracker for
-    // why it cannot share the detector's. Built here so the fallback collects
-    // what the worker path collects; a landmark map that depended on which
-    // thread happened to be detecting would be untraceable.
-    pageTracker = createFeatureTracker(core.cv,
-      createCanvasLumaSource(core.cv, { maxWidth: TRACK_WIDTH }));
     return core;
   })().catch((err) => {
     setStatus(`detector failed: ${err.message}`);
@@ -1318,17 +1115,6 @@ function ensureDetectWorker() {
       failDetectWorker();
       return;
     }
-    if (msg.type === 'track-failed') {
-      // Landmarks are gone for this session; detection is not, so the worker
-      // stays exactly where it is. Recorded rather than only announced: the
-      // status line is behind the immersive session, so the one place this can
-      // actually be read is the overlay — and a tracker that shuts itself off
-      // used to show up as a line quietly missing, which is indistinguishable
-      // from a line that was never enabled.
-      trackFailed = msg.message || 'tracker error';
-      setStatus(`feature tracking failed; landmarks off (${trackFailed})`);
-      return;
-    }
     if (msg.type !== 'xr-result') return;
     // The buffer is the page's only one and it was transferred away; take it
     // back before anything can return early, or the next frame allocates six
@@ -1354,9 +1140,8 @@ function ensureDetectWorker() {
 // points it will be sampled for come back from the worker long after. Inert
 // bytes survive; ~38 KB at ARCore's usual 160x120, copied only while a
 // detection is being dispatched (~4/s). These numbers reach the journal (so
-// replay-depth.js can score them against the tags) and, through it, landmark
-// founding on the server — as a prior only, behind that session's own trust
-// gate. Nothing here decides anything; the page just samples.
+// replay-depth.js can score them against the tags). Nothing here decides
+// anything; the page just samples.
 function grabDepth(frame, view) {
   if (!frame.getDepthInformation) return null;
   let di;
@@ -1452,12 +1237,8 @@ async function detectAndReport(frame, view, pose, viewport) {
     meta.seq = ++detectSeq;
     worker.postMessage({
       type: 'xr-frame', seq: meta.seq, buf,
-      w: meta.w, h: meta.h, flipY: true, intr, view: camView, reset: trackReset,
-      // Off skips the feature tracker in the worker — the single most
-      // expensive thing this page pays for — while tag detection continues.
-      track: landmarksOn,
+      w: meta.w, h: meta.h, flipY: true, intr, view: camView,
     }, [buf]);
-    trackReset = false;
     // The caller's `busy` guard is what keeps one frame in flight at a time, and
     // it releases on this promise — so it has to outlive the post and resolve
     // when the worker answers, not when the message is sent.
@@ -1474,28 +1255,6 @@ async function detectAndReport(frame, view, pose, viewport) {
   const source = image ?? pixelsToCanvas(meta.w, meta.h);
   const res = await core.detect(lumaSource, source, meta.w, meta.h, performance.now());
   if (!res) return;
-  if (pageTracker && landmarksOn) {
-    if (trackReset) {
-      pageTracker.reset();
-      trackReset = false;
-    }
-    try {
-      const tracked = await pageTracker.track(image, res.boxes,
-        camView ? { q: camView.q, K: intr } : null);
-      res.points = tracked?.points.map((p) => ({
-        id: p.id,
-        u: Math.round(p.u * 100) / 100,
-        v: Math.round(p.v * 100) / 100,
-      }));
-      res.gen = tracked?.gen;
-      res.trackMs = tracked?.ms;
-    } catch {
-      // Landmarks are gone; tags are not.
-      pageTracker.dispose();
-      pageTracker = null;
-      setStatus('feature tracking failed; landmarks off');
-    }
-  }
   reportDetection(meta, res);
 }
 
@@ -1511,8 +1270,7 @@ async function detectAndReport(frame, view, pose, viewport) {
 // alone would not save it; the pair is what makes this safe.
 //
 // The rest of the pipeline needs no changes and gets none: the survey already
-// treats a tag-less `xr-pose` as ARCore carrying the fix (`quality: 'tracked'`),
-// and `maintainLandmarks` returns immediately on a report with no points.
+// treats a tag-less `xr-pose` as ARCore carrying the fix (`quality: 'tracked'`).
 
 function sendCarry(pose, now) {
   // Nothing has described this camera yet, so there is nothing to report it as.
@@ -1565,9 +1323,6 @@ function reportDetection(meta, res) {
   lastReport = performance.now();
   lastIntr = meta.intr;
   lastTags = res.tags || [];
-  lastTrack = res.points
-    ? { n: res.points.length, ms: res.trackMs ?? 0, churn: res.churn ?? null }
-    : null;
   const common = {
     t: meta.t,
     w: meta.w,
@@ -1581,14 +1336,6 @@ function reportDetection(meta, res) {
     // at nothing.
     mode: res.mode,
     scanned: res.scanned,
-    // Tracked features, when landmark collection is on. `intrinsics` above is
-    // already the camera model the server needs to turn one into a bearing, so
-    // unlike /client this path has nothing extra to send for it.
-    points: res.points,
-    gen: res.gen,
-    // Journalled with the report, so churn is measurable after the fact rather
-    // than only while someone is watching the phone.
-    churn: res.churn,
     // What the loop is costing, for the same reason and read the same way: the
     // only surface this page has is behind an immersive session, so a claim
     // about what a feature costs here has to come out of the journal rather
@@ -1658,8 +1405,6 @@ function wireIconBtn(btn, run, label) {
   };
 }
 wireIconBtn(blankBtn, () => blank.toggle(), () => `Blank ${onOff(blank.on)}`);
-wireIconBtn(lmBtn, () => setLandmarks(!landmarksOn), () => `Landmarks ${onOff(landmarksOn)}`);
-lmBtn.classList.add('active');
 wireIconBtn(streamBtn, () => setStreaming(!streamOn), () => `Stream ${onOff(streamOn)}`);
 wireIconBtn(mapBtn,
   () => setMapMode(MAP_MODES[(MAP_MODES.indexOf(mapMode) + 1) % MAP_MODES.length]),

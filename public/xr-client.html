@@ -153,7 +153,7 @@
        wrong. Upright they run along the bottom, clear of the gesture bar.
        Right-anchored, and the map-only controls sit at the left-hand end: they
        appear and disappear with the map, under the user's thumb, and from this
-       end they push nothing that was already there — Map, Landmarks, Stream and
+       end they push nothing that was already there — Map, Stream and
        Blank keep the exact spot they had before the map was turned on. Same rule
        as the column below, which anchors at its bottom for the same reason. */
     #overlayBtns {
@@ -202,7 +202,7 @@
          to its widest child, and every button then fills it. */
       flex-direction: column; justify-content: flex-end; align-items: stretch;
     }
-    /* Bottom up: Blank, Stream, Landmarks, Map, then the three the map brings
+    /* Bottom up: Blank, Stream, Map, then the three the map brings
        with it. The map-only buttons appear and disappear under the user's thumb,
        and anchored from the bottom of the column they push nothing that was
        already there — the four permanent ones keep the exact spot they had
@@ -211,7 +211,6 @@
     #overlay.rot90 #transparentBtn, #overlay.rot270 #transparentBtn { order: 2; }
     #overlay.rot90 #fitBtn, #overlay.rot270 #fitBtn { order: 3; }
     #overlay.rot90 #mapBtn, #overlay.rot270 #mapBtn { order: 4; }
-    #overlay.rot90 #lmBtn, #overlay.rot270 #lmBtn { order: 5; }
     #overlay.rot90 #streamBtn, #overlay.rot270 #streamBtn { order: 6; }
     #overlay.rot90 #blankBtn, #overlay.rot270 #blankBtn { order: 7; }
     #overlay.rot90 #reportBtn, #overlay.rot270 #reportBtn { order: 8; }
@@ -385,17 +384,6 @@
           </svg>
         </button>
         <!-- The feature cloud, as it is drawn: scattered points. -->
-        <button id="lmBtn" class="icon-btn" type="button"
-                title="Landmark tracking" aria-label="Landmark tracking">
-          <svg viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true">
-            <circle cx="6" cy="7" r="1.6"/>
-            <circle cx="12.5" cy="4.5" r="1.6"/>
-            <circle cx="18" cy="9" r="1.6"/>
-            <circle cx="8" cy="14" r="1.6"/>
-            <circle cx="15" cy="16.5" r="1.6"/>
-            <circle cx="5.5" cy="19.5" r="1.6"/>
-          </svg>
-        </button>
         <!-- The dashboard's own camera-composite glyph: same thing being
              switched, so the same picture of it. -->
         <button id="streamBtn" class="icon-btn" type="button"
