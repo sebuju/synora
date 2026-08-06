@@ -14,12 +14,11 @@ const {
 // the output only ever claims "attested free".
 //
 // The depth exclusion is measured, not inherited: past 3 m ARCore's depth is
-// 0.9-1.7 m out (.claude/rules/depth.md), which is the removed mapping
-// pipeline's failure on a newer source, and a wall is exactly the far-range
-// claim that error lands on. Landmark rays are the one route by which
-// anything depth-derived could reach this grid and they ship inert
-// (landmarkScale 0); even switched on they carve line of sight only and their
-// far end asserts nothing.
+// 0.9-1.7 m out, which is the removed mapping pipeline's failure on a newer
+// source, and a wall is exactly the far-range claim that error lands on.
+// Landmark rays are the one route by which anything depth-derived could reach
+// this grid and they ship inert (landmarkScale 0); even switched on they carve
+// line of sight only and their far end asserts nothing.
 //
 // The grid is as permanent as markers.json, so evidence is gated the way the
 // survey gates map growth, not the way the viewer gates display: a report must
@@ -277,14 +276,14 @@ const DEFAULTS = {
   // of L.
   //
   // Two independent sources feed it, both measured against the full 190-
-  // journal corpus before being tuned (.claude/rules/walls.md has the
-  // numbers): a free cell sitting behind a mapped tag's own plane, inside
-  // that tag's bracket, is wrong by construction unless the far side has
-  // its own evidence of being a real room; and a blocked-ray deposit earns
-  // retraction trust when the frame it came from could not have been
-  // motion-blurred — either because it decoded a *different* tag (proving
-  // the detector was working on that image) or because the camera was
-  // reported as stationary during it (proving nothing could have smeared).
+  // journal corpus before being tuned: a free cell sitting behind a mapped
+  // tag's own plane, inside that tag's bracket, is wrong by construction
+  // unless the far side has its own evidence of being a real room; and a
+  // blocked-ray deposit earns retraction trust when the frame it came from
+  // could not have been motion-blurred — either because it decoded a
+  // *different* tag (proving the detector was working on that image) or
+  // because the camera was reported as stationary during it (proving nothing
+  // could have smeared).
   // Either alone leaves too small a population to matter; the union does
   // not.
   //
@@ -1095,10 +1094,10 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
     // decoding a *different* tag proves the detector was working on this
     // image regardless of motion, or the camera being near-stationary proves
     // nothing could have smeared regardless of tag count. Neither alone
-    // covers enough of the corpus to matter (measured, .claude/rules/
-    // walls.md); the union does. Ordinary blocked-ray evidence (Ln, the
-    // deduced-class feed below) needs neither — it only ever adds a read-time
-    // display hint, never moves a cell's state.
+    // covers enough of the corpus to matter (measured); the union does.
+    // Ordinary blocked-ray evidence (Ln, the deduced-class feed below) needs
+    // neither — it only ever adds a read-time display hint, never moves a
+    // cell's state.
     const retractTrust = !zeroTag || (velMps !== null && velMps <= C.motionMaxMps);
     // A cell that took positive evidence *before* this pass ran must not take
     // a retraction-trust deposit either, same contradiction rule bumpNeg
