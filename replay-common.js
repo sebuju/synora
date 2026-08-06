@@ -58,18 +58,16 @@ function numFlag(flags, key, dflt, usage) {
 // swallowed — walls has to refuse a marker size that does not match its map,
 // while other callers have nothing to check.
 // Journals live one per walk inside a session directory, so a path that is a
-// directory is walked rather than refused. That keeps `node replay-x.js
-// recordings` working as the whole-corpus command it always was, now that
-// `recordings/*.pose.jsonl` matches nothing — and a directory of directories is
-// the shape every one of these tools is handed.
+// directory is walked rather than refused. That is what makes `node replay-x.js
+// recordings` the whole-corpus command, and a directory of directories is the
+// shape every one of these tools is handed.
 //
 // One level of nesting is all the layout has, and all this looks for: a deeper
 // walk would start reading whatever else somebody put under `recordings/`.
-// The suffix carries no leading dot on purpose: inside a session directory the
-// journal is simply `pose.jsonl` (the directory already says whose walk it is),
-// while the pre-migration corpus spells it `<stamp>_client<N>.pose.jsonl`.
-// `endsWith('pose.jsonl')` is the one test that matches both, and getting this
-// wrong is silent — the tool reports zero reports and looks like an empty room.
+// The suffix is matched with `endsWith` and carries no leading dot because the
+// object-frame caller passes `obj.jsonl` against files named `frames.obj.jsonl`
+// — an exact match would find nothing there. Getting this wrong is silent: the
+// tool reports zero reports and looks like an empty room.
 function expandJournals(paths, suffix = 'pose.jsonl') {
   const out = [];
   for (const p of paths) {
