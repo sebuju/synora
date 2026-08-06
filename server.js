@@ -9,12 +9,26 @@ const { WebSocketServer } = require('ws');
 const qrcode = require('qrcode-terminal');
 const { createSurvey } = require('./survey.js');
 const { createWalls } = require('./walls.js');
-const { quatRotate, quatConj, snapQuarterTurn } = require('./public/pose-math.js');
+const { quatRotate, quatConj, snapQuarterTurn, sessionAlignment } = require('./public/pose-math.js');
 const { createDeviceRegistry, modelFromUa } = require('./devices.js');
 const { createSettings } = require('./settings.js');
-const { readFrameLogMeta } = require('./frame-log.js');
+const { openFrameLog, readFrameLogMeta } = require('./frame-log.js');
+const { decodeFrameRecord, depthAtPixel } = require('./public/frame-wire.js');
+const { createObjects } = require('./objects.js');
+const { createObjectHistory } = require('./object-history.js');
+const { writeFrameImages, writeBoxImage } = require('./frame-images.js');
+const { createObjectDetector, objectDetectorAvailable } = require('./object-detector.js');
+const { fitOutlines } = require('./outlines.js');
 
 const PORT = Number(process.env.PORT) || 8443;
+// How often the server pings each socket at the protocol level. One missed
+// round is a drop, so this is also the worst-case lag on noticing a client that
+// vanished without closing — a phone whose page was frozen or killed.
+const HEARTBEAT_MS = 10000;
+// Three of the client's own 5 s ping intervals. Anything less flags a phone
+// that merely had a slow moment; anything more and a frozen page sits in the
+// roster looking healthy for most of a minute.
+const APP_SILENCE_MS = 15000;
 // Where everything the server *writes* lives. Overridable because a second
 // instance — a replay feed, an experiment, a spare-port server — would
 // otherwise overwrite the marker map and the walls grid of the room the real
@@ -36,6 +50,10 @@ const VCAM_FPS = 30;
 const VENDOR_DIR = path.join(PUBLIC_DIR, 'vendor');
 const MARKER_MAP_FILE = path.join(STATE_DIR, 'markers.json');
 const WALLS_FILE = path.join(STATE_DIR, 'walls.json');
+const OBJECTS_FILE = path.join(STATE_DIR, 'objects.json');
+// Beside the object map rather than inside it, for the reason the tag history is
+// beside the marker map: it is a log *of* a map, not part of one.
+const OBJECT_HISTORY_FILE = path.join(STATE_DIR, 'objects-history.json');
 const DEVICES_FILE = path.join(STATE_DIR, 'devices.json');
 // Named for what it used to hold — the printed marker size, and nothing else.
 // Kept under the old name deliberately: it is where every existing install's
@@ -348,8 +366,22 @@ function serveStatic(req, res) {
         res.end('Not found');
         return;
       }
+      // A validator, because max-age on its own is a cliff: the day it expires
+      // the phone has no way to ask "still the same?" and re-pulls all ~10 MB —
+      // and the moment /xr-client asks for opencv.js is the moment an XR session
+      // is starting, which is the worst moment to spend that. With an ETag the
+      // expiry costs a 304. `immutable` is honest here: a vendored lib changes
+      // by being re-fetched into the directory, and then so does the tag.
+      const etag = `W/"${stat.size.toString(16)}-${stat.mtimeMs.toString(16)}"`;
+      headers['ETag'] = etag;
+      headers['Last-Modified'] = stat.mtime.toUTCString();
+      headers['Cache-Control'] = 'public, max-age=604800, immutable';
+      if (req.headers['if-none-match'] === etag) {
+        res.writeHead(304, headers);
+        res.end();
+        return;
+      }
       headers['Content-Length'] = stat.size;
-      headers['Cache-Control'] = 'public, max-age=86400';
       res.writeHead(200, headers);
       fs.createReadStream(filePath).pipe(res);
     });
@@ -384,6 +416,14 @@ const clients = new Map();
 // main socket is displaced can have its bulk socket retired with it — the bytes
 // are attributed to whichever main socket owns the id at the time they arrive.
 const bulkSockets = new Map();
+// The object-frame sockets per client id, held for the same reason as the bulk
+// sockets above and retired alongside them. A third socket rather than a second
+// meaning for binary on the bulk one: that socket's bytes are recorder chunks
+// unconditionally (see the binary handler), and a WebM stream makes no promise
+// about its first bytes, so a magic-prefix sniff would be guessing against a
+// file nobody wants corrupted. A socket whose role *is* the meaning of its
+// bytes is the shape this server already uses.
+const frameSockets = new Map();
 // Client ids are stable per device: a client persists a random id across
 // reloads and presents it on every connection, so a refresh keeps its slot on
 // the dashboard (and its recording filenames) instead of taking a new number.
@@ -468,6 +508,11 @@ function clientList() {
         ? { name: path.basename(ws.recordingPath), bytes: ws.recordingBytes }
         : null,
       vcam: id === vcamClientId,
+      // The object channel's counters. They live against the *frames* socket,
+      // which is a different socket from this one, so they are looked up by
+      // client id rather than read off `ws` — and they survive that socket
+      // reconnecting, which is what makes a ratio over a whole walk meaningful.
+      obj: objStats.get(id) || null,
     };
   });
 }
@@ -505,6 +550,24 @@ function sendWatchers(obj, { bulk = false } = {}) {
 function sendRoom(obj, opts) {
   send(viewerSocket, obj);
   sendWatchers(obj, opts);
+}
+
+// The object map, to everyone drawing one.
+//
+// Wider than `sendRoom` by exactly one case: a client showing the object
+// readout but not the room map. `/xr-client` has its own button for that
+// readout, and tying it to `watchingRoom` meant pressing it did nothing until
+// the map — an unrelated control, carrying the walls grid and the marker map
+// with it — was switched on too. This sends the one message that page asked
+// for, and none of the rest.
+function sendObjects(obj) {
+  send(viewerSocket, obj);
+  for (const ws of clients.values()) {
+    if (watchingRoom(ws)) {
+      if (ws.bufferedAmount > ROOM_BULK_BACKLOG) continue;
+    } else if (!ws.clientState?.objects) continue;
+    send(ws, obj);
+  }
 }
 
 // What a room view needs from a pose report: who, where, how good it is, and
@@ -548,17 +611,18 @@ function roomPoseMessage(clientId, msg, room) {
 }
 
 // One directory per client connection — one walk — holding everything that walk
-// produced: the recording and the pose journal.
+// produced: the recording, the pose journal, the object frames, and an `images`
+// subdirectory for the pictures.
 //
 // A walk is the unit every comparison in this project is actually about ("run
 // the replay over these journals, then over those"), and it used to be
-// reconstructed by eye from two filenames whose stamps differ by a second or
+// reconstructed by eye from four filenames whose stamps differ by a second or
 // two because they open at different moments. A directory says it instead.
 //
-// Keyed on the *main* socket: the bulk socket is a separate connection sharing
-// a client id, and its bytes belong to the walk that socket is having. A socket
-// that somehow arrives with no main socket falls back to a directory of its own
-// rather than dropping the walk.
+// Keyed on the *main* socket: the bulk and frames sockets are separate
+// connections that share a client id, and their bytes belong to the walk that
+// socket is having. A frames socket that somehow arrives with no main socket
+// falls back to a directory of its own rather than dropping the walk.
 function sessionDir(ws) {
   const main = ws.role === 'client' ? ws : clients.get(ws.clientId);
   const owner = main || ws;
@@ -574,7 +638,7 @@ function sessionDir(ws) {
 //
 // `seq` disambiguates the second and later files of a kind within one walk —
 // the recorder is rebuilt on a camera switch, a resolution change and a mic
-// toggle.
+// toggle, and the frame log reopens with the XR session.
 function sessionPath(ws, name, seq = 0) {
   const dir = sessionDir(ws);
   fs.mkdirSync(dir, { recursive: true });
@@ -961,6 +1025,204 @@ function journalPose(ws, entry) {
   ws.poseJournalLines++;
 }
 
+// Object frames: the same bargain as the pose journal, for the detector rather
+// than the survey. The bytes are kept so a different model or threshold is a
+// re-run over one walk instead of another walk, which is the only way a
+// detector this experiment does not yet trust can be swapped out cheaply.
+//
+// The log hangs off the *frames* socket, not the client's main one: it records
+// one XR session's pictures, and the frames socket is the thing that lives and
+// dies with that session's page.
+function closeFrameLog(ws) {
+  if (!ws.frameLog) return;
+  const { path: p, frames, bytes } = ws.frameLog;
+  ws.frameLog.close();
+  ws.frameLog = null;
+  log(`Object frames saved: ${path.relative(__dirname, p)} `
+    + `(${frames} frames, ${fmtBytes(bytes)}`
+    + `${ws.imagesWritten ? `, ${ws.imagesWritten} images` : ''})`);
+}
+
+// Image files for one frame, on setImmediate rather than inline: the overlay
+// costs a decode, a per-pixel blend and a re-encode — tens of milliseconds —
+// and the socket handler must not spend that before reading the next frame.
+// Dropped rather than queued when it cannot keep up, for the same reason the
+// detector drops: a queue here would only ever grow.
+function saveFrameImages(ws, record) {
+  const want = {
+    camera: settings.get('objSaveCamera'),
+    depth: settings.get('objDepthImages'),
+    overlay: settings.get('objSaveOverlay'),
+    quality: settings.get('objFrameQuality'),
+  };
+  if (!ws.imageDir || (!want.camera && !want.depth && !want.overlay)) return;
+  if (ws.imageBusy) return;
+  ws.imageBusy = true;
+  setImmediate(() => {
+    try {
+      if (!ws.imagesWritten) fs.mkdirSync(ws.imageDir, { recursive: true });
+      const wrote = writeFrameImages(ws.imageDir, record, want);
+      if (wrote.camera || wrote.depth || wrote.overlay) ws.imagesWritten++;
+    } catch (err) {
+      if (!ws.imageErrLogged) {
+        ws.imageErrLogged = true;
+        log(`Could not write frame images for client ${ws.clientId}: ${err.message}`);
+      }
+    } finally {
+      ws.imageBusy = false;
+    }
+  });
+}
+
+// The detector's own boxes drawn on the frame it looked at.
+//
+// Separate from `saveFrameImages` because it happens at a different moment: the
+// boxes do not exist when the frame arrives, they exist ~160 ms later when
+// inference returns. Deferred and guarded like that one, and for the same
+// reason — a decode, a draw and a re-encode inside the inference slot would cost
+// the channel frames rather than the PC idle time.
+function saveBoxImages(ws, record, dets) {
+  if (!settings.get('objSaveBoxes') || !ws.imageDir || !dets?.length) return;
+  if (ws.boxBusy) return;
+  ws.boxBusy = true;
+  setImmediate(() => {
+    try {
+      fs.mkdirSync(ws.imageDir, { recursive: true });
+      writeBoxImage(ws.imageDir, record, dets, { quality: settings.get('objFrameQuality') });
+    } catch (err) {
+      if (!ws.boxErrLogged) {
+        ws.boxErrLogged = true;
+        log(`Could not write detection overlay for client ${ws.clientId}: ${err.message}`);
+      }
+    } finally {
+      ws.boxBusy = false;
+    }
+  });
+}
+
+// One frame through the detector and into the object map.
+//
+// Deliberately fire-and-forget: the frame channel is not on the pose path and
+// nothing waits for this. A frame whose pose has already fallen out of the ring
+// is dropped rather than joined to a neighbouring one — a bearing attached to
+// the wrong camera position is not weak evidence, it is wrong evidence, and the
+// map has no way to tell afterwards.
+async function detectFrame(ws, record) {
+  const stat = objStat(ws.clientId);
+  stat.offered++;
+  if (objBusy.has(ws.clientId)) { stat.busy++; return; }
+  if (!objectDetector) {
+    const modelFile = settings.get('objDetectorModel');
+    if (!objectDetectorAvailable(modelFile)) return;
+    objectDetector = createObjectDetector({ modelFile, log });
+    // The allow-list follows the model that is actually loaded, not a default:
+    // the two vocabularies do not spell the same classes, and a list written
+    // against the wrong one maps nothing while looking like an empty room.
+    objectDetector.load()
+      .then(({ vocab }) => objects.setVocabulary(vocab))
+      .catch(() => {});
+  }
+  objBusy.add(ws.clientId);
+  const t0 = Date.now();
+  try {
+    // Decoded here only when the outline fitter needs the pixels, and then
+    // handed to the detector as pixels so the decode is paid for once —
+    // `detect()` takes either. With outlines off the buffer goes through
+    // untouched and this path costs exactly what it always did.
+    const wantOutlines = settings.get('objOutlines');
+    const img = wantOutlines
+      ? require('jpeg-js').decode(Buffer.from(record.jpeg), { useTArray: true })
+      : null;
+    const dets = await objectDetector.detect(img || Buffer.from(record.jpeg));
+    stat.inferred++;
+    stat.ms += Date.now() - t0;
+    if (img) {
+      const t1 = Date.now();
+      fitOutlines(img, dets, { outlineMinPx: settings.get('objOutlineMinPx') });
+      stat.outlineMs += Date.now() - t1;
+    }
+    saveBoxImages(ws, record, dets);
+    for (const d of dets) {
+      if (!record.depth) continue;
+      // Sampled at the box centre, through the same lookup the phone uses at
+      // tag centres. Interior to the object, which is the only place on a box
+      // where depth is not straddling the silhouette.
+      const z = depthAtPixel(record.depth,
+        (d.box[0] + d.box[2]) / 2, (d.box[1] + d.box[3]) / 2,
+        record.header.w, record.header.h);
+      if (z !== null) d.d = z;
+    }
+    const key = `${ws.frameSid}:${record.header.fseq}`;
+    const hit = posesByFseq.get(ws.clientId)?.get(key);
+    if (hit) {
+      stat.joined++;
+      applyDetections(hit, record, dets);
+      return;
+    }
+    // **The frame normally arrives before its own pose.** The phone ships the
+    // JPEG as soon as it has decimated it, then hands the same camera read to
+    // the tag detector and only reports the pose ~300 ms later when that
+    // returns — while inference here takes ~160 ms. So the join almost always
+    // fails on the first look, and dropping here meant nothing was ever mapped
+    // live even though the offline replay of the same walk mapped it fine.
+    //
+    // Parked instead, for the pose to collect. Still never joined to a
+    // *neighbouring* pose: a bearing attached to the wrong camera position is
+    // not weak evidence, it is wrong evidence, and nothing downstream could
+    // tell afterwards.
+    stat.parked++;
+    pendingDets.set(`${ws.clientId}:${key}`, {
+      dets, w: record.header.w, h: record.header.h, at: Date.now(),
+    });
+    while (pendingDets.size > PENDING_MAX) {
+      const oldest = pendingDets.keys().next().value;
+      pendingDets.delete(oldest);
+      // A parked detection whose pose never came is the one loss this path can
+      // suffer, so it is counted rather than left to be inferred from a gap
+      // between two other numbers.
+      objStat(Number(String(oldest).split(':')[0])).evicted++;
+    }
+  } catch (err) {
+    if (!ws.objErrLogged) {
+      ws.objErrLogged = true;
+      log(`Object detection failed for client ${ws.clientId}: ${err.message}`);
+    }
+  } finally {
+    objBusy.delete(ws.clientId);
+  }
+}
+
+function openFrameLog_(ws, sid, w, h) {
+  closeFrameLog(ws);
+  ws.frameSeq = (ws.frameSeq ?? -1) + 1;
+  const p = sessionPath(ws, 'frames.frames', ws.frameSeq);
+  // `sid` is the join key's other half: the frame header carries `fseq`, which
+  // is only unique within a session, and the pose message carries both. A log
+  // that could not say which session it recorded would be unjoinable.
+  // Held on the socket as well as in the file: the live join needs it on every
+  // frame, and re-reading the log to find out which session it is recording
+  // would be absurd.
+  ws.frameSid = sid ?? null;
+  // Re-armed with the log: a socket that opened one unnamed log and then got a
+  // proper frames-begin has stopped being the case that was warned about, and
+  // should be able to raise it again if it recurs.
+  ws.frameSidWarned = false;
+  // One `images` subdirectory for the whole walk, not one per frame log: the
+  // pictures from a reopened log are the same walk's pictures, and `fseq` keeps
+  // rising across the reopen because it is minted per camera read.
+  ws.imageDir = path.join(path.dirname(p), 'images');
+  ws.imagesWritten = 0;
+  ws.frameLog = openFrameLog(p, {
+    at: Date.now(),
+    clientId: ws.clientId,
+    deviceId: ws.deviceId,
+    sid: sid ?? null,
+    w: w ?? null,
+    h: h ?? null,
+  });
+  log(`Object frames started: ${path.relative(__dirname, p)}`);
+}
+
 // Detection rate the client reported achieving against the interval it was
 // asked for (`msg.cost`, from either capture page's rolling-window meter —
 // see common.js createCostMeter). The setting says the rate is "attempted, not
@@ -989,6 +1251,19 @@ function noteDetectRate(ws, cost) {
         + `${detHz.toFixed(1)}/s of ${targetHz.toFixed(1)} asked`);
     }
     ws.detectBehind = nowBehind;
+  }
+  // Where the client is detecting, on the same crossing rule as the rate above.
+  // /xr-client is the only page that reports this, and it reports it because it
+  // used to be able to lose its detection worker and carry on silently — which
+  // read here as a phone that had simply got slow.
+  if (cost.det !== undefined) {
+    const off = cost.det !== 'worker';
+    if (off !== !!ws.detectorOff) {
+      log(off
+        ? `Client ${ws.clientId} is not detecting: ${cost.detWhy || 'detector unavailable'}`
+        : `Client ${ws.clientId} detector back on its worker`);
+      ws.detectorOff = off;
+    }
   }
   // Separately: the interval the client says it is working to may not be the
   // one this server last asked for — a config push that never arrived, or
@@ -1077,6 +1352,251 @@ const walls = createWalls({
   markerSizeM: settings.get('markerSizeM'),
   log,
 });
+
+// Objects detected in the room and triangulated from their bearings. Reads the
+// survey's pose and writes to nothing — not the marker map, not the walls grid,
+// not the XR alignment. A second opinion beside the first, and the disagreement
+// between them is the diagnostic.
+// What each object has been doing over the life of the map — see
+// object-history.js. Built here rather than inside `objects` because it is
+// anchored on the *survey's* frame: the object map is expressed in it and does
+// not own it, and a record stamped with an anchor the survey has since replaced
+// is a record of a room that no longer exists.
+const objectHistory = createObjectHistory({
+  file: OBJECT_HISTORY_FILE,
+  log,
+  anchorId: () => survey.getMarkerMap().anchorId,
+});
+const objects = createObjects({ file: OBJECTS_FILE, log, history: objectHistory });
+
+// The object detector is loaded lazily and only when a frame actually arrives:
+// it is 80 MB resident and the channel is off by default.
+let objectDetector = null;
+// One inference in flight per client. A backlog would join pictures to poses
+// that have already been evicted from the ring below, which is worse than
+// dropping the frame — the frame is the cheap half.
+const objBusy = new Set();
+// Recent poses by (clientId, sid, fseq), for the join. The frame and its pose
+// travel on different sockets and are never matched by arrival order.
+const posesByFseq = new Map();
+const POSE_RING = 64;
+let objectsPushTimer = null;
+
+// Detections waiting for the pose of the frame they came from — see detectFrame
+// for why that is the normal case rather than the exception.
+const pendingDets = new Map();
+const PENDING_MAX = 64;
+
+// What the frame channel has actually done, per client, for the roster card.
+//
+// Counts rather than rates, because the number that matters is a **ratio**: the
+// join bug — every frame arriving ~300 ms before its pose, inference finishing
+// first, every observation dropped — ran for a whole session with nothing on
+// screen or in the log that could have shown it. `joined + collected` against
+// `inferred` is that bug, visible.
+const objStats = new Map();
+function objStat(clientId) {
+  let s = objStats.get(clientId);
+  if (!s) {
+    s = {
+      offered: 0, inferred: 0, busy: 0, joined: 0, parked: 0, collected: 0, evicted: 0, ms: 0,
+      // Measured apart from inference: what the outline fitter adds is a claim
+      // about this step, and a total cannot make it.
+      outlineMs: 0,
+    };
+    objStats.set(clientId, s);
+  }
+  return s;
+}
+
+// What one frame's outlines say about where the camera was, pushed back to the
+// phone that took it.
+//
+// **A readout and nothing else.** It feeds no module, corrects no alignment and
+// moves nothing on the phone — it is a second opinion published beside the
+// survey's own, and the offset between them is the product. That is the same
+// standing `objects.localize` has, and the bar for either changing is zero
+// measured false fixes.
+//
+// The offset is against the survey's own pose *for this frame*, which is the
+// only ground truth there is, and the yaw against the session alignment that
+// pose implies. Both from the same instant: `hit` carries the session pose the
+// room pose was solved for.
+// The session-to-room alignment carried from the last frame the survey *could*
+// answer, per client. This is "where the phone already thinks it is", and it is
+// the only thing that can tell two clocks in two rooms apart — a class label
+// cannot, and the picture cannot.
+//
+// Keyed by XR session: an alignment maps *that* session's frame into the room,
+// and the next session has a different origin and a different yaw. Carrying one
+// across the boundary would compare a pose against a transform for somewhere
+// else entirely.
+const shapeAlign = new Map();          // clientId -> { sid, align }
+
+function carriedAlign(hit) {
+  const held = shapeAlign.get(hit.clientId);
+  return held && held.sid === hit.sid ? held.align : null;
+}
+
+function shapeReadout(hit, sizes, dets, note) {
+  if (!hit.xr?.q || !hit.K?.fx) return null;
+  const withOutline = dets.filter((d) => d.outline);
+  if (!withOutline.length) return null;
+  const fix = objects.poseFromShape({
+    note,
+    dets: withOutline, K: hit.K, camW: hit.camW, camH: hit.camH,
+    frameW: sizes.w ?? sizes.header?.w, frameH: sizes.h ?? sizes.header?.h,
+    qGravity: hit.xr.q,
+    // Where the phone already thinks it is, for the tie-breaks — the mirror
+    // pair within one object, and rival instances of one class. Absent (a fresh
+    // session, or one that has never seen a tag) simply removes that step and
+    // the ambiguous cases go back to being refused.
+    align: carriedAlign(hit), xr: hit.xr,
+    // Who and when, for the window of recent detections the rival tie-break
+    // scores against — the discriminator that needs no room pose.
+    clientId: hit.clientId, sid: hit.sid, at: hit.at,
+    // The tags of this same frame: a printed tag is the best-conditioned quad
+    // in the room and a pose solved from one is the survey's own answer coming
+    // back round.
+    tags: hit.tags,
+  });
+  if (!fix) return null;
+  // The offset is against the survey's own pose for this frame — the only
+  // ground truth there is — and there is not always one. Where the survey had
+  // nothing, the fix's own room position is the whole of what there is to show,
+  // and that is the case this feature was built for rather than a degraded one.
+  const truth = hit.pose ? sessionAlignment(hit.xr, hit.pose) : null;
+  let dYawDeg = null;
+  if (truth) {
+    let d = (fix.yaw - truth.yaw) * 180 / Math.PI;
+    while (d > 180) d -= 360;
+    while (d < -180) d += 360;
+    dYawDeg = d;
+  }
+  return {
+    cls: fix.cls,
+    id: fix.id,
+    kind: fix.kind,
+    by: fix.by,
+    rivals: fix.rivals,
+    p: fix.p.map((v) => Math.round(v * 100) / 100),
+    dPosM: hit.pose
+      ? Math.hypot(fix.p[0] - hit.pose.p[0], fix.p[1] - hit.pose.p[1],
+        fix.p[2] - hit.pose.p[2])
+      : null,
+    dYawDeg,
+  };
+}
+
+function applyDetections(hit, sizes, dets) {
+  // The map needs a camera position — a bearing from nowhere is not evidence —
+  // so with no room pose this frame feeds nothing and only the shape readout
+  // below runs. That asymmetry is the point: one of these two answers "where is
+  // that object", the other answers "where am I", and only the first needs the
+  // survey to have already succeeded.
+  if (hit.pose) {
+    const { changed } = objects.observe({
+      sid: hit.sid, at: hit.at, pose: hit.pose, K: hit.K,
+      camW: hit.camW, camH: hit.camH,
+      frameW: sizes.w ?? sizes.header?.w, frameH: sizes.h ?? sizes.header?.h, dets,
+      // Where the tags were in this same frame, so a detection that is really a
+      // printed tag can be refused. The survey already knows where every tag is;
+      // a copy of one in the object map is a second opinion built from the same
+      // evidence.
+      tags: hit.tags,
+    });
+    if (changed) scheduleObjectsPush();
+  }
+  // The debug push. Off by default and skipped for a socket with a backlog —
+  // this rides the client's own signaling socket, which also carries its pose
+  // traffic, and a stale outline is worth nothing at all.
+  if (!settings.get('objOutlineDebug')) return;
+  const ws = clients.get(hit.clientId);
+  if (!ws || ws.bufferedAmount > ROOM_BULK_BACKLOG) return;
+  const outlines = dets.filter((d) => d.outline).map((d) => ({ cls: d.cls, ...d.outline }));
+  if (!outlines.length) return;
+  // Which test refused, carried with the refusal. "No fix" was as far as the
+  // phone could see, and a refusal that cannot name its own test is one nobody
+  // can act on while standing in front of the object it refused — which is the
+  // only place this is ever read.
+  const note = {};
+  const fix = shapeReadout(hit, sizes, dets, note);
+  send(ws, {
+    type: 'obj-shape',
+    fseq: hit.fseq ?? null,
+    w: sizes.w ?? sizes.header?.w,
+    h: sizes.h ?? sizes.header?.h,
+    // Whether the survey had an answer for this frame at all. Without it the
+    // readout cannot tell "the shape fix agrees with the survey" from "the
+    // survey has nothing and this is the only answer there is".
+    localized: !!hit.pose,
+    outlines,
+    fix,
+    why: fix ? null : (note.why || null),
+  });
+}
+
+function rememberPose(clientId, msg, pose) {
+  if (msg.fseq == null) return;
+  // **A frame is remembered even when the survey had no answer for it.**
+  //
+  // This used to bail on a missing room pose, which silently switched the whole
+  // object channel off exactly where it is most wanted: the shape fix exists to
+  // place a camera the survey cannot, and requiring the survey's answer before
+  // it may be attempted is backwards.
+  //
+  // What genuinely cannot be done without ARCore is the solve itself — the
+  // gravity-aligned orientation is what makes the unknown a yaw and a
+  // translation rather than a full six degrees of freedom. So a frame with
+  // neither a room pose nor a session pose is still nothing to keep.
+  if (!pose && !msg.xr?.q) return;
+  let ring = posesByFseq.get(clientId);
+  if (!ring) { ring = new Map(); posesByFseq.set(clientId, ring); }
+  const key = `${msg.sid}:${msg.fseq}`;
+  const hit = {
+    // Null where the survey had nothing. Everything reading this has to handle
+    // that: the map needs a camera position and skips, the shape fix does not
+    // and runs.
+    pose: pose ?? null, at: Date.now(), sid: msg.sid, clientId, fseq: msg.fseq,
+    K: msg.intrinsics || msg.intr, camW: msg.w, camH: msg.h,
+    // The session pose of the same frame. The shape solve needs a gravity-
+    // aligned orientation and ARCore's session frame is one by definition;
+    // `pose` is the room-frame answer this is measured *against*, so both have
+    // to be the same instant or the offset is a fit to two different moments.
+    xr: msg.xr ? { p: msg.xr.p, q: msg.xr.q } : null,
+    // Corners only: this is kept for one job — refusing detections that are
+    // really the printed tag — and holding the whole tag report would put the
+    // solver's rvec/tvec on a path that has no business reading them.
+    tags: (msg.tags || []).map((t) => ({ id: t.id, corners: t.corners })),
+  };
+  ring.set(key, hit);
+  // Refreshed from every frame the survey *did* answer, and never from one it
+  // did not — this is the carry, and a carry updated from its own guesses is a
+  // feedback loop rather than a reference.
+  if (pose && msg.xr?.p && msg.xr?.q) {
+    const align = sessionAlignment(msg.xr, pose);
+    if (align) shapeAlign.set(clientId, { sid: msg.sid, align });
+  }
+  while (ring.size > POSE_RING) ring.delete(ring.keys().next().value);
+  // The other half of the join: detections that got here first.
+  const pending = pendingDets.get(`${clientId}:${key}`);
+  if (pending && hit.K?.fx) {
+    pendingDets.delete(`${clientId}:${key}`);
+    objStat(clientId).collected++;
+    applyDetections(hit, pending, pending.dets);
+  }
+}
+
+// Debounced like the walls push and sent {bulk: true} for the same reason: a
+// watcher with a backlog is also carrying that client's own pose traffic, and
+// the next snapshot is a second away.
+function scheduleObjectsPush() {
+  if (objectsPushTimer) return;
+  objectsPushTimer = setTimeout(() => {
+    objectsPushTimer = null;
+    sendObjects({ type: 'objects', ...objects.getObjects() });
+  }, 1000);
+}
 
 // Debounced full-snapshot push: the grid takes evidence at 10 Hz per client
 // but the viewer only needs to see it settle, and a snapshot of a real room
@@ -1169,6 +1689,23 @@ settings.on('poseJournalEnabled', (on) => {
   log(`Pose journal ${on ? 'enabled' : 'disabled'}`);
 });
 
+// Same reason: a frame log left open after the clients stopped feeding it looks
+// like a session that is still running.
+settings.on('objFramesEnabled', (on) => {
+  if (!on) for (const set of frameSockets.values()) for (const f of set) closeFrameLog(f);
+  log(`Object frames ${on ? 'enabled' : 'disabled'}`);
+});
+
+// Dropped rather than swapped: the session holds ~80 MB and the next frame
+// rebuilds it, which also re-reads the class names and re-declares the
+// vocabulary. Doing it here rather than at the next frame's expense would mean
+// loading a model nobody has asked to use yet.
+settings.on('objDetectorModel', (file) => {
+  objectDetector?.close();
+  objectDetector = null;
+  log(`Object detector set to ${file} — loading on the next frame`);
+});
+
 // What a capture client has to be told about the room's tags. Assembled here
 // rather than stored, so there is no second copy of the marker size to fall out
 // of step with the store.
@@ -1178,6 +1715,14 @@ function poseConfigMessage() {
     markerSizeM: settings.get('markerSizeM'),
     dictionary: POSE_DICTIONARY,
     poseRateMs: settings.get('poseRateMs'),
+    // The object-frame channel rides the same message rather than growing one
+    // of its own: it is paced by the same page, on the same frame loop, and a
+    // second config message would be a second thing that can arrive late.
+    objFramesEnabled: settings.get('objFramesEnabled'),
+    objFrameRateMs: settings.get('objFrameRateMs'),
+    objFrameLongEdge: settings.get('objFrameLongEdge'),
+    objFrameQuality: settings.get('objFrameQuality'),
+    objFrameDepth: settings.get('objFrameDepth'),
   };
 }
 
@@ -1326,6 +1871,16 @@ function handleSignal(ws, msg) {
       // retire whatever socket still holds the id — only one owns it.
       const prev = clients.get(ws.clientId);
       if (prev && prev !== ws) {
+        // Said out loud, because the interesting case is not a reload. A page
+        // Android froze keeps its sockets looking open from here — there is no
+        // server-side heartbeat — so a phone whose owner gave up and opened a
+        // fresh tab arrives as a displacement, with a dead page still holding
+        // the id. Silently, that read as an ordinary connect. How long the old
+        // socket had held it is the tell: seconds is a reload, minutes is a
+        // page that stopped answering a while ago.
+        const heldMs = prev.connectedAt ? Date.now() - prev.connectedAt : null;
+        log(`Client ${ws.clientId} displaced an earlier page`
+          + (heldMs === null ? '' : ` (it had held the id ${(heldMs / 1000).toFixed(0)}s)`));
         prev.close();
         // And the bulk socket that was feeding it. Binary is written to
         // whichever main socket holds the id *now*, so a chunk still in flight
@@ -1336,6 +1891,11 @@ function handleSignal(ws, msg) {
         // own bulk socket and its recording-start opens a fresh file, so no
         // WebM header is lost.
         for (const b of bulkSockets.get(ws.clientId) || []) b.close();
+        // And its object-frame socket, for the same reason one level up: a
+        // frame still in flight from the displaced page would be logged under
+        // the new page's session, joining a picture from one walk to a pose
+        // from another.
+        for (const f of frameSockets.get(ws.clientId) || []) f.close();
       }
       clients.set(ws.clientId, ws);
       log(`Client ${ws.clientId} connected (${clients.size} total)`);
@@ -1362,6 +1922,16 @@ function handleSignal(ws, msg) {
       // the retire step above.
       if (!bulkSockets.has(ws.clientId)) bulkSockets.set(ws.clientId, new Set());
       bulkSockets.get(ws.clientId).add(ws);
+    } else if (msg.role === 'client-frames') {
+      // A client's third socket, carrying only object frames (a small JPEG
+      // behind the header in public/frame-wire.js). Separate from the bulk
+      // socket so a frame cannot queue behind a second of WebM, and separate
+      // from signaling so it cannot queue in front of a pose.
+      ws.role = 'client-frames';
+      ws.clientId = clientIdFor(msg.deviceId);
+      ws.deviceId = msg.deviceId;
+      if (!frameSockets.has(ws.clientId)) frameSockets.set(ws.clientId, new Set());
+      frameSockets.get(ws.clientId).add(ws);
     } else if (msg.role === 'audio-lab') {
       ws.role = 'audio-lab';
       ws.deviceId = msg.deviceId;
@@ -1390,6 +1960,7 @@ function handleSignal(ws, msg) {
       send(ws, settingsMessage());
       send(ws, { type: 'marker-map', ...survey.getMarkerMap() });
       sendWalls(ws);
+      send(ws, { type: 'objects', ...objects.getObjects() });
       sendClients();
       for (const client of clients.values()) send(client, { type: 'viewer-ready' });
     }
@@ -1418,6 +1989,11 @@ function handleSignal(ws, msg) {
         // its screen it gives it. Anything but these two is off — the value is
         // also what decides whether the room messages are sent at all.
         map: msg.map === 'split' || msg.map === 'full' ? msg.map : 'off',
+        // Whether this client is drawing the object readout. Separate from
+        // `map` because it wants only the object map and none of the rest of
+        // the room feed — tying it to `map` meant its own button did nothing
+        // until an unrelated control was switched on too.
+        objects: !!msg.objects,
         // XR only: whether that page is sending video and recording it. Null is
         // "this client never said", which is what hides the control — /client
         // always streams and reports nothing here.
@@ -1427,7 +2003,48 @@ function handleSignal(ws, msg) {
         xrFeatures: Array.isArray(msg.xrFeatures)
           ? msg.xrFeatures.filter((f) => typeof f === 'string').slice(0, 16)
           : null,
+        // XR only. A page that answers this socket but cannot start a session
+        // is indistinguishable from a frozen one from anywhere except its own
+        // screen, which is the one place nobody can read it from. Capped: it
+        // is a client-supplied string on its way to the dashboard.
+        detector: typeof msg.detector === 'string' ? msg.detector.slice(0, 80) : null,
+        canStart: msg.canStart === undefined ? null : !!msg.canStart,
+        // The page holds a session object that has stopped delivering frames.
+        // Only the page can know this — there is no property on XRSession that
+        // admits the session is gone, so it is measured from the frame loop.
+        stalled: !!msg.stalled,
       };
+      // Logged on the crossing only, like the detection-rate and detector-path
+      // lines: the state is reported several times a second and only its
+      // changes are news.
+      const st = ws.clientState;
+      if (st.kind === 'xr' && st.canStart !== null) {
+        // Two different ways to be unable to start, and telling them apart is
+        // the point: waiting on the detector is a page working correctly, while
+        // believing in a session that has already gone is the state that reads
+        // as a frozen tab — every tap swallowed by an overlay that outlived the
+        // session it belonged to.
+        const why = st.canStart ? null
+          : st.stalled ? 'it still believes a session is running, but no XR frames are arriving'
+            : st.session ? null            // an ordinary session, nothing to say
+              : `detector ${st.detector || 'unknown'}`;
+        // Once per socket, whatever the value. The crossing log below only
+        // speaks when something changes, which says nothing at all about a page
+        // that arrives already in the state being chased — and a reconnect is
+        // the one moment a page that has stopped responding to its user will
+        // still describe itself.
+        if (!ws.xrStateLogged) {
+          ws.xrStateLogged = true;
+          log(`Client ${ws.clientId} xr page state: detector ${st.detector}`
+            + `, session ${st.session ? 'held' : 'none'}`
+            + `, stalled ${st.stalled}, canStart ${st.canStart}`);
+        }
+        if (why !== (ws.startBlockedWhy ?? null)) {
+          if (why) log(`Client ${ws.clientId} cannot start a session: ${why}`);
+          else if (ws.startBlockedWhy) log(`Client ${ws.clientId} can start a session again`);
+          ws.startBlockedWhy = why;
+        }
+      }
       // The XR client shares a browser, and therefore a deviceId, with /client
       // on the same phone. It has no mic, no recorder and no resolution to
       // choose, so storing what it reports would overwrite the settings the
@@ -1447,6 +2064,12 @@ function handleSignal(ws, msg) {
       if (!watched && watchingRoom(ws)) {
         send(ws, { type: 'marker-map', ...survey.getMarkerMap() });
         sendWalls(ws);
+      }
+      // The object readout is its own switch, so it gets its own snapshot —
+      // a client that turns it on while standing still would otherwise wait for
+      // something in the room to change before anything appeared.
+      if (watchingRoom(ws) || ws.clientState?.objects) {
+        send(ws, { type: 'objects', ...objects.getObjects() });
       }
       logClients();
       sendClients();
@@ -1480,6 +2103,13 @@ function handleSignal(ws, msg) {
   }
   if (msg.type === 'recording-start') {
     if (ws.role === 'client') openRecording(ws);
+    return;
+  }
+  // One frame log per XR session, announced on the frames socket itself so the
+  // session id travels with the pictures rather than being inferred from
+  // whatever pose happened to arrive nearby.
+  if (msg.type === 'frames-begin') {
+    if (ws.role === 'client-frames') openFrameLog_(ws, msg.sid, msg.w, msg.h);
     return;
   }
   // Audio-lab coordination, fanned to the other audio-lab pages verbatim:
@@ -1541,6 +2171,13 @@ function handleSignal(ws, msg) {
       walls.reset();
       walls.setMarkerMap(map);
       broadcastWalls();
+      // The object map is expressed in the same room frame and must not
+      // survive into the next one, exactly like the grid. The record of it goes
+      // with it: every position in there is relative to an anchor that has just
+      // stopped existing.
+      objects.reset(map.anchorId);
+      objectHistory.clear();
+      sendObjects({ type: 'objects', ...objects.getObjects() });
     }
     return;
   }
@@ -1562,7 +2199,12 @@ function handleSignal(ws, msg) {
       sendRoom({ type: 'marker-map', ...map });
       // Removing the anchor resets the survey; the grid was measured in that
       // room frame and must not survive into the next one.
-      if (map.anchorId == null) walls.reset();
+      if (map.anchorId == null) {
+        walls.reset();
+        objects.reset(null);
+        objectHistory.clear();
+        sendObjects({ type: 'objects', ...objects.getObjects() });
+      }
       walls.setMarkerMap(map);
       broadcastWalls();
     }
@@ -1578,6 +2220,13 @@ function handleSignal(ws, msg) {
     }
     return;
   }
+  // The same bargain for objects, and for the same reasons — see above.
+  if (msg.type === 'object-history') {
+    if (ws.role === 'viewer' && Number.isInteger(msg.id)) {
+      send(ws, { type: 'object-history', ...objectHistory.get(msg.id) });
+    }
+    return;
+  }
   // ARCore tracking loss on an XR client. The client keeps detecting tags
   // through it and falls back to plain `pose` reports, so this is a change of
   // localization mode rather than an outage — but it used to be sent as
@@ -1586,6 +2235,16 @@ function handleSignal(ws, msg) {
   // answerable from the log rather than from a gap between journal lines.
   if (msg.type === 'client-overlay') {
     if (ws.role === 'client') journalOverlay(ws, msg.text);
+    return;
+  }
+  // A capture page reporting its own failure. Worth a log line of its own
+  // rather than the overlay journal: these are the events that precede a page
+  // going silent, and the whole difficulty in chasing that has been that the
+  // page's last words were never recorded anywhere this side of the LAN.
+  if (msg.type === 'client-error') {
+    if (ws.role === 'client' && typeof msg.what === 'string') {
+      log(`Client ${ws.clientId} reports: ${msg.what.slice(0, 300)}`);
+    }
     return;
   }
   if (msg.type === 'xr-tracking') {
@@ -1647,6 +2306,10 @@ function handleSignal(ws, msg) {
       entry.room.roll = updateScreenRoll(ws, entry.room.pose);
       journalPose(ws, entry);
       noteDetectRate(ws, msg.cost);
+      // The raw survey pose, not the eased one shown below: the object map is
+      // measuring geometry, and the easing exists to make a dot move nicely.
+      // Same rule the survey applies to its own extend and refine paths.
+      rememberPose(ws.clientId, msg, surveyPose);
       // What is *shown* takes the eased pose; what is stored above did not.
       // Only when the survey's own alignment produced it: a dead-reckon has
       // replaced `entry.room.pose` by now and has no alignment behind it to
@@ -1664,7 +2327,17 @@ function handleSignal(ws, msg) {
         // this side's to hand out, and a client drawing the map has no other way
         // to pick itself out of the poses it is being sent for everybody.
         type: 'room-pose', clientId: ws.clientId,
-        pose: shown.pose, quality: shown.quality, jitter });
+        pose: shown.pose,
+        // The frame the object map is measured in, sent beside the one that is
+        // shown. `pose` above carries the display easing (see smoothedReport),
+        // and the client fits its whole room<-session transform from this
+        // message — so a transform fitted to `pose` is a transform fitted to the
+        // filter, and every object projected through it comes out displaced by
+        // whatever correction is still being absorbed. Measured on a walk:
+        // zero between corrections, 217 mm at worst, which at 1.5 m is 8° of
+        // arc between a box and the thing it is drawn around.
+        rawPose: entry.room.pose,
+        quality: shown.quality, jitter });
       if (mapChanged) {
         const map = survey.getMarkerMap();
         sendRoom({ type: 'marker-map', ...map });
@@ -1686,6 +2359,7 @@ function handleSignal(ws, msg) {
       entry.room.roll = updateScreenRoll(ws, entry.room.pose);
       journalPose(ws, entry);
       noteDetectRate(ws, msg.cost);
+      rememberPose(ws.clientId, msg, entry.room.pose);
       send(viewerSocket, { ...msg, clientId: ws.clientId, room: entry.room });
       sendWatchers(roomPoseMessage(ws.clientId, msg, entry.room));
       // The client cannot know its room pose on its own (the marker map lives
@@ -1720,6 +2394,12 @@ function probeAssets() {
   if (missing.length) {
     log(`Pose features disabled: missing ${missing.join(', ')} — run "npm run fetch-vendor"`);
   }
+  // Said once, and only as a fact about this checkout: the object channel is an
+  // experiment that is off by default, so a missing model is not a fault.
+  const model = settings.get('objDetectorModel');
+  if (!objectDetectorAvailable(model)) {
+    log(`Object detection disabled: models/${model} missing — run "npm run fetch-vendor"`);
+  }
 }
 
 function main() {
@@ -1728,6 +2408,10 @@ function main() {
   survey.load();
   walls.load();
   walls.setMarkerMap(survey.getMarkerMap());
+  objects.load(survey.getMarkerMap().anchorId);
+  // After the survey, which is what decides the anchor the record is checked
+  // against, and after the map, so the log reads in the order things happened.
+  objectHistory.load();
   registry.load();
   const tls = loadOrCreateCert();
   const server = https.createServer(tls, serveStatic);
@@ -1735,7 +2419,50 @@ function main() {
 
   wss.on('connection', (ws) => {
     ws.on('message', (data, isBinary) => {
+      // Any inbound byte proves the page's main thread ran. Stamped before the
+      // dispatch so a message that turns out to be unhandled still counts —
+      // liveness is the question here, not usefulness.
+      ws.lastMsgAt = Date.now();
       if (isBinary) {
+        // Binary means one thing per role, and the role is the only thing that
+        // says which. On the frames socket it is an object frame; on the client
+        // and bulk sockets it stays a recorder chunk, unconditionally, exactly
+        // as it always has.
+        if (ws.role === 'client-frames') {
+          if (!settings.get('objFramesEnabled')) return;
+          const record = decodeFrameRecord(data);
+          // A frame that will not decode came from a socket that lied about its
+          // role. Dropped loudly rather than guessed at — the alternative is
+          // writing whatever it is into a file the offline detector will read.
+          if (!record) {
+            if (!ws.frameBadLogged) {
+              ws.frameBadLogged = true;
+              log(`Client ${ws.clientId}: bad object-frame header, dropping`);
+            }
+            return;
+          }
+          // No frames-begin arrived (an older page, or a socket that
+          // reconnected mid-session). Open a log anyway rather than dropping
+          // the walk; it simply cannot name the session it belongs to.
+          if (!ws.frameLog) openFrameLog_(ws, null, record.header.w, record.header.h);
+          // And say so, once. A log with no session id cannot be joined to a
+          // pose — the key is `sid:fseq` — so every detection made from these
+          // frames is discarded and the object map gains nothing for as long as
+          // this socket lasts. That used to be completely silent: the pictures
+          // arrived, the detector ran, and the room simply never learned an
+          // object. The bytes are still worth keeping for an offline pass.
+          if (ws.frameSid === null && !ws.frameSidWarned) {
+            ws.frameSidWarned = true;
+            log(`Client ${ws.clientId} object frames name no session — nothing they see can be placed`);
+          }
+          // Recorded before it is looked at, and recorded whether or not the
+          // detector is even installed: the bytes are the durable half. A model
+          // can be re-run over them; a walk cannot.
+          ws.frameLog.write(data);
+          saveFrameImages(ws, record);
+          detectFrame(ws, record);
+          return;
+        }
         if (ws.role !== 'client' && ws.role !== 'client-bulk') return;
         // Recording state lives on the client's main socket, wherever the
         // bytes arrive.
@@ -1780,6 +2507,11 @@ function main() {
         const set = bulkSockets.get(ws.clientId);
         set?.delete(ws);
         if (set && !set.size) bulkSockets.delete(ws.clientId);
+      } else if (ws.role === 'client-frames') {
+        closeFrameLog(ws);
+        const set = frameSockets.get(ws.clientId);
+        set?.delete(ws);
+        if (set && !set.size) frameSockets.delete(ws.clientId);
       } else if (ws === viewerSocket) {
         viewerSocket = null;
         log('Viewer disconnected');
@@ -1790,7 +2522,56 @@ function main() {
     });
 
     ws.on('error', () => {});
+    // Liveness, from this end. Everything about whether a client is still there
+    // has until now been the client's job — it pings, and an unanswered ping is
+    // how *it* learns the socket died. Nothing ran in this direction, so a page
+    // Android froze left a socket that stays open here forever: the roster kept
+    // listing it, the dashboard kept drawing it, and the log recorded no
+    // disconnect. That is not a cosmetic gap. It is the diagnostic surface for
+    // this whole system, and twice it reported a healthy client that had in
+    // fact stopped existing two minutes earlier — which is exactly the evidence
+    // used to rule out the page having died.
+    ws.isAlive = true;
+    ws.on('pong', () => { ws.isAlive = true; });
   });
+
+  // Two different deaths, and only both together tell them apart.
+  //
+  // The protocol ping answers "is the connection there". The browser's network
+  // stack replies to it without waking the page, so it detects a socket that
+  // has gone, not a page that has stopped running.
+  //
+  // A page that stops running is what actually happens here — Android freezing
+  // or killing a backgrounded renderer — and the tell is the *application*
+  // ping, `{type:'ping'}` from common.js every 5 s, which only a live main
+  // thread can send. A socket that pongs but has sent nothing for three of
+  // those intervals is a frozen page. That state used to be completely
+  // invisible: the roster listed the client, the dashboard drew it, and there
+  // was no disconnect in the log, so it read as a perfectly healthy phone.
+  setInterval(() => {
+    const now = Date.now();
+    for (const ws of wss.clients) {
+      if (ws.role === 'client' && ws.lastMsgAt) {
+        const quiet = now - ws.lastMsgAt;
+        const silent = quiet > APP_SILENCE_MS;
+        if (silent !== !!ws.appSilent) {
+          log(silent
+            ? `Client ${ws.clientId} page has stopped running — nothing sent for ${(quiet / 1000).toFixed(0)}s, socket still open`
+            : `Client ${ws.clientId} page is running again`);
+          ws.appSilent = silent;
+        }
+      }
+      if (ws.isAlive === false) {
+        if (ws.clientId !== undefined) {
+          log(`Client ${ws.clientId} stopped answering — dropping the ${ws.role || 'unknown'} socket`);
+        }
+        ws.terminate();
+        continue;
+      }
+      ws.isAlive = false;
+      ws.ping();
+    }
+  }, HEARTBEAT_MS);
 
   // The roster is pushed on every change, but the recording byte count only
   // ever grows — it has no event to hang off, and a size that only moves when
