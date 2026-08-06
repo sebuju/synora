@@ -968,8 +968,8 @@ function journalPose(ws, entry) {
 //
 // Logged only on a crossing, the same shape as the ARCore tracking-loss log
 // above — a level judged against one threshold flaps, the lesson already paid
-// for once by depthState (.claude/rules/depth.md), so BEHIND_ON/BEHIND_OFF
-// give the verdict two thresholds rather than one.
+// for once by the depth trust gate, so BEHIND_ON/BEHIND_OFF give the verdict
+// two thresholds rather than one.
 const BEHIND_ON = 0.75;    // ratio of achieved to target that trips "behind"
 const BEHIND_OFF = 0.9;    // ratio that clears it — clears by more than it tripped
 

@@ -850,9 +850,8 @@ async function start() {
       // optional, so asking costs nothing on a device without them, and every
       // path downstream works without depth. Sampling depth at the tags, whose
       // distance the solver already knows, is the measurement that readmitted
-      // it — it now also serves as a founding prior on the server, under a
-      // trust gate the session re-earns from those same pairs
-      // (`.claude/rules/depth.md`).
+      // it. Nothing in the product reads it today; the samples are journalled
+      // so the measurement stays available to whatever asks for it next.
       optionalFeatures: ['camera-access', 'anchors', 'dom-overlay', 'hit-test',
         'plane-detection', 'depth-sensing'],
       depthSensing: {
