@@ -75,6 +75,12 @@ function settleOpenCv(mod, resolve, reject) {
 // Works on a page and inside a worker: the pose pipeline runs detection off the
 // main thread, and that thread has no document to append a script tag to.
 function loadOpenCv() {
+  // Success is memoised — loading ~10 MB and a wasm compile twice is the whole
+  // point of the cache. A *rejection* is not: what fails here is a fetch over
+  // the LAN, and the moment it is asked for on /xr-client is the moment an XR
+  // session is starting and the radio has just woken. That is transient in
+  // exactly the way a permanent answer is not, and a memoised rejection is how
+  // one bad fetch used to condemn the page until it was reloaded.
   cvLoadPromise ??= new Promise((resolve, reject) => {
     if (typeof importScripts === 'function') {
       try {
@@ -91,6 +97,9 @@ function loadOpenCv() {
     script.onerror = () => reject(new Error('failed to load /vendor/opencv.js'));
     script.onload = () => settleOpenCv(self.cv, resolve, reject);
     document.head.append(script);
+  }).catch((err) => {
+    cvLoadPromise = null;
+    throw err;
   });
   return cvLoadPromise;
 }
