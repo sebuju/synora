@@ -258,8 +258,10 @@ The active client's chunk stream is teed into `ffmpeg`, decoded, and piped to `A
 - One directory per walk: `recordings/<stamp>_client<id>/`, holding everything one client connection produced. The video is `capture.webm` inside it.
 - A new file starts on connect/reconnect, camera switch, mic toggle, resolution change, and the new-recording button. Pause does not split the file. Later files in the same walk are `capture-2.webm`, `capture-3.webm` — a reconnect is a new walk and gets its own directory.
 - The pose journal is `pose.jsonl` in the same directory and is the input to the replay harnesses. The replay tools take the directory: `node replay-survey.js recordings` runs the whole corpus.
-- Retention is manual; disk space is the only limit.
-- A 0-byte file means the client's screen was off or the page was backgrounded — the camera delivers no frames there.
+- A 0-byte file means the client's screen was off or the page was backgrounded — the camera delivers no frames there. That walk is a **null walk**: fewer than 10 observations, under 1 MB of capture, under 1 MB of recorded object frames (the frame log's records plus the images written from them), nothing else in the directory. It is what reconnect churn leaves behind, and it is worth nothing to a replay.
+- Null walks are removed when the client disconnects and swept from the whole corpus at server startup. The sweep prints both lists — everything kept, then everything deleted, in date order — to the console and `server.log` **before** it deletes anything, which is the only record there will be: there is no undo. `SYNORA_PURGE_WALKS=0` runs the same scan and the same report without deleting, which is what to use after changing a threshold.
+- `recordings/.walks.json` records the verdicts — which walks were judged worth keeping, so they are not re-inspected on every start, and an audit trail of what was deleted and the numbers that condemned it. Written only when purging is on.
+- Retention of everything else is manual; disk space is the only limit.
 
 ## Replay harnesses
 
@@ -272,7 +274,7 @@ replay-tagbias.js    per-tag mirror-branch and orientation statistics
 replay-depth.js      ARCore depth against the tag solver's own distance
 ```
 
-Every harness takes walk directories, or the whole corpus in one argument — `node replay-survey.js recordings` — and reaches one level in to find the journals. `migrate-recordings.js` converts a pre-existing flat corpus to that layout; it says what it would move by default, needs `--apply` to move anything, and undoes itself from the manifest it writes.
+Every harness takes walk directories, or the whole corpus in one argument — `node replay-survey.js recordings` — and reaches one level in to find the journals.
 
 Compare replays only against a *fixed* `markers.json` — the live server rewrites it mid-session, and a moved map silently invalidates a "before" number.
 
@@ -285,7 +287,6 @@ walls.js               free-space carve, wall inference, negative evidence
 devices.js             device registry: settings, calibration, fingerprints
 settings.js            persisted server settings: schema, store, validation
 replay-*.js            offline measurement harnesses
-migrate-recordings.js  flat recordings/ -> one directory per walk, reversible
 fetch-vendor.js        downloads opencv.js / three.js
 public/
   xr-client.js/.html   ARCore pose + tag detection + on-phone map
@@ -310,6 +311,7 @@ public/
   viewer.html · index.html · style.css
 certs/                 self-signed cert, generated on first run   (gitignored)
 recordings/            one directory per walk: video + journal    (gitignored)
+  .walks.json          null-walk verdicts: kept, pruned           (gitignored)
 tools/                 ffmpeg.exe for the virtual webcam          (gitignored)
 public/vendor/         fetched opencv.js / three.js               (gitignored)
 markers.json           surveyed marker map                        (gitignored)

@@ -12,6 +12,7 @@ const { createWalls } = require('./walls.js');
 const { quatRotate, quatConj, snapQuarterTurn } = require('./public/pose-math.js');
 const { createDeviceRegistry, modelFromUa } = require('./devices.js');
 const { createSettings } = require('./settings.js');
+const { readFrameLogMeta } = require('./frame-log.js');
 
 const PORT = Number(process.env.PORT) || 8443;
 // Where everything the server *writes* lives. Overridable because a second
@@ -78,6 +79,21 @@ function fmtDateTime(d) {
 function fmtFileStamp(d) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_` +
     `${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+}
+
+// Byte counts, in the unit a person would have chosen. One helper because the
+// recorder, the frame log and the walk verdict all print sizes and had each
+// picked their own divisor — one of them in MiB and one in MB, which is a
+// difference nobody reading two adjacent log lines could see.
+const BYTE_UNITS = ['B', 'KB', 'MB', 'GB', 'TB'];
+function fmtBytes(n) {
+  const bytes = Number(n) || 0;
+  let i = 0;
+  let v = Math.abs(bytes);
+  while (v >= 1024 && i < BYTE_UNITS.length - 1) { v /= 1024; i++; }
+  // Whole bytes are counts, not measurements; everything above is one decimal.
+  const shown = i === 0 ? String(Math.round(v)) : v.toFixed(1);
+  return `${bytes < 0 ? '-' : ''}${shown} ${BYTE_UNITS[i]}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -567,11 +583,326 @@ function sessionPath(ws, name, seq = 0) {
   return path.join(dir, `${name.slice(0, dot)}-${seq + 1}${name.slice(dot)}`);
 }
 
+// Null walks. A client that writes nothing leaves no directory at all (above),
+// but one that connects and is cancelled a second later writes just enough to
+// make one: a pose journal holding its own meta line, a capture.webm holding a
+// WebM header and no picture. Hundreds accumulate from reconnect churn and a
+// screen that went off, and every replay run over the corpus pays for each of
+// them — `expandJournals` has no notion of a journal too short to bother with.
+//
+// The verdict is read off the directory and nothing else, never off the socket
+// that wrote it, so the disconnect path and the startup sweep cannot drift
+// apart and a dry run reports exactly what the real run would act on.
+const MIN_WALK_POSE_LINES = 10;
+// A WebM header is a few hundred bytes and a single chunk a few kilobytes; at
+// 4K recorder bitrates a megabyte is still around a second of video. The floor
+// separates "the recorder started" from "there is something to look at", and
+// the same question is asked of the frame log, whose preamble is likewise
+// present in a file that recorded nothing and whose records are whole JPEGs.
+const MIN_WALK_CAPTURE_BYTES = 1024 * 1024;
+const MIN_WALK_FRAME_BYTES = 1024 * 1024;
+// The journal of a real walk is many megabytes and must not be slurped once per
+// directory across a corpus of hundreds, so the line count is a bounded head
+// read: a file that fills the window without settling the question is far too
+// big to be a null walk.
+const WALK_POSE_SCAN_BYTES = 256 * 1024;
+// Long after a page has finished tearing down its three sockets, and short
+// enough that reconnect churn does not pile up. See pruneWalkLater.
+const WALK_PRUNE_DELAY_MS = 2000;
+const WALKS_MANIFEST = path.join(RECORDINGS_DIR, '.walks.json');
+const MAX_PRUNED_RECORDED = 500;
+// On by default: the rule was judged against the whole corpus in dry runs
+// before it was switched on, and a null walk left on disk is a walk every
+// replay run has to read past. `SYNORA_PURGE_WALKS=0` puts the dry run back —
+// the same scan, the same report, nothing deleted — which is what to reach for
+// after changing a threshold above.
+const PURGE_WALKS = process.env.SYNORA_PURGE_WALKS !== '0';
+
+function countPoseLines(file) {
+  let fd;
+  try { fd = fs.openSync(file, 'r'); } catch { return 0; }
+  try {
+    const buf = Buffer.alloc(WALK_POSE_SCAN_BYTES);
+    const n = fs.readSync(fd, buf, 0, WALK_POSE_SCAN_BYTES, 0);
+    let lines = 0;
+    for (let i = 0; i < n; i++) if (buf[i] === 0x0a) lines++;
+    if (n === WALK_POSE_SCAN_BYTES && lines <= MIN_WALK_POSE_LINES) return Infinity;
+    // The meta header is not an observation.
+    return Math.max(0, lines - 1);
+  } catch {
+    return 0;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// Record bytes, not file bytes: the preamble's own length is in the file, so
+// what a log recorded is a subtraction rather than an estimate, and a log that
+// opened and recorded nothing measures exactly zero.
+function frameLogBytes(file) {
+  const head = readFrameLogMeta(file);
+  if (!head) return 0;
+  try {
+    return Math.max(0, fs.statSync(file).size - head.offset);
+  } catch {
+    return 0;
+  }
+}
+
+// Null unless every piece of evidence is absent — a single real capture, a
+// single recorded frame or ten observations saves the directory. Returns null
+// if the directory is already gone.
+function walkVerdict(dir) {
+  let names;
+  try { names = fs.readdirSync(dir); } catch { return null; }
+  let poseLines = 0;
+  let captureBytes = 0;
+  let frameBytes = 0;
+  let other = '';
+  for (const name of names) {
+    const p = path.join(dir, name);
+    // `pose-2.jsonl` and later are real journals of the same walk and count
+    // toward it, the way `capture-2.webm` does.
+    if (/^pose(-\d+)?\.jsonl$/.test(name)) { poseLines += countPoseLines(p); continue; }
+    if (/^capture(-\d+)?\.webm$/.test(name)) {
+      try { captureBytes = Math.max(captureBytes, fs.statSync(p).size); } catch { /* gone */ }
+      continue;
+    }
+    if (/^frames(-\d+)?\.frames$/.test(name)) {
+      frameBytes += frameLogBytes(p);
+      continue;
+    }
+    // Detections, written offline by detect-objects.js from the frame log
+    // beside it. Recognised so it is not mistaken for evidence, and worth
+    // nothing on its own: the frames it was read from are already counted, and
+    // re-running the detector must not be what saves a walk.
+    if (/^frames(-\d+)?\.obj\.jsonl$/.test(name)) continue;
+    // The image files are the same frames written a second time, so they are
+    // measured with the frame log rather than counted as something unknown —
+    // otherwise two JPEGs saved a walk whose frame log holds four bytes, which
+    // is what the first dry run of this rule actually did.
+    if (/^images(-\d+)?$/.test(name)) {
+      try {
+        for (const img of fs.readdirSync(p)) {
+          try { frameBytes += fs.statSync(path.join(p, img)).size; } catch { /* gone */ }
+        }
+      } catch { /* gone */ }
+      continue;
+    }
+    // Anything this function does not recognise is evidence it cannot weigh,
+    // and the safe reading of evidence it cannot weigh is to keep the walk.
+    // Named, not just flagged: a walk kept for a reason the columns cannot show
+    // reads as a bug in the rule, and the reason is one word long.
+    if (!other) other = name;
+  }
+  const keep = !!other
+    || poseLines >= MIN_WALK_POSE_LINES
+    || captureBytes >= MIN_WALK_CAPTURE_BYTES
+    || frameBytes >= MIN_WALK_FRAME_BYTES;
+  return { keep, poseLines, captureBytes, frameBytes, other };
+}
+
+// One row of the verdict, as cells rather than a string: the dry run prints
+// hundreds of these and they are read down the column, not along the line, so
+// the widths have to be taken across the whole list before anything is printed.
+function walkRow(name, v) {
+  return [
+    name,
+    `${v.poseLines} obs`,
+    `${fmtBytes(v.captureBytes)} capture`,
+    `${fmtBytes(v.frameBytes)} frames`,
+    v.other ? `+ ${v.other}` : '',
+  ];
+}
+
+function walkWidths(rows) {
+  const w = [];
+  for (const r of rows) r.forEach((c, i) => { w[i] = Math.max(w[i] || 0, c.length); });
+  return w;
+}
+
+// Name left, numbers right: a column of right-aligned figures is comparable at
+// a glance and a column of left-aligned ones is not.
+function padWalkRow(cells, w) {
+  return cells.map((c, i) => (i ? c.padStart(w[i]) : c.padEnd(w[i]))).join(' | ')
+    .replace(/[\s|]+$/, '');   // the last column is empty on most rows
+}
+
+// The same cells on a line of their own, for the one-walk case that has no
+// column to line up with.
+function describeWalk(v) {
+  return walkRow('', v).slice(1).join(' | ').replace(/[\s|]+$/, '');
+}
+
+// The manifest answers "has this one been judged already", so the corpus is
+// inspected once rather than on every start. Read and written whole: the rate
+// is one disconnect or one boot, and a cached copy is a second place for the
+// sweep and the disconnect path to disagree.
+function readWalksManifest() {
+  try {
+    const m = JSON.parse(fs.readFileSync(WALKS_MANIFEST, 'utf8'));
+    return {
+      kept: m && typeof m.kept === 'object' && m.kept ? m.kept : {},
+      pruned: Array.isArray(m && m.pruned) ? m.pruned : [],
+    };
+  } catch {
+    // Missing or unreadable means nothing has been judged yet, not an error.
+    return { kept: {}, pruned: [] };
+  }
+}
+
+function writeWalksManifest(man) {
+  // A dry run leaves no state behind, or the next one would report on a corpus
+  // it had already made decisions about.
+  if (!PURGE_WALKS) return;
+  const pruned = man.pruned.length > MAX_PRUNED_RECORDED
+    ? man.pruned.slice(-MAX_PRUNED_RECORDED) : man.pruned;
+  try {
+    fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
+    fs.writeFileSync(WALKS_MANIFEST,
+      JSON.stringify({ at: Date.now(), kept: man.kept, pruned }, null, 1));
+  } catch (err) {
+    log(`Could not write ${path.relative(__dirname, WALKS_MANIFEST)}: ${err.message}`);
+  }
+}
+
+function noteWalk(name, pruned) {
+  if (!PURGE_WALKS) return;
+  const man = readWalksManifest();
+  if (pruned) {
+    delete man.kept[name];
+    man.pruned.push({ name, at: Date.now(), ...pruned });
+  } else {
+    man.kept[name] = Date.now();
+  }
+  writeWalksManifest(man);
+}
+
+// `announce` is off for the sweep, which has already printed the walk in its
+// table and would otherwise say it twice; a failure is always logged.
+function pruneWalk(dir, verdict, announce = true) {
+  const rel = path.relative(__dirname, dir);
+  if (!PURGE_WALKS) {
+    if (announce) log(`Null walk (dry run, would delete): ${rel} - ${describeWalk(verdict)}`);
+    return false;
+  }
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+  } catch (err) {
+    // A handle still open holds a Windows write lock. Say so and leave it;
+    // the next start will judge it again.
+    log(`Could not delete null walk ${rel}: ${err.message}`);
+    return false;
+  }
+  // A directory that disappears silently is worse than one that stays: the
+  // server log is the only place this decision is visible.
+  if (announce) log(`Null walk deleted: ${rel} - ${describeWalk(verdict)}`);
+  return true;
+}
+
+// Deferred, because the bulk and frames sockets are separate connections that
+// close in no fixed order around the main one and both write into this
+// directory, and because closePoseJournal's stream.end() is asynchronous.
+// Unref'd so a pending verdict never holds the process open.
+function pruneWalkLater(dir) {
+  const timer = setTimeout(() => {
+    const verdict = walkVerdict(dir);
+    if (!verdict) return;
+    const name = path.basename(dir);
+    if (verdict.keep) { noteWalk(name, null); return; }
+    if (pruneWalk(dir, verdict)) {
+      noteWalk(name, {
+        poseLines: verdict.poseLines,
+        captureBytes: verdict.captureBytes,
+        frameBytes: verdict.frameBytes,
+      });
+    }
+  }, WALK_PRUNE_DELAY_MS);
+  if (timer.unref) timer.unref();
+}
+
+// The corpus that accumulated before any of this existed, swept once at boot.
+// Safe to run unconditionally: no client socket exists yet, so nothing under
+// recordings/ is mid-write.
+function sweepWalks() {
+  let entries;
+  try { entries = fs.readdirSync(RECORDINGS_DIR, { withFileTypes: true }); } catch { return; }
+  const man = readWalksManifest();
+  const dirs = entries.filter(e => e.isDirectory() && !e.name.startsWith('.'));
+  // Judged names whose directory is gone, dropped so the manifest tracks the
+  // corpus rather than accumulating ghosts.
+  const live = new Set(dirs.map(e => e.name));
+  for (const name of Object.keys(man.kept)) if (!live.has(name)) delete man.kept[name];
+
+  const nulls = [];
+  const keeps = [];
+  let cached = 0;
+  for (const e of dirs) {
+    if (man.kept[e.name]) { cached++; continue; }
+    const dir = path.join(RECORDINGS_DIR, e.name);
+    const verdict = walkVerdict(dir);
+    if (!verdict) continue;
+    if (verdict.keep) { man.kept[e.name] = Date.now(); keeps.push({ name: e.name, verdict }); continue; }
+    nulls.push({ name: e.name, dir, verdict });
+  }
+  const kept = cached + keeps.length;
+
+  if (!nulls.length) { writeWalksManifest(man); return; }
+
+  // Every walk on both sides of the line, not a sample, and printed before
+  // anything is deleted: the report is how the rule is checked against the
+  // corpus by hand, and a truncated list is exactly where the walk that should
+  // not have been condemned would hide. It goes to server.log as well as the
+  // console, so it can be read after the fact — which, once deleting is on, is
+  // the only reading there will be.
+  //
+  // Both lists in date order, which is what the directory name sorts as: the
+  // corpus is remembered as sessions, and a walk is recognised by the afternoon
+  // it happened rather than by how much it recorded.
+  nulls.sort((a, b) => a.name.localeCompare(b.name));
+  keeps.sort((a, b) => a.name.localeCompare(b.name));
+  const nullRows = nulls.map(n => walkRow(n.name, n.verdict));
+  const keepRows = keeps.map(k => walkRow(k.name, k.verdict));
+  // One set of widths across both lists: the two are read against each other.
+  const w = walkWidths(nullRows.concat(keepRows));
+  log(`Recordings: ${nulls.length} of ${kept + nulls.length} walks are null `
+    + `(under ${MIN_WALK_POSE_LINES} obs, ${fmtBytes(MIN_WALK_CAPTURE_BYTES)} capture, `
+    + `${fmtBytes(MIN_WALK_FRAME_BYTES)} frames)`);
+  // Kept first, condemned last: the list that matters is the one still on
+  // screen when the scan stops.
+  if (keepRows.length) {
+    log(`  keeping ${kept}:`);
+    for (const r of keepRows) log(`  ${padWalkRow(r, w)}`);
+  }
+  log(`  deleting ${nulls.length}:`);
+  for (const r of nullRows) log(`  ${padWalkRow(r, w)}`);
+
+  if (!PURGE_WALKS) {
+    log('  dry run (SYNORA_PURGE_WALKS=0) - nothing deleted');
+    return;
+  }
+
+  let gone = 0;
+  for (const n of nulls) {
+    if (!pruneWalk(n.dir, n.verdict, false)) continue;   // locked; judged again next start
+    gone++;
+    man.pruned.push({
+      name: n.name,
+      at: Date.now(),
+      poseLines: n.verdict.poseLines,
+      captureBytes: n.verdict.captureBytes,
+      frameBytes: n.verdict.frameBytes,
+    });
+  }
+  log(`  deleted ${gone} of ${nulls.length}, kept ${kept}`);
+  writeWalksManifest(man);
+}
+
 function closeRecording(ws) {
   if (!ws.recordingStream) return;
   ws.recordingStream.end();
-  const mb = (ws.recordingBytes / (1024 * 1024)).toFixed(1);
-  log(`Recording saved: ${path.relative(__dirname, ws.recordingPath)} (${mb} MB)`);
+  log(`Recording saved: ${path.relative(__dirname, ws.recordingPath)} `
+    + `(${fmtBytes(ws.recordingBytes)})`);
   ws.recordingStream = null;
   ws.recordingPath = null;
   sendClients();
@@ -1429,6 +1760,10 @@ function main() {
       if (ws.role === 'client') {
         closeRecording(ws);
         closePoseJournal(ws);
+        // Before the displacement check below: a displaced socket's walk is its
+        // own directory — the socket that replaced it has a different one — and
+        // it is exactly the kind that turns out to hold nothing.
+        if (ws.sessionDir) pruneWalkLater(ws.sessionDir);
         // A reconnect of the same device may already own this id — its state
         // belongs to the new socket, so leave it alone.
         if (clients.get(ws.clientId) !== ws) return;
@@ -1463,6 +1798,8 @@ function main() {
   setInterval(() => {
     if (viewerSocket) sendClients();
   }, 1000);
+
+  sweepWalks();
 
   server.listen(PORT, () => {
     const ips = lanAddresses();
