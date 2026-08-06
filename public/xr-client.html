@@ -211,6 +211,7 @@
     #overlay.rot90 #transparentBtn, #overlay.rot270 #transparentBtn { order: 2; }
     #overlay.rot90 #fitBtn, #overlay.rot270 #fitBtn { order: 3; }
     #overlay.rot90 #mapBtn, #overlay.rot270 #mapBtn { order: 4; }
+    #overlay.rot90 #objBtn, #overlay.rot270 #objBtn { order: 5; }
     #overlay.rot90 #streamBtn, #overlay.rot270 #streamBtn { order: 6; }
     #overlay.rot90 #blankBtn, #overlay.rot270 #blankBtn { order: 7; }
     #overlay.rot90 #reportBtn, #overlay.rot270 #reportBtn { order: 8; }
@@ -314,6 +315,90 @@
     #overlay.rot270 #exitBtn {
       left: auto; right: calc(env(safe-area-inset-top, 0px) + 48px); top: 8px;
     }
+    /* The object readout: what the map says is in front of the camera right
+       now, one row per object, with a line to where each one is.
+
+       It answers the question this page could not — the map inset shows objects
+       from above, which says where they are in the room but never which thing in
+       front of you is which. The line is the whole point: a name on its own is a
+       claim about a room, a name with a line to a chair is a claim about that
+       chair, and the second one can be checked by looking.
+
+       Left edge, under the close box, which is where the top-left corner is free
+       in landscape — the chip owns the top right and the button column the right
+       edge. Portrait the chip is top left instead, so it starts lower. */
+    #objList {
+      position: absolute; z-index: 39;
+      left: 8px; right: 8px;
+      top: calc(env(safe-area-inset-top, 0px) + 150px);
+      max-width: 45%;
+      display: flex; flex-direction: column; align-items: flex-start;
+      gap: 3px;
+      font-family: ui-monospace, monospace;
+      font-size: 11px;
+      pointer-events: none;
+    }
+    /* Sideways the close box takes one end of the top edge and the list runs
+       under it, so the two share an inset — read off the *same* expression the
+       close box uses rather than a constant that happens to match, because it is
+       the same fact about the same status bar.
+
+       Android keeps its status bar on the phone's physical top edge whatever the
+       page's orientation lock says, and that edge is this box's left at rot90
+       and its right at rot270 — so which side needs the room swaps with the
+       turn, exactly as #exitBtn's does. The inset is taken from safe-area
+       *top* for the same reason it is there: the insets describe the unturned
+       screen, so top is the one that means "status bar" however far this has
+       been turned. */
+    #overlay.rot90 #objList {
+      top: 62px;
+      left: calc(env(safe-area-inset-top, 0px) + 48px);
+      right: 8px;
+    }
+    #overlay.rot270 #objList {
+      top: 62px;
+      left: 8px;
+      right: calc(env(safe-area-inset-top, 0px) + 48px);
+    }
+    #objList .obj {
+      display: flex; align-items: baseline; gap: 6px;
+      background: rgba(0, 0, 0, 0.62);
+      border-radius: 4px;
+      padding: 2px 6px;
+      white-space: nowrap;
+      /* The leader line leaves from this row's right edge, so a row that has
+         faded out must not still be an anchor. */
+      opacity: 1; transition: opacity 200ms linear;
+    }
+    /* A candidate is a position the map has but has not promoted, and it is
+       drawn the way the map draws it — dimmed. The difference is the status,
+       so it has to be visible without reading the numbers. */
+    #objList .obj.cand { opacity: 0.55; }
+    #objList .obj .name { color: #eee; }
+    #objList .obj .stat { color: #9a9a9a; }
+    /* How sure the *detector* was, which is a different question from how well
+       the map has placed the thing — and the one that catches a mislabel, since
+       a confidently-placed wrong label looks perfect by every other number on
+       the row. Coloured because two digits read at arm's length while walking
+       are not something anyone acts on. */
+    #objList .obj .conf { color: #7fbf7f; }
+    #objList .obj .conf.mid { color: #d8b45a; }
+    #objList .obj .conf.low { color: #e07a5f; }
+    /* The dot is the row's colour key, matching the line drawn from it: with
+       three chairs in the list, which line belongs to which row is otherwise
+       guesswork. */
+    #objList .obj .dot {
+      width: 7px; height: 7px; border-radius: 50%;
+      flex: none; align-self: center;
+    }
+    /* Full-bleed and behind the rows, since a line runs from a row to a point
+       that may be anywhere on screen. Never interactive. */
+    #objLines {
+      position: absolute; inset: 0; z-index: 38;
+      width: 100%; height: 100%;
+      pointer-events: none;
+      overflow: visible;
+    }
     /* Only while there is a map for them to act on. Carried on the row rather
        than on each button, because `.on` on a button is style.css's *toggled*
        state and would light these three green just for being visible. */
@@ -338,6 +423,12 @@
       <canvas id="mapCanvas"></canvas>
       <canvas id="camCanvas"></canvas>
       <div id="overlayText"><span id="overlayTextBody"></span></div>
+      <!-- The mapped objects the camera is currently pointing at, and a leader
+           line from each name to where it actually is. Before the button row in
+           the document so the controls draw over it: this is a readout, and a
+           readout must never take a tap meant for a control. -->
+      <svg id="objLines" aria-hidden="true"></svg>
+      <div id="objList"></div>
       <button id="exitBtn" type="button" title="End the XR session">✕</button>
       <div id="btnToast"><span></span></div>
       <!-- The map-only three first, so they appear and disappear at the end of
@@ -370,6 +461,20 @@
             <path d="M15.4 15.4L21 21"/>
             <path d="M10.5 7.5v6"/>
             <path d="M7.5 10.5h6"/>
+          </svg>
+        </button>
+        <!-- The object readout. A box round a thing with a leader off it, which
+             is a picture of exactly what the control draws. Not the map glyph's
+             neighbour by accident: this is the other view of the same data, the
+             room seen from where you are standing rather than from above. -->
+        <button id="objBtn" class="icon-btn" type="button"
+                title="Object labels" aria-label="Object labels">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="9.5" y="10.5" width="11" height="9" rx="1.5"/>
+            <path d="M9.5 12.5H4.5"/>
+            <path d="M3 5.5h8"/>
+            <path d="M3 8.5h5"/>
           </svg>
         </button>
         <!-- A folded paper map, the one glyph that is not a picture of what it
@@ -421,7 +526,10 @@
   <script src="/media-tx.js"></script>
   <script src="/cv-common.js"></script>
   <script src="/pose-math.js"></script>
-  <script src="/detect-core.js"></script>
+  <script src="/frame-wire.js"></script>
+  <!-- No detect-core.js: the detector runs in the worker and nowhere else on
+       this page. It used to be here for an on-page fallback that cost half the
+       frame rate — see ensureDetectWorker. -->
   <script src="/anim.js"></script>
   <script src="/map2d.js"></script>
   <script src="/room-feed.js"></script>
