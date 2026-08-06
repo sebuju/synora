@@ -795,6 +795,13 @@ function roomAxisColorCss(k) {
 function roomTagColorCss(id) {
   return `hsl(${(id * 137.5) % 360}, 62%, 40%)`;
 }
+
+// The anchor is the datum rather than a measurement, and the gold is what says
+// so — it stands outside the hue walk on every surface that draws tags (the 2D
+// map's bar and chip, the 3D card, the drawer's dot). One constant because
+// three copies of a colour whose whole job is "this one is not like the others"
+// is exactly the kind of thing that drifts.
+const ROOM_ANCHOR_COLOR_CSS = '#d4b34c';
 const ROOM_POSE_STALE_MS = 2000;
 
 // A carry report has no detection behind it, so its empty tag list is not a
@@ -893,13 +900,15 @@ function forgetTagSettle(id) {
   roomSettleHist.delete(id);
 }
 
-// What a surface uses to say "the survey is not done with this one". The
-// drawer paints a dot, the 2D map outlines the tag's id chip; nothing at all is
-// the resting state, so a mark always means go and look.
+// What a surface uses to say "the survey is not done with this one". Both the
+// drawer and the 2D map ring the thing rather than recolouring it — the drawer
+// outlines the whole card, the map the tag's id chip — leaving the tag's own
+// colour to say *which* tag it is; nothing at all is the resting state, so a
+// mark always means go and look.
 //
-// Amber because that is what `.warn` and `.dot.warn` already are in style.css —
-// the two must not drift, and the map draws to a canvas and cannot read the
-// stylesheet. It does sit near the anchor's gold (`#d4b34c`) and the guide's
+// Amber because that is what `.warn` and `.drawer-card.tag.settling` already
+// are in style.css — the two must not drift, and the map draws to a canvas and
+// cannot read the stylesheet. It does sit near the anchor's gold and the guide's
 // (`#ffd166`), which is survivable only because the anchor is `datum` and never
 // carries this mark: the two can never appear on the same glyph.
 const ROOM_SETTLING_CSS = '#e0a03a';

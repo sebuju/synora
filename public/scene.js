@@ -47,7 +47,7 @@ function createSceneView(canvas) {
   const clients = new Map();     // clientId -> { group, cone, label, target, at, colorHex }
   const GREY = new THREE.Color(0x555555);
   const TAG_COLOR = new THREE.Color(0xcccccc);
-  const ANCHOR_COLOR = new THREE.Color(0xd4b34c);
+  const ANCHOR_COLOR = new THREE.Color(ROOM_ANCHOR_COLOR_CSS);
   const HOVER_COLOR = new THREE.Color(0xffffff);
   // Pointer feedback, quicker than the other fades — matches map2d's HOVER_MS.
   const HOVER_MS = 120;
@@ -180,7 +180,7 @@ function createSceneView(canvas) {
         const quad = new THREE.Mesh(
           new THREE.PlaneGeometry(size, size),
           new THREE.MeshBasicMaterial({
-            color: anchor ? 0xd4b34c : 0xcccccc, side: THREE.DoubleSide,
+            color: anchor ? ANCHOR_COLOR : TAG_COLOR, side: THREE.DoubleSide,
             transparent: true, opacity: 0,
           }));
         const label = makeTextSprite(String(m.id), '#eee');

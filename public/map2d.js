@@ -1167,7 +1167,7 @@ function createMap2dView(canvas, mode = 'top', {
       // chip reads as a name for exactly that mark. The anchor keeps its
       // gold — it is the datum, and the gold is what says so. It crossfades:
       // the anchor moving is a change of datum, worth seeing happen.
-      const tagColor = animMixCss(roomTagColorCss(id), '#d4b34c', m.anchorMix);
+      const tagColor = animMixCss(roomTagColorCss(id), ROOM_ANCHOR_COLOR_CSS, m.anchorMix);
       const hot = m.hot;
       // A halo under the stroke rather than a different colour on it: the tag
       // colour is the tag's identity here and in the drawer, and swapping it to
