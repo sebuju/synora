@@ -850,10 +850,21 @@ function tagSettleState(tag, anchorId) {
     // holding the phone to the right problem.
     return tag.checkedAtMs ? 'disputed' : 'unchecked';
   }
-  const prev = roomSettleHist.get(tag.id);
   const now = Date.now();
-  const moved = !prev
-    || Math.hypot(tag.p[0] - prev.p[0], tag.p[1] - prev.p[1], tag.p[2] - prev.p[2]) > ROOM_SETTLE_MOVE_M
+  // First sight of this tag — a viewer that has just loaded, or a tag promoted
+  // a moment ago. Nobody has seen it move, and starting its clock at `now` is a
+  // claim that it moved this instant: that is what made every tag on a reloaded
+  // viewer read as settling for a full window while the room stood still. The
+  // history is a browser-side artefact of watching, not a property of the tag,
+  // and the resting state here is *nothing at all* — so the baseline is seeded
+  // as though the tag had already been still for a window. A movement anyone
+  // actually observes restarts the clock below, for real.
+  if (!roomSettleHist.has(tag.id)) {
+    roomSettleHist.set(tag.id, { p: tag.p, q: tag.q, stillAtMs: now - ROOM_SETTLE_WINDOW_MS });
+  }
+  const prev = roomSettleHist.get(tag.id);
+  const moved
+    = Math.hypot(tag.p[0] - prev.p[0], tag.p[1] - prev.p[1], tag.p[2] - prev.p[2]) > ROOM_SETTLE_MOVE_M
     || quatAngleDeg(tag.q, prev.q) > ROOM_SETTLE_MOVE_DEG;
   // The baseline is the pose as of the last *detected move*, and it is left
   // alone until then — so the question asked is "how long since it moved a
@@ -864,8 +875,11 @@ function tagSettleState(tag, anchorId) {
   // read as settled throughout on the map while the drawer called it settling.
   if (moved) roomSettleHist.set(tag.id, { p: tag.p, q: tag.q, stillAtMs: now });
   const stillAtMs = moved ? now : prev.stillAtMs;
-  // Tiny residual settles it immediately — otherwise a freshly opened viewer
-  // calls an obviously converged tag unsettled for the first window.
+  // Tiny residual settles it whatever the clock says: there is nothing left for
+  // refinement to correct, so a tag still being nudged by micrometres is not a
+  // tag anyone should be sent to go and look at. (It was also the cover for a
+  // freshly opened viewer calling a converged tag unsettled — that hole is the
+  // seeded baseline's job now, and this is left as the claim it always was.)
   const settled = (tag.resid ?? 0) <= 0.005 && (tag.residDeg ?? 0) <= 1
     || now - stillAtMs >= ROOM_SETTLE_WINDOW_MS;
   return settled ? 'settled' : 'settling';
