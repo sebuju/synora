@@ -554,6 +554,26 @@ function solvePose(objPts, imgPts, K, seed, { maxIter = 60 } = {}) {
   return { p, q, rms: Math.sqrt(cost / n) };
 }
 
+// The room<-session transform implied by one paired (session pose, room pose).
+//
+// Both frames are gravity-aligned — ARCore's session frame by definition, the
+// room frame to about 2 degrees — so the whole transform is a yaw and a
+// translation, four numbers. Three places need it and it must be one
+// implementation: the phone recovers it to draw the object readout, the server
+// recovers it to say how far a shape-derived fix sits from the survey's own, and
+// `replay-objects.js` recovers it as the ground truth its carry error is
+// measured against. Two of those disagreeing about the sign of a yaw is not a
+// bug anything downstream could see.
+function sessionAlignment(xr, roomPose) {
+  if (!xr?.p || !xr?.q || !roomPose?.p || !roomPose?.q) return null;
+  const q = quatMul(roomPose.q, quatConj(xr.q));
+  const yaw = 2 * Math.atan2(q[1], q[3]);
+  const c = Math.cos(yaw);
+  const s = Math.sin(yaw);
+  const rp = [c * xr.p[0] + s * xr.p[2], xr.p[1], -s * xr.p[0] + c * xr.p[2]];
+  return { yaw, t: [roomPose.p[0] - rp[0], roomPose.p[1] - rp[1], roomPose.p[2] - rp[2]] };
+}
+
 if (typeof module !== 'undefined') {
   module.exports = {
     quatFromRvec, rvecFromQuat, quatMul, quatConj, quatNormalize, quatRotate,
@@ -561,6 +581,6 @@ if (typeof module !== 'undefined') {
     se3Invert, se3Identity, transformPoint, segIntersect2D, quatFromTo, solvePose,
     matFromRvec, rvecFromMat, matMul3, mirrorRvecGuesses,
     tagPlaneAgreement, CLIP_PLANE_M, CLIP_PARALLEL_COS,
-    rotationWarp, applyWarp,
+    rotationWarp, applyWarp, sessionAlignment,
   };
 }
