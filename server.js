@@ -1494,8 +1494,12 @@ function applyDetections(hit, sizes, dets) {
   // below runs. That asymmetry is the point: one of these two answers "where is
   // that object", the other answers "where am I", and only the first needs the
   // survey to have already succeeded.
+  // detection -> the map entry it was associated to, for the debug push below.
+  // Empty without a room pose, which is the honest answer: with no camera
+  // position nothing was associated to anything this frame.
+  let assigned = new Map();
   if (hit.pose) {
-    const { changed } = objects.observe({
+    const { changed, assigned: got } = objects.observe({
       sid: hit.sid, at: hit.at, pose: hit.pose, K: hit.K,
       camW: hit.camW, camH: hit.camH,
       frameW: sizes.w ?? sizes.header?.w, frameH: sizes.h ?? sizes.header?.h, dets,
@@ -1505,6 +1509,7 @@ function applyDetections(hit, sizes, dets) {
       // evidence.
       tags: hit.tags,
     });
+    assigned = got;
     if (changed) scheduleObjectsPush();
   }
   // The debug push. Off by default and skipped for a socket with a backlog —
@@ -1514,7 +1519,26 @@ function applyDetections(hit, sizes, dets) {
   const ws = clients.get(hit.clientId);
   if (!ws || ws.bufferedAmount > ROOM_BULK_BACKLOG) return;
   const outlines = dets.filter((d) => d.outline).map((d) => ({ cls: d.cls, ...d.outline }));
-  if (!outlines.length) return;
+  // The boxes as the detector drew them, in the frame's own pixels, each tagged
+  // with the map entry it was associated to.
+  //
+  // **Only the detections the map took.** The raw stream is the whole
+  // vocabulary at a 0.35 score floor — 80 classes or 365 — and the map accepts
+  // 18 or 28 of them, refuses anything explained by a printed tag, and refuses
+  // anything clipped at the sides of the frame. Pushing the raw stream put
+  // boxes on screen for things that are in no list and never will be, which
+  // reads as the map having lost them rather than never having wanted them.
+  // The id is what lets the phone go further and draw only what its own list is
+  // showing, and draw it in that row's colour.
+  //
+  // This is the one overlay that cannot be in the wrong *place*: the box is the
+  // recogniser's own answer replayed through the camera model that produced it,
+  // so it lands on the object however wrong the map is about where the object
+  // is. Stale by a detection round trip, and that is the whole of its error.
+  const boxes = dets.filter((d) => assigned.has(d)).map((d) => ({
+    cls: d.cls, score: d.score, box: d.box, id: assigned.get(d),
+  }));
+  if (!outlines.length && !boxes.length) return;
   // Which test refused, carried with the refusal. "No fix" was as far as the
   // phone could see, and a refusal that cannot name its own test is one nobody
   // can act on while standing in front of the object it refused — which is the
@@ -1531,6 +1555,7 @@ function applyDetections(hit, sizes, dets) {
     // survey has nothing and this is the only answer there is".
     localized: !!hit.pose,
     outlines,
+    boxes,
     fix,
     why: fix ? null : (note.why || null),
   });

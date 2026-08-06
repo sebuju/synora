@@ -447,8 +447,9 @@ function costLine() {
     + (c.blocked ? ` · ${c.blocked} late` : '');
 }
 
-// The last `obj-shape` push from the PC: the outlines it fitted in one of this
-// phone's own frames, and the camera pose they imply. Off unless the debug
+// The last `obj-shape` push from the PC: what the detector found in one of this
+// phone's own frames — every box, plus the outlines fitted inside the ones that
+// had a shape to fit — and the camera pose they imply. Off unless the debug
 // setting is on, and empty is the resting state.
 let lastShapeMsg = null;
 // How long a pushed outline is worth drawing. It already describes a frame a
@@ -1212,26 +1213,37 @@ function projectCameraPixel(u, v, intr, view) {
   return c ? viewportToOverlay(c) : null;
 }
 
-// The outline the PC actually fitted, drawn where it was fitted.
+// What the detector found, drawn where it found it — for the objects the list
+// beside it is naming, and no others.
 //
-// **Behind a debug setting, in its own colour, and labelled** — because it is
-// stale by construction. It describes a frame that left this phone a third of a
-// second ago in a view that has since moved, so it is useful for judging the
-// fitter and worthless as a claim about where anything is. The projected map
-// shape beside it is the claim; these two must never be confused, which is the
-// whole reason this one does not borrow the object's colour.
+// **This is the only overlay on this page that cannot be in the wrong place.**
+// The box and the outline arrive in the pixels of a frame this phone sent, and
+// `projectCameraPixel` puts a frame pixel back on the screen through the camera
+// model that produced it — so the drawing is right whatever the map believes.
+// It costs the one thing it cannot avoid: the round trip. The frame left ~300 ms
+// ago and the view has moved since, so everything here lags a moving camera and
+// is exact for a still one. That is a fair trade and the map's version of the
+// same picture was not: it is current every frame and lands beside the object,
+// because a position triangulated from bearings is a claim about the room and
+// this is a claim about the image.
+//
+// The outline keeps its own pale dashed stroke rather than the class colour —
+// the box says *what*, the outline says what shape was fitted inside it, and one
+// of the two being able to fail on its own is the point of drawing both.
 const SHAPE_DEBUG_COLOUR = '#e8e8e8';
+// Under the label text, so a box edge never runs through its own name.
+const DET_LABEL_PAD = 3;
 let shapeDebugEls = null;
 
 function drawShapeDebug(view) {
   const m = lastShapeMsg;
   const live = m && lastIntr && performance.now() - m.at <= SHAPE_DEBUG_MS
-    && m.w > 0 && m.outlines?.length;
+    && m.w > 0 && (m.outlines?.length || m.boxes?.length);
   if (!shapeDebugEls) {
     if (!live) return;
     const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
     objLines.append(g);
-    shapeDebugEls = { g, polys: [] };
+    shapeDebugEls = { g, polys: [], boxes: [] };
   }
   if (!live) { shapeDebugEls.g.style.display = 'none'; return; }
   shapeDebugEls.g.style.display = '';
@@ -1240,7 +1252,7 @@ function drawShapeDebug(view) {
   // every bearing in the map already stands on.
   const s = lastIntr.w / m.w;
   const rings = [];
-  for (const o of m.outlines) {
+  for (const o of m.outlines || []) {
     const pts = [];
     if (o.kind === 'ellipse') {
       const c = Math.cos(o.theta);
@@ -1257,6 +1269,25 @@ function drawShapeDebug(view) {
     const at = pts.map((p) => projectCameraPixel(p[0], p[1], lastIntr, view)).filter(Boolean);
     if (at.length >= 3) rings.push(at);
   }
+  // Four corners projected one at a time, not two corners and a rectangle: the
+  // overlay is turned by whatever quarter turn the phone is held at, and a
+  // rectangle built from a projected min and max would be the axis-aligned
+  // bounding box of the turned box rather than the box.
+  const quads = [];
+  for (const d of m.boxes || []) {
+    // **The same objects the list is showing, and nothing else.** A detection
+    // the map refused has no id and never gets here; one the map took but this
+    // page is not listing — no position yet, out of view when the list was
+    // built, or stale — is dropped here. The list answers what is being seen and
+    // the box says where it is on screen; two different answers to that would be
+    // the readout contradicting itself in the same glance.
+    if (!objRows.has(d.id)) continue;
+    const [x0, y0, x1, y1] = d.box;
+    const at = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+      .map((p) => projectCameraPixel(p[0] * s, p[1] * s, lastIntr, view));
+    if (at.some((p) => !p)) continue;      // a corner behind the eye: no box to draw
+    quads.push({ at, d });
+  }
   while (shapeDebugEls.polys.length < rings.length) {
     const el = document.createElementNS('http://www.w3.org/2000/svg', 'polygon');
     el.setAttribute('stroke', SHAPE_DEBUG_COLOUR);
@@ -1266,11 +1297,56 @@ function drawShapeDebug(view) {
     shapeDebugEls.g.append(el);
     shapeDebugEls.polys.push(el);
   }
+  while (shapeDebugEls.boxes.length < quads.length) {
+    const poly = document.createElementNS('http://www.w3.org/2000/svg', 'polygon');
+    poly.setAttribute('stroke-width', '2');
+    poly.setAttribute('fill', 'none');
+    const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+    text.setAttribute('font-size', '13');
+    text.setAttribute('font-weight', '600');
+    // Outlined in the page's own dark, because this is drawn over passthrough:
+    // a lit wall and a white wall are both backgrounds this text has to survive.
+    text.setAttribute('stroke', '#000');
+    text.setAttribute('stroke-width', '3');
+    text.setAttribute('paint-order', 'stroke');
+    shapeDebugEls.g.append(poly, text);
+    shapeDebugEls.boxes.push({ poly, text });
+  }
   shapeDebugEls.polys.forEach((el, i) => {
     if (i >= rings.length) { el.style.display = 'none'; return; }
     el.style.display = '';
     el.setAttribute('points',
       rings[i].map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' '));
+  });
+  shapeDebugEls.boxes.forEach((el, i) => {
+    if (i >= quads.length) {
+      el.poly.style.display = 'none';
+      el.text.style.display = 'none';
+      return;
+    }
+    const { at, d } = quads[i];
+    // The object's own colour, which is the colour of its dot in the list — the
+    // only thing tying a box on the room to a row beside it, now that neither
+    // draws a leader to the other. Per object and not per class on purpose: two
+    // chairs are two rows and have to be two boxes.
+    const colour = objColour(d.id);
+    el.poly.style.display = '';
+    el.poly.setAttribute('stroke', colour);
+    el.poly.setAttribute('points',
+      at.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' '));
+    // Off the corner nearest the top left of the *screen*, which is a different
+    // corner of the box at every quarter turn — the text is upright in the
+    // overlay's own space and has to be anchored in that space too.
+    const lx = Math.min(...at.map((p) => p.x));
+    const ly = Math.min(...at.map((p) => p.y));
+    const label = `${String(d.cls).toUpperCase()} ${Math.round((d.score || 0) * 100)}%`;
+    el.text.style.display = '';
+    el.text.setAttribute('fill', colour);
+    el.text.setAttribute('x', lx.toFixed(1));
+    // Above the box, or inside its top edge when there is no room above — a
+    // label off the top of the screen is a label that is not there.
+    el.text.setAttribute('y', (ly > 16 ? ly - DET_LABEL_PAD : ly + 14).toFixed(1));
+    if (el.text.textContent !== label) el.text.textContent = label;
   });
 }
 
@@ -1299,10 +1375,6 @@ const objRows = new Map();      // id -> { row, dot, name, stat, conf }
 let objOrder = '';
 
 function updateObjectList(view) {
-  // The live fitted outline, when the debug push is on. Drawn whether or not
-  // the object readout is — it is a check on the *fitter*, and the map's own
-  // shapes being switched off says nothing about that.
-  drawShapeDebug(view);
   const objs = objOn ? roomFeed.getObjects()?.objects : null;
   const seen = new Set();
   if (objs && roomFromSession && overlayRot.clientWidth) {
@@ -1391,6 +1463,11 @@ function updateObjectList(view) {
     objRows.delete(id);
     objOrder = '';        // the kept order no longer describes the list
   }
+  // **Last, and not first.** The boxes are drawn only for the objects this list
+  // is showing, so the list has to have been settled for this frame before they
+  // can be filtered against it — drawn first, every box would be answering to
+  // the previous frame's rows.
+  drawShapeDebug(view);
 }
 
 function cvPose(transform) {
