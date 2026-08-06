@@ -41,6 +41,38 @@ const AXIS_GIZMO_LABEL_PX = 14;
 const AXIS_GIZMO_TEXT_PX = 7;
 const AXIS_GIZMO_PAD = 12;
 
+// Label text. One constant because the dodge, the obstacle test and the drawing
+// all have to be measuring the same font.
+const LABEL_FONT = '12px ui-monospace, monospace';
+
+// Room y, the one axis that means something without knowing the room frame's
+// convention. Written as an arrow and a magnitude — `↑0.38`, `↓0.73` — where x
+// and z are written as a letter and a signed number. The floor plan collapses
+// exactly this axis, which is how a clock 0.38 m up the wall and a plant 0.73 m
+// down on the floor came to be drawn on the same spot; the arrow is what tells
+// those apart at a glance, where `y +0.38` has to be read. One formatter for
+// every coordinate this file prints, so nothing that names a position can
+// disagree with anything else about how a number is spelled.
+// A screen point carried back into the space the drawing was turned in, about
+// the middle of the canvas. Module level because both users need it and neither
+// can borrow the other's: the draw pass has one for the few marks that belong
+// to the canvas rather than to the room, and the pointer readout needs the same
+// inverse after the frame is over and those locals are gone.
+function unrotateScreen(sx, sy, w, h, rot) {
+  if (Math.abs(rot) <= 1e-4) return [sx, sy];
+  const c = Math.cos(rot);
+  const s = Math.sin(rot);
+  const dx = sx - w / 2;
+  const dy = sy - h / 2;
+  return [w / 2 + dx * c + dy * s, h / 2 - dx * s + dy * c];
+}
+
+const AXIS_UP = 1;
+function fmtAxis(axis, v) {
+  if (axis === AXIS_UP) return `${v >= 0 ? '↑' : '↓'}${Math.abs(v).toFixed(2)}`;
+  return `${ROOM_AXIS_NAMES[axis]} ${v.toFixed(2)}`;
+}
+
 function createMap2dView(canvas, mode = 'top', {
   onHover, raf, maxPixels, pairsFocusOnly,
 } = {}) {
@@ -381,6 +413,27 @@ function createMap2dView(canvas, mode = 'top', {
     return null;
   }
 
+  // Where the pointer is, in canvas pixels, and the transform the last frame was
+  // drawn with. Screen coordinates are kept rather than room ones and converted
+  // at draw time: a pan or a zoom under a pointer that never moved changes what
+  // it is over, and a readout frozen until the mouse twitches is a readout that
+  // lies while the map is being driven.
+  let pointerPx = null;
+  let lastXf = null;
+
+  // A canvas point in room coordinates, as the pair of axes this view keeps.
+  // The inverse of the draw pass, in its order: out of the rotation first, then
+  // out of `toPx`. Null before the first frame, when there is no transform to
+  // invert.
+  function screenToRoom(sx, sy) {
+    if (!lastXf) return null;
+    const {
+      ca, cb, scale, w, h, rot,
+    } = lastXf;
+    const [x, y] = unrotateScreen(sx, sy, w, h, rot);
+    return [(x - w / 2) / scale + ca, orient * (y - h / 2) / scale + cb];
+  }
+
   // What the pointer was last reported to be over, so a move across one tag
   // does not repaint the drawer four hundred times.
   let reportedHover = '';
@@ -402,6 +455,11 @@ function createMap2dView(canvas, mode = 'top', {
   }
 
   canvas.addEventListener('pointermove', (ev) => {
+    // Before the drag branch below returns: the readout has to keep up while
+    // the paper is being pushed around, which is when a reading is most likely
+    // to be wanted.
+    pointerPx = [ev.offsetX, ev.offsetY];
+    schedule();
     if (!drag) {
       const tagId = markerAt(ev.offsetX, ev.offsetY);
       const clientId = tagId === null ? clientAt(ev.offsetX, ev.offsetY) : null;
@@ -428,7 +486,11 @@ function createMap2dView(canvas, mode = 'top', {
     schedule();
   });
 
-  canvas.addEventListener('pointerleave', () => reportHover(null));
+  canvas.addEventListener('pointerleave', () => {
+    pointerPx = null;
+    reportHover(null);
+    schedule();
+  });
   const endDrag = (ev) => {
     if (!drag || drag.id !== ev.pointerId) return;
     canvas.releasePointerCapture(ev.pointerId);
@@ -880,6 +942,11 @@ function createMap2dView(canvas, mode = 'top', {
     spanB = h / scale;
     const toPx = (a, b) => [(a - ca) * scale + w / 2, orient * (b - cb) * scale + h / 2];
     const px = (p) => toPx(...proj(p));
+    // The transform this frame was drawn with, kept so a pointer can be carried
+    // back through it after the frame is over. Taken from `shown` — the eased
+    // view, which is what is on screen — and never from `view`: mid-pan the two
+    // disagree by exactly the distance the readout would then be wrong by.
+    lastXf = { ca, cb, scale, w, h, rot: viewRot };
 
     // Cleared, not just painted over: a transparent backdrop has to actually
     // erase the last frame, and the fill below is what makes it opaque again.
@@ -910,14 +977,7 @@ function createMap2dView(canvas, mode = 'top', {
     // Screen point -> the turned-space point that lands on it: the inverse of
     // the transform above, for the few things that belong to the canvas rather
     // than to the room and still have to be drawn in this space.
-    const unturn = (sx, sy) => {
-      if (!turned) return [sx, sy];
-      const c = Math.cos(viewRot);
-      const s = Math.sin(viewRot);
-      const dx = sx - w / 2;
-      const dy = sy - h / 2;
-      return [w / 2 + dx * c + dy * s, h / 2 - dx * s + dy * c];
-    };
+    const unturn = (sx, sy) => unrotateScreen(sx, sy, w, h, turned ? viewRot : 0);
 
     // Attested free space, under everything: it is the claim the rest of the
     // drawing stands on. Only the floor plan can show it — the side view has
@@ -966,7 +1026,7 @@ function createMap2dView(canvas, mode = 'top', {
       ctx.globalAlpha = 1;
     }
 
-    ctx.font = '12px ui-monospace, monospace';
+    ctx.font = LABEL_FONT;
     ctx.textAlign = 'center';
 
     // Room axes as a corner gizmo, in the 3D scene's colours. Not at the room
@@ -1455,6 +1515,31 @@ function createMap2dView(canvas, mode = 'top', {
     labelRot = -viewRot;
     flushLabels();
     if (turned) ctx.restore();
+
+    // Where the pointer is, in room metres. The map is a picture of a measured
+    // room and there was no way to ask it what a spot *is* — reading a position
+    // off it meant hovering something that already had a label.
+    //
+    // Outside the turn and after the labels, in plain canvas pixels: this
+    // belongs to the canvas rather than to the room, and a reading that rode a
+    // heading-up rotation would be sideways exactly when the map is in use. One
+    // line per axis this view keeps, in the corner gizmo's own colours, so the
+    // two agree about which letter is which direction — the gizmo says where
+    // the axes point, this says how far along them the pointer is.
+    if (pointerPx) {
+      const at = screenToRoom(pointerPx[0], pointerPx[1]);
+      if (at) {
+        ctx.textAlign = 'right';
+        const rx = w - AXIS_GIZMO_PAD;
+        let ry = AXIS_GIZMO_PAD + 10;
+        [axisA, axisB].forEach((axis, i) => {
+          ctx.fillStyle = roomAxisColorCss(axis);
+          ctx.fillText(fmtAxis(axis, at[i]), rx, ry);
+          ry += 15;
+        });
+        ctx.textAlign = 'center';
+      }
+    }
     schedule();
   }
 
