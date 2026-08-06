@@ -1231,12 +1231,11 @@ function createMap2dView(canvas, mode = 'top', {
       // where a tag is going to be detaches from the tag it belongs to.
       const ap = markers.get(a.id)?.pos || a.p;
       const bp = markers.get(b.id)?.pos || b.p;
-      // A leg is a statement about two tags, so it is only as present as the
-      // less present of them.
-      const legAlpha = pairsAlpha * focusFade
-        * Math.min(markers.get(a.id)?.fade ?? 1, markers.get(b.id)?.fade ?? 1);
-      if (legAlpha <= 0.01) continue;
-      ctx.globalAlpha = legAlpha;
+      // A leg is a statement about two tags, so it is on screen only while both
+      // of them are. Presence is the whole of it: a leg is a measurement, and a
+      // half-faded number reads as a less certain one, which it never is.
+      if (Math.min(markers.get(a.id)?.fade ?? 1, markers.get(b.id)?.fade ?? 1) <= 0.01) continue;
+      ctx.globalAlpha = 1;
       // The elbow: by default b's across-screen axis and a's up-screen one, the
       // other way round where that is the corner that keeps the legs out of the
       // walls (see chooseElbows). Built off this view's own axis pair rather
@@ -1268,7 +1267,7 @@ function createMap2dView(canvas, mode = 'top', {
         // Back through the scale rather than from the world points: the leg is
         // axis-aligned on screen, so its pixel length is its world length.
         queueLabel(`leg:${a.id}-${b.id}-${leg}`, (len / scale).toFixed(2),
-          (x1 + x2) / 2, (y1 + y2) / 2 - 3, legColor, labelBg, legAlpha);
+          (x1 + x2) / 2, (y1 + y2) / 2 - 3, legColor, labelBg, 1);
       });
     }
     ctx.globalAlpha = 1;
