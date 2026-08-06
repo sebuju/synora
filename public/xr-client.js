@@ -79,6 +79,13 @@ let session = null;
 // began.
 let sessionId = null;
 let refSpace = null;
+// Which reference space was actually granted, as a string, for the report.
+// 'local-floor' puts the session's y=0 on the floor and 'local' puts it at the
+// start pose — a metre and a half apart, and nothing downstream could tell
+// which it had been given. Measured over the existing corpus the camera's
+// session y sits around 0.25 m, which is the start-pose answer, so this is not
+// a hypothetical: anything wanting a floor has to know which it got.
+let refSpaceKind = null;
 let viewerSpace = null;
 let gl = null;
 let binding = null;
@@ -866,8 +873,12 @@ async function start() {
   await gl.makeXRCompatible();
   session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
   binding = new XRWebGLBinding(session, gl);
+  refSpaceKind = 'local-floor';
   refSpace = await session.requestReferenceSpace('local-floor')
-    .catch(() => session.requestReferenceSpace('local'));
+    .catch(() => {
+      refSpaceKind = 'local';
+      return session.requestReferenceSpace('local');
+    });
   // 'local'/'local-floor' are world-locked: locating the viewer in them is
   // exactly what ARCore stops being able to do when tracking drops, which is
   // why getViewerPose returns null. The 'viewer' space is defined relative to
@@ -893,6 +904,7 @@ async function start() {
     session = null;
     sessionId = null;
     camInfo = null;
+    refSpaceKind = null;
     // The cost window belongs to the session that was measured; carried over,
     // the next session's first reports would describe the last one's.
     costMeter.reset();
@@ -1336,6 +1348,10 @@ function reportDetection(meta, res) {
     // at nothing.
     mode: res.mode,
     scanned: res.scanned,
+    // Which reference space the session actually got. Additive, and nothing in
+    // the survey, the walls grid or the XR alignment reads it — old journals
+    // replay bit-identically, which is the standing gate here.
+    refSpace: refSpaceKind,
     // What the loop is costing, for the same reason and read the same way: the
     // only surface this page has is behind an immersive session, so a claim
     // about what a feature costs here has to come out of the journal rather
