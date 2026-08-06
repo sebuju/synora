@@ -1172,27 +1172,13 @@ function grabDepth(frame, view) {
   };
 }
 
-// Depth at a camera-image pixel, metres along the view z, or null. The pixel
-// is normalized against the camera frame (the camera shares the view
-// frustum), pushed through normDepthBufferFromNormView, and read from the
-// copied buffer — the lookup getDepthInMeters performs, done by hand because
-// the frame is gone by sampling time. Convention risk worth naming: the
-// normalized coordinates are taken top-left-origin like the image's own; if
-// ARCore means the other Y, replay-depth.js will show it instantly as errors
-// that mirror with screen height, which is precisely what the measurement is
-// for.
-function depthAt(d, u, v, w, h) {
-  if (!d) return null;
-  const nx = u / w;
-  const ny = v / h;
-  const bx = d.m[0] * nx + d.m[4] * ny + d.m[12];
-  const by = d.m[1] * nx + d.m[5] * ny + d.m[13];
-  if (!(bx >= 0 && bx < 1 && by >= 0 && by < 1)) return null;
-  const ix = Math.min(d.w - 1, Math.floor(bx * d.w));
-  const iy = Math.min(d.h - 1, Math.floor(by * d.h));
-  const metres = d.data[iy * d.w + ix] * d.scale;
-  return Number.isFinite(metres) && metres > 0 ? Math.round(metres * 1000) / 1000 : null;
-}
+// Depth at a camera-image pixel, metres along the view z, or null.
+//
+// The lookup itself is `depthAtPixel` in frame-wire.js, because the server
+// samples the same maps at box centres and two copies of this convention would
+// be two chances to disagree about which way Y runs. This page keeps only the
+// name it has always used.
+const depthAt = depthAtPixel;
 
 // `pose` is the camera's pose in the XR session frame, or null when ARCore has
 // no world track. Null is not an error: it selects the tag-only report, the
