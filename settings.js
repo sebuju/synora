@@ -102,6 +102,19 @@ function coerce(spec, raw) {
     if (typeof raw !== 'boolean') return { error: `${spec.key} must be true or false` };
     return { value: raw };
   }
+  if (spec.type === 'string') {
+    // A closed set declared in the schema, never an open string. Two reasons,
+    // both load-bearing: this module deliberately knows nothing about what a
+    // setting does and must not go looking at the filesystem to validate one,
+    // and the only string setting so far becomes a path — a fixed list cannot
+    // contain a separator, so a hand-edited settings file cannot turn into a
+    // way to read something outside models/.
+    if (typeof raw !== 'string') return { error: `${spec.key} must be a string` };
+    if (!spec.values?.includes(raw)) {
+      return { error: `${spec.label} must be one of: ${(spec.values || []).join(', ')}` };
+    }
+    return { value: raw };
+  }
   const v = Number(raw);
   if (!Number.isFinite(v)) return { error: `${spec.key} must be a number` };
   if (v < spec.min || v > spec.max) {
