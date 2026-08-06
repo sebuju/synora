@@ -41,6 +41,11 @@ const AXIS_GIZMO_LABEL_PX = 14;
 const AXIS_GIZMO_TEXT_PX = 7;
 const AXIS_GIZMO_PAD = 12;
 
+// Half the end tick on a dimension bar, in screen pixels. Fixed rather than on
+// the world scale: it is punctuation saying "this is a length", not part of the
+// length being read.
+const BAR_TICK_PX = 3;
+
 // Label text, and the second line some labels carry under it. The sub line is
 // smaller and set in the same family: it is the same label continued, not a
 // second label, and at equal size the two lines read as two marks.
@@ -51,14 +56,22 @@ const LABEL_SUB_FONT = '10px ui-monospace, monospace';
 // the obstacle tests are measured in.
 const LABEL_SUB_DY = 11;
 
+// Pixels per metre past which an object's label carries its measurements as a
+// second line. Absolute rather than a multiple of the current fit: what a second
+// line needs is room on screen between one object and the next, and that is a
+// distance in pixels — a fit-relative rule would open the detail on a zoomed-out
+// phone and hold it shut on a zoomed-in monitor. At 250 px/m the four objects on
+// one wall of this room stand about a label-width apart.
+const OBJ_DETAIL_PX_PER_M = 250;
+
 // Room y, the one axis that means something without knowing the room frame's
 // convention. Written as an arrow and a magnitude — `↑0.38`, `↓0.73` — where x
 // and z are written as a letter and a signed number. The floor plan collapses
 // exactly this axis, which is how a clock 0.38 m up the wall and a plant 0.73 m
 // down on the floor came to be drawn on the same spot; the arrow is what tells
 // those apart at a glance, where `y +0.38` has to be read. One formatter for
-// every coordinate this file prints, so nothing that names a position can
-// disagree with anything else about how a number is spelled.
+// every coordinate this file prints, so the object labels and the pointer
+// readout can never disagree about how a number is spelled.
 // A screen point carried back into the space the drawing was turned in, about
 // the middle of the canvas. Module level because both users need it and neither
 // can borrow the other's: the draw pass has one for the few marks that belong
@@ -79,8 +92,156 @@ function fmtAxis(axis, v) {
   return `${ROOM_AXIS_NAMES[axis]} ${v.toFixed(2)}`;
 }
 
+// The gates `objects.js` promotes and trusts an object by. Mirrored rather than
+// carried on the wire: the wire already says whether an object is `usable`, and
+// only the *reason* is worth printing next to it. `objects.js` DEFAULTS is the
+// source of truth for both — keep them in step by hand, they change rarely and
+// a drift here misnames a state rather than breaking one.
+const OBJ_MIN_ARC_DEG = 8;
+const OBJ_PRIOR_FRAC_MAX = 0.35;
+
+// The mark that says how big an object was measured to be, in metres, in the
+// two room axes a view keeps. **It carries as many dimensions as that view has
+// measured extents in it, and never more** — the whole hazard of drawing a size
+// is that a mark with an area claims a footprint, and a mark with a long axis
+// claims a bearing, whether or not either was measured.
+//
+// Three cases, in falling order of what is known:
+//
+//   - **A fitted circular outline** is what the thing *is* and which way it
+//     faces, so its projection is a genuine 2D footprint: a disc of radius r
+//     facing n, projected orthographically, is an ellipse — a full circle seen
+//     face on, a sliver seen edge on, and correctly angled in between. Taken
+//     through the projection rather than axis by axis: extents measured along
+//     the two room axes separately give the shape's *bounding box*, which for a
+//     paper-thin object on a wall running at an angle to the room is a fat blob
+//     claiming footprint in two directions it does not have.
+//   - **`w` and `h`**, in an elevation. Two extents whose directions are both
+//     known — `h` is world-vertical and `w` is horizontal, which is the axis
+//     running across an elevation — so an axis-aligned ellipse is exactly the
+//     claim being made.
+//   - **`w` alone**, in the floor plan, where both kept axes are horizontal and
+//     only one horizontal extent was ever measured. One number, so one
+//     dimension: a bar of that length, not a circle. A circle would assert a
+//     footprint measured in every direction, which is true of a chair and badly
+//     false of a television, and nothing here can tell those apart.
+//
+// A fitted quad falls to the second case: it has `w` and `h` in its own plane
+// but nothing here knows which way round they lie in it, and guessing would
+// invent exactly the bearing this whole function refuses to invent.
+function objMark(rec, axisA, axisB, orient) {
+  if (rec.shape?.kind === 'ellipse' && rec.shape.r > 0 && rec.shape.n) {
+    const r = rec.shape.r;
+    const n = rec.shape.n;
+    // Any two orthonormal vectors spanning the disc's plane. Which two does not
+    // matter — they parameterize the same circle, and the SVD below recovers the
+    // projected ellipse's own axes regardless of where the parameterization
+    // started. Seeded off whichever room axis the normal leans on least, so the
+    // cross product is never taken against something nearly parallel.
+    const k = Math.abs(n[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
+    const e1 = unitv([k[1] * n[2] - k[2] * n[1],
+      k[2] * n[0] - k[0] * n[2],
+      k[0] * n[1] - k[1] * n[0]]);
+    const e2 = unitv([n[1] * e1[2] - n[2] * e1[1],
+      n[2] * e1[0] - n[0] * e1[2],
+      n[0] * e1[1] - n[1] * e1[0]]);
+    // The disc's points in screen directions, before the common pixel scale: a
+    // point r(cosθ·e1 + sinθ·e2) lands at M·(cosθ, sinθ). `orient` rides along
+    // because an elevation draws its second axis upward.
+    const mark = ellipseFromMatrix(
+      r * e1[axisA], r * e2[axisA],
+      orient * r * e1[axisB], orient * r * e2[axisB],
+    );
+    // Below a millimetre the minor axis is not a thin ellipse, it is a line the
+    // canvas would render as a hairline of arbitrary width.
+    if (mark.ry < 0.001) return { kind: 'bar', len: mark.rx * 2, rot: mark.rot };
+    return mark;
+  }
+  const wide = rec.w || null;
+  if (axisB === AXIS_UP || axisA === AXIS_UP) {
+    const up = rec.h || null;
+    if (!wide || !up) return null;
+    return {
+      kind: 'ellipse',
+      rx: (axisA === AXIS_UP ? up : wide) / 2,
+      ry: (axisB === AXIS_UP ? up : wide) / 2,
+      rot: 0,
+    };
+  }
+  return wide ? { kind: 'bar', len: wide, rot: null } : null;
+}
+
+function unitv(v) {
+  const n = Math.hypot(v[0], v[1], v[2]) || 1;
+  return [v[0] / n, v[1] / n, v[2] / n];
+}
+
+// The ellipse that the unit circle maps to under the 2x2 matrix [[a,b],[c,d]] —
+// its two semi-axes and the angle the major one sits at. Closed-form 2x2 SVD;
+// `rx` is the larger by construction, which is what makes the rotation the major
+// axis's own angle rather than one of two conventions.
+function ellipseFromMatrix(a, b, c, d) {
+  const e = (a + d) / 2;
+  const f = (a - d) / 2;
+  const g = (c + b) / 2;
+  const hh = (c - b) / 2;
+  const q = Math.hypot(e, hh);
+  const r = Math.hypot(f, g);
+  return {
+    kind: 'ellipse',
+    rx: q + r,
+    ry: Math.abs(q - r),
+    rot: (Math.atan2(hh, e) + Math.atan2(g, f)) / 2,
+  };
+}
+
+// Everything about an object except which object it is, as short rows under the
+// name. Held back until the view is zoomed in far enough to have room for them:
+// at the fit these are a dozen numbers per object over a room that fits in a
+// hand, and the question a zoomed-out map answers is which things are where.
+//
+// One row per kind of claim — what its geometry is, how well that is known —
+// rather than one long line. Rows keep the block narrow, and narrow is what
+// matters now that object labels sit on their objects and no longer step aside
+// for each other.
+//
+// `axis`/`v` are the coordinate the view collapses and its value, which is the
+// one number the picture cannot be read for. It rides down here with the rest
+// because the name line is only ever the name.
+function objDetail(rec, axis, v) {
+  const rows = [];
+  const size = [];
+  if (rec.w) size.push(`w ${rec.w.toFixed(2)}`);
+  if (rec.h) size.push(`h ${rec.h.toFixed(2)}`);
+  // Last on the row the sizes are on, not first and not on one of its own: it
+  // is the third number about this object's geometry, and the arrow (or the
+  // axis letter, in an elevation) already tells it apart from the two lengths
+  // beside it.
+  size.push(fmtAxis(axis, v));
+  rows.push(size.join(' · '));
+  const state = [`arc ${(rec.arcDeg ?? 0).toFixed(1)}°`];
+  const why = objWhy(rec);
+  // `arc` is already the first thing on this row, so the arc doubt state would
+  // be the same number printed twice.
+  if (why && !why.startsWith('arc')) state.push(why);
+  rows.push(state.join(' · '));
+  return rows;
+}
+
+// Why this object is not yet something the map stands on, most-fundamental
+// first: an entry still accumulating is a different statement from one that has
+// sightings but was never seen from enough angles. Null once it has cleared all
+// three, which is when the label drops the clause entirely.
+function objWhy(rec) {
+  if (!rec) return null;
+  if (!rec.promoted) return `n=${rec.nObs ?? 0}`;
+  if (rec.priorFrac > OBJ_PRIOR_FRAC_MAX) return `prior ${Math.round(rec.priorFrac * 100)}%`;
+  if (rec.arcDeg < OBJ_MIN_ARC_DEG) return `arc ${rec.arcDeg.toFixed(1)}°`;
+  return null;
+}
+
 function createMap2dView(canvas, mode = 'top', {
-  onHover, raf, maxPixels, pairsFocusOnly,
+  onHover, onSelect, raf, maxPixels, pairsFocusOnly,
 } = {}) {
   const ctx = canvas.getContext('2d');
   const nextFrame = raf || ((cb) => requestAnimationFrame(cb));
@@ -100,7 +261,6 @@ function createMap2dView(canvas, mode = 'top', {
   // into a position.
   const segA = axisA === 2 ? 1 : 0;
 
-  let active = false;
   let markerMap = null;
   // Screen pixels along the bottom and left edges that the page has covered with
   // chrome of its own — the XR client's button row sits over the canvas, and on
@@ -123,6 +283,10 @@ function createMap2dView(canvas, mode = 'top', {
   // back into a rotation, and the map moves tags whenever the survey refines,
   // re-seeds or forgets one. The drawn vectors are derived per frame instead.
   const markers = new Map();
+  // Detected objects, keyed by the id objects.js assigns. Same match-don't-
+  // replace contract as the tags: a snapshot arrives whole and an object that
+  // moved is still that object.
+  const objectDots = new Map();
   // clientId -> { target, cur {p:[3], fwd:[3]}, seen, at, color }
   const clients = new Map();
   // Measured spread of the recent fixes, drawn rather than hidden: a bare dot
@@ -146,8 +310,14 @@ function createMap2dView(canvas, mode = 'top', {
   // belonging to whatever lands there.
   const CLIENT_LABEL_PIN_PX = 14;
   const HOVER_MS = 120;
-  let rafPending = false;
   let lastFrameAt = 0;
+  // The loop itself is common.js's — see createDrawLoop for why the latch it
+  // owns is a token rather than a flag, and why that is load-bearing here in
+  // particular: on /xr-client `nextFrame` is the XR *session's*
+  // requestAnimationFrame, and a session that ends with a frame queued never
+  // delivers it. `draw` is a declaration, so it is already bound here.
+  const loop = createDrawLoop({ nextFrame, draw });
+  const schedule = loop.schedule;
   // The tag glyphs of the last drawn frame, in pixels: the bar and the id chip,
   // exactly as they were stroked. Hit tests read this rather than re-deriving a
   // radius around the tag's centre — the glyph is a rotated bar with a chip
@@ -168,6 +338,16 @@ function createMap2dView(canvas, mode = 'top', {
   // lastGlyphs: the shape the pointer is tested against is the shape on
   // screen, recorded in the same (turned) space.
   let lastClientDots = [];
+  // Object marks as drawn this frame, same convention again. The radius is the
+  // hit target rather than a fixed one: an object's mark is whatever `objMark`
+  // decided, from a 4 px ring to a metre-wide ellipse, and a fixed target would
+  // be unmissable on one and unhittable on the other.
+  let lastObjectDots = [];
+  // Which object the reader has opened in the drawer, told from outside exactly
+  // as `focusId` is. It is what draws the co-visibility legs: every object's
+  // partners at once is a web across the whole room, and the question is only
+  // ever asked of one object at a time.
+  let focusObjectId = null;
   // Which tag the reader has opened, told from outside for the same reason the
   // hover is. With `pairsFocusOnly` the legs are the opened tag's own: a room of
   // a dozen tags draws a leg and two labels for every one of them, which is
@@ -202,6 +382,16 @@ function createMap2dView(canvas, mode = 'top', {
   let walls = [];
   let nextWallKey = 1;
   let showWalls = true;
+  let showObjects = true;
+  // The name and stat block drawn on each object's own mark. Separate from the
+  // marks themselves because a caller can already be naming them somewhere else:
+  // the XR client carries a list of what is in view and the names belong there,
+  // where there is room to read them, rather than on a map the size of a stamp
+  // held at arm's length. Default on — the dashboard's map is the only place its
+  // objects are named, and the panel's cards cross-reference the `#id` this
+  // prints.
+  let showObjectLabels = true;
+  let objectsAlpha = 0;
   let wallsAlpha = 1;
   // The dark backdrop and the 1 m grid it carries: everything that is only
   // there to be drawn *on*. Turned off, the canvas is cleared instead of
@@ -234,6 +424,11 @@ function createMap2dView(canvas, mode = 'top', {
   // follow point with no heading at all.
   let headingRad = null;   // null: north up, the room frame's own orientation
   let followPos = null;    // null: the fit's own bounds, centred on the room
+  // Where the client is pointing, and how wide its camera is — set only by a
+  // page that *is* somewhere in the room, which is the capture client and never
+  // the dashboard. Null on the dashboard, and null is "no gaze", which is why
+  // nothing there changes. See `setGaze`.
+  let gaze = null;
   // Reach only as far as the followed client's own business instead of holding
   // the whole survey in view — see the fit below. The client has to be named
   // for it: the fit is built from what *that* client can see, and the map has
@@ -259,6 +454,14 @@ function createMap2dView(canvas, mode = 'top', {
   // Neutral white, not a tag colour: the highlight has to read the same on
   // every tag, and each tag already owns a colour of its own.
   const HOVER_HALO_CSS = 'rgba(255,255,255,0.55)';
+  // The two object colours are `ROOM_OBJECT_CSS` and `ROOM_OBJECT_BEST_CSS` in
+  // common.js — teal for one the map would stand on, periwinkle for one still
+  // accumulating — because the object drawer paints its cards with the same
+  // pair. These are their fills, and they are the canvas's alone: the size mark
+  // is filled where the scatter ring is only stroked, because the two marks are
+  // different claims and must not be mistakeable for each other.
+  const ROOM_OBJECT_FILL_CSS = 'rgba(127,143,214,0.18)';
+  const ROOM_OBJECT_BEST_FILL_CSS = 'rgba(127,184,164,0.18)';
   const WALL_STROKE_CSS = '#dfe7ea';
   const WALL_FILL_CSS = 'rgba(223,231,234,0.10)';
 
@@ -460,6 +663,25 @@ function createMap2dView(canvas, mode = 'top', {
     return null;
   }
 
+  // The object mark under the pointer, when nothing above it claimed it first.
+  // Last in the order because objects are drawn under everything — the survey is
+  // what the room is measured by, and a guess about the furniture must not take
+  // a hover from it. Nearest centre wins where two overlap, which on this map is
+  // the normal case: duplicates of one thing sit within a few centimetres.
+  const OBJECT_HIT_MIN_PX = 8;
+  function objectAt(x, y) {
+    let best = null;
+    let bestD = Infinity;
+    for (const o of lastObjectDots) {
+      const d = Math.hypot(x - o.x, y - o.y);
+      if (d <= Math.max(OBJECT_HIT_MIN_PX, o.r) && d < bestD) {
+        bestD = d;
+        best = o.id;
+      }
+    }
+    return best;
+  }
+
   canvas.addEventListener('pointermove', (ev) => {
     // Before the drag branch below returns: the readout has to keep up while
     // the paper is being pushed around, which is when a reading is most likely
@@ -469,8 +691,11 @@ function createMap2dView(canvas, mode = 'top', {
     if (!drag) {
       const tagId = markerAt(ev.offsetX, ev.offsetY);
       const clientId = tagId === null ? clientAt(ev.offsetX, ev.offsetY) : null;
+      const objId = tagId === null && clientId === null
+        ? objectAt(ev.offsetX, ev.offsetY) : null;
       const h = tagId !== null ? { kind: 'tag', id: tagId }
-        : clientId !== null ? { kind: 'client', id: clientId } : null;
+        : clientId !== null ? { kind: 'client', id: clientId }
+          : objId !== null ? { kind: 'object', id: objId } : null;
       canvas.style.cursor = h ? 'pointer' : '';
       reportHover(h);
       return;
@@ -505,6 +730,30 @@ function createMap2dView(canvas, mode = 'top', {
   };
   canvas.addEventListener('pointerup', endDrag);
   canvas.addEventListener('pointercancel', endDrag);
+
+  // Selecting is the **left** button, and it has to be its own press rather than
+  // something hung off the pan's: the pan is on the right (see PAN_BUTTON), so a
+  // left press never enters that path at all. The two gestures are on different
+  // buttons and cannot be confused, which is also why this needs no threshold
+  // against a pan — only against the hand's own wobble.
+  //
+  // A touch pointer reports button 0 and cannot pan, so a tap selects, which is
+  // the only sensible thing a tap on a mark could mean.
+  const CLICK_SLOP_PX = 5;
+  let press = null;
+  canvas.addEventListener('pointerdown', (ev) => {
+    press = ev.button === 0 ? { id: ev.pointerId, x: ev.offsetX, y: ev.offsetY } : null;
+  });
+  canvas.addEventListener('pointerup', (ev) => {
+    const p = press;
+    press = null;
+    if (!p || p.id !== ev.pointerId) return;
+    if (Math.hypot(ev.offsetX - p.x, ev.offsetY - p.y) > CLICK_SLOP_PX) return;
+    // Hit-tested where the press landed rather than where it ended: within the
+    // slop they are the same spot, and the press is the one that was aimed.
+    const id = objectAt(p.x, p.y);
+    if (id !== null) onSelect?.({ kind: 'object', id });
+  });
 
   // Gives the auto-fit back, everywhere on the canvas. It used to forget a tag
   // when the double-click landed on one — one gesture with two meanings, on a
@@ -542,8 +791,7 @@ function createMap2dView(canvas, mode = 'top', {
   }
 
   function draw(now) {
-    rafPending = false;
-    if (!active) return;
+    if (!loop.active) return;
     const dt = lastFrameAt ? now - lastFrameAt : 16;
     lastFrameAt = now;
 
@@ -669,11 +917,11 @@ function createMap2dView(canvas, mode = 'top', {
       // A fixed label sits on its anchor and takes no part in any of this: it
       // neither dodges nor reserves. The dodge exists so that a label which
       // *names a place* is not read against the wrong mark, and it pays for that
-      // with a label that can end up a long way from what it names. A label
-      // whose mark is drawn around it, and whose own coordinate is in its text,
-      // is not naming a place — so it can sit dead on the thing and let whatever
-      // else lands there land there. Drawn before everything, so the survey's
-      // own text is the layer on top when they do collide.
+      // with a label that can end up a long way from what it names. An object
+      // label is not naming a place — the object's mark is drawn around it and
+      // its own coordinate is in the text — so it can sit dead on the thing and
+      // let whatever else lands there land there. Drawn before everything, so
+      // the survey's own text is the layer on top when they do collide.
       for (const lb of order) {
         if (!lb.fixed || lb.alpha <= 0.01) continue;
         ctx.globalAlpha = lb.alpha;
@@ -870,7 +1118,20 @@ function createMap2dView(canvas, mode = 'top', {
       seg.width = animApproach(seg.width, seg.inferred ? 2 : 4, dt, MOTION_TAU_MS);
     }
 
+    // Objects ease and fade like the tags: a promotion, a re-seed after
+    // something was moved, or a forget is worth being able to watch happen.
+    for (const [id, o] of objectDots) {
+      o.fade = animFade(o.fade, !o.dead, dt);
+      if (o.dead && o.fade === 0) {
+        objectDots.delete(id);
+        continue;
+      }
+      animApproachArr(o.pos, o.tp, dt, MOTION_TAU_MS);
+      o.r = animApproach(o.r, o.tr, dt, MOTION_TAU_MS);
+    }
+
     poseMix = animFade(poseMix, showPose, dt);
+    objectsAlpha = animFade(objectsAlpha, showObjects, dt);
     wallsAlpha = animFade(wallsAlpha, showWalls, dt);
     backdropAlpha = animFade(backdropAlpha, showBackdrop, dt);
     pairsAlpha = animFade(pairsAlpha, showPairs, dt);
@@ -1273,6 +1534,251 @@ function createMap2dView(canvas, mode = 'top', {
     ctx.globalAlpha = 1;
     ctx.setLineDash([]);
 
+    // Detected objects, under the tags: the survey is what the room is measured
+    // by and must not be obscured by a guess about the furniture.
+    lastObjectDots = [];
+    if (objectsAlpha > 0.01) {
+      // The co-visibility legs of the opened object, under its own mark and
+      // under everything else's. One line per thing it has been in frame with,
+      // its weight the count: what this drawer question is really asking is
+      // which of the room's things travel together, and a leg that looked the
+      // same at three sightings and three hundred would answer it wrongly.
+      //
+      // Drawn from the *opened* object only. The whole table at once is a web
+      // across the room with a line between every pair, which is a picture of
+      // the map's density rather than of any object's neighbourhood.
+      const focus = focusObjectId === null ? null : objectDots.get(focusObjectId);
+      if (focus?.rec?.seenWith?.length) {
+        const [fx, fy] = px(focus.pos);
+        const top = focus.rec.seenWith.reduce((m, [, n]) => Math.max(m, n), 1);
+        ctx.setLineDash([]);
+        for (const [k, n] of focus.rec.seenWith) {
+          let to = null;
+          if (k.startsWith('t')) {
+            const tag = markerMap?.markers?.find((m) => m.id === Number(k.slice(1)));
+            if (tag) to = px(tag.p);
+          } else {
+            const other = objectDots.get(Number(k.slice(1)));
+            if (other) to = px(other.pos);
+          }
+          if (!to) continue;
+          // A tag partner is a different claim from an object one — it puts this
+          // near a *surveyed* position — so it is drawn in the tag's own colour
+          // rather than the object palette, which is the same distinction the
+          // card's text makes.
+          ctx.strokeStyle = k.startsWith('t')
+            ? roomTagColorCss(Number(k.slice(1))) : ROOM_OBJECT_BEST_CSS;
+          ctx.globalAlpha = objectsAlpha * (0.25 + 0.55 * (n / top));
+          ctx.lineWidth = 1 + 1.5 * (n / top);
+          ctx.beginPath();
+          ctx.moveTo(fx, fy);
+          ctx.lineTo(to[0], to[1]);
+          ctx.stroke();
+        }
+        ctx.globalAlpha = 1;
+        ctx.lineWidth = 1;
+      }
+      for (const [, o] of objectDots) {
+        const [ox, oy] = px(o.pos);
+        // Straight off the scale rather than by projecting an offset point: the
+        // projection is uniform in both axes, so a metre is `scale` pixels in
+        // every view and there is no axis to pick. The offset used to be built
+        // along room x unconditionally, which the front elevation collapses —
+        // there every ring came out at the 4 px floor whatever its scatter.
+        const rPx = Math.max(4, o.r * scale);
+        // The pointer target, and the halo. An object the drawer has open or the
+        // pointer is over gets a ring behind it in the neutral highlight white —
+        // the same one a hovered tag gets, and neutral for the same reason: the
+        // object already owns two colours saying what it is, and a third meaning
+        // "this one" would be a third thing to learn. Behind the mark, so the
+        // mark is still the thing being read.
+        const lit = focusObjectId === o.rec?.id
+          || (hovered?.kind === 'object' && hovered.id === o.rec?.id);
+        if (lit) {
+          ctx.globalAlpha = o.fade * objectsAlpha;
+          ctx.strokeStyle = HOVER_HALO_CSS;
+          ctx.lineWidth = 3;
+          ctx.setLineDash([]);
+          ctx.beginPath();
+          ctx.arc(ox, oy, rPx + 4, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+        // Dashed, always. A solid ring would read like the carved walls, which
+        // are evidence; this is an estimate from a neural detector and has to
+        // look like one.
+        //
+        // And it is an estimate of an *error*, not of a size: `e.r` is the 90th
+        // percentile of the inlier bearings' own residuals (`objects.js`), so a
+        // fat ring means the sightings disagreed about where the thing is. The
+        // solid mark below is the size. They are usually not the same order —
+        // scatter floors at 5 cm and most furniture is wider than that — so the
+        // size mark normally reaches past the ring rather than sitting inside
+        // it, which is the honest picture: a well-located object is a big shape
+        // with a small ring at its middle.
+        // **State is never carried by opacity here.** A dimmed object is a
+        // half-erased one: at 28% it was unreadable over the carved floor and
+        // the grid, which is how a mapped clock came to be reported as missing
+        // in the first place. Alpha is the fade animation and the show/hide
+        // switch, and nothing else — every state below is a difference in the
+        // stroke, which stays legible at full strength.
+        const committed = o.rec?.promoted && o.rec.usable !== false;
+        const objCss = committed ? ROOM_OBJECT_BEST_CSS : ROOM_OBJECT_CSS;
+        ctx.globalAlpha = o.fade * objectsAlpha;
+        ctx.strokeStyle = objCss;
+        // The measured size, under the scatter ring so the ring stays readable
+        // over it. Solid and filled where the ring is dashed and hollow: this is
+        // a length in metres the map actually measured, and the two marks must
+        // not be able to be mistaken for one another. What shape it takes — and
+        // whether there is one at all — is `objMark`'s call, on how many extents
+        // this view has behind it.
+        const mark = o.rec ? objMark(o.rec, axisA, axisB, orient) : null;
+        // The detail rows, computed here rather than at the label because the
+        // dimension bar has to be placed clear of them.
+        const near = scale >= OBJ_DETAIL_PX_PER_M;
+        const sub = near && o.rec ? objDetail(o.rec, 3 - axisA - axisB,
+          o.pos[3 - axisA - axisB]) : null;
+        if (mark) {
+          ctx.lineWidth = 1;
+          ctx.fillStyle = committed ? ROOM_OBJECT_BEST_FILL_CSS : ROOM_OBJECT_FILL_CSS;
+          if (mark.kind === 'ellipse') {
+            ctx.beginPath();
+            ctx.ellipse(ox, oy, mark.rx * scale, mark.ry * scale, mark.rot, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.stroke();
+          } else if (mark.rot !== null || near) {
+            // A length with no bearing behind it, drawn flat on the screen and
+            // deliberately *unturned*: on a heading-up map every room direction
+            // swings with the room and this one does not, which is the signal
+            // that it is a measurement and not an outline. End ticks for the
+            // same reason — a bare line reads as a thin object seen edge on,
+            // which is exactly the claim being avoided.
+            //
+            // **Slung under the object rather than through it, and only close
+            // up.** A dimension is not where the thing is; drawn across the
+            // centre it read as part of the mark, and at a zoom where objects
+            // are a few pixels apart a field of crossed lines said nothing at
+            // all. Below the ring and below the rows it belongs with, it reads
+            // as what it is — the caption's last line, drawn instead of written.
+            //
+            // A bar that *did* come out of a facing (a fitted disc seen edge on)
+            // is not a dimension at all: it is the object's own outline, seen
+            // edge on. That one keeps its angle, keeps the centre, and is drawn
+            // at every zoom like any other shape.
+            const dim = mark.rot === null;
+            const rot = dim ? -viewRot : mark.rot;
+            const half = (mark.len / 2) * scale;
+            // Clear of the ring and of the rows: the label block straddles the
+            // centre, so its bottom is half a drop below the baseline.
+            const drop = sub ? sub.length * LABEL_SUB_DY : 0;
+            const by = dim ? Math.max(oy + rPx, oy + 4 + drop / 2 + 3) + 7 : oy;
+            ctx.save();
+            ctx.translate(ox, by);
+            ctx.rotate(rot);
+            ctx.beginPath();
+            ctx.moveTo(-half, 0);
+            ctx.lineTo(half, 0);
+            ctx.moveTo(-half, -BAR_TICK_PX);
+            ctx.lineTo(-half, BAR_TICK_PX);
+            ctx.moveTo(half, -BAR_TICK_PX);
+            ctx.lineTo(half, BAR_TICK_PX);
+            ctx.stroke();
+            ctx.restore();
+          }
+        }
+        ctx.lineWidth = 1.5;
+        // Dashed for a position the map has committed to, dotted for one it has
+        // not — and there are two ways to not be committed: not promoted yet
+        // (too few sightings, viewpoints or sessions), or promoted but still
+        // standing on a depth prior rather than on parallax. The second is the
+        // dangerous one to draw confidently, since it looks exactly like a
+        // measured object while being a single depth reading wearing a position.
+        // Carried by the dash rather than by the alpha it used to be: the two
+        // read apart at a glance and both read at all.
+        ctx.setLineDash(committed ? [3, 3] : [1, 3]);
+        ctx.beginPath();
+        ctx.arc(ox, oy, rPx, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        // `usable` — whether the position came from parallax or is still
+        // standing on a depth prior — used to be a filled 2 px core here. The
+        // label now sits on the object's centre and covers it, and the same
+        // state is already legible twice over: the ring's dash pattern, and the
+        // `prior NN%` row under the name. A third telling that has to be
+        // uncovered to be read is not a third telling.
+        // **Every object is named, committed or not.** Candidates used to be
+        // left unlabelled so a guess would not read as a fact about the room —
+        // but an unlabelled dim ring reads as *nothing at all*, and a correct
+        // object that looks absent is the worse failure of the two. A wall clock
+        // is seen from a narrow sweep and so sits below the arc gate more or
+        // less permanently; it was on this map all along and was reported as
+        // missing. The label carries its own doubt instead: the ring keeps its
+        // dotted stroke, and the rows under the name say which gate it is under.
+        //
+        // The id is what makes two rings of one class distinguishable at all,
+        // and it is the same id `objects.json`, `server.log` and
+        // `replay-objects.js --dump` use — so the map cross-references the
+        // tooling for nothing.
+        //
+        // The coordinate the rows below carry is the axis *this view collapses*
+        // — the one number the projection destroys, and therefore the only one
+        // the picture cannot already be read for. Three axes, two kept.
+        // With a gaze set, only what the client is pointing at is named — see
+        // `setGaze`. Measured in the projected pair of room axes and without
+        // `orient`, which is a screen convention and would flip the test on an
+        // elevation: this is a bearing in the room, not an angle on the canvas.
+        // An object the client is standing on has no bearing to test and counts
+        // as looked at.
+        let named = true;
+        if (gaze) {
+          const fa = gaze.fwd[axisA];
+          const fb = gaze.fwd[axisB];
+          const da = o.pos[axisA] - gaze.pos[axisA];
+          const db = o.pos[axisB] - gaze.pos[axisB];
+          const fl = Math.hypot(fa, fb);
+          const dl = Math.hypot(da, db);
+          named = fl < 1e-6 || dl < 1e-3
+            || (fa * da + fb * db) / (fl * dl) >= gaze.cosHalf;
+        }
+        if (named && showObjectLabels && o.rec?.cls) {
+          // **The name line is only ever the name.** Class and instance are what
+          // a label is for at every zoom — which thing is this, and which of the
+          // several of its class. Every number about it lives in the rows below,
+          // which appear only when there is room to read them: a coordinate, a
+          // size and a confidence hung off the end of the name made the widest
+          // text on the map out of the one thing that has to stay scannable.
+          //
+          // Read off the eased position the mark is actually drawn at, not off
+          // the record's target: a number that disagreed with the mark it sits
+          // over would be the one thing on this map that cannot be trusted.
+          const text = `${o.rec.cls} #${o.rec.id}`;
+          // Dead on the object, and fixed: no dodge, nothing dodging for it.
+          // The mark is drawn around this point and the text names the thing at
+          // it, so a label that had wandered clear of a neighbour would be a
+          // label pointing at the wrong object — the one failure the dodge
+          // cannot trade away here. Two of them landing on each other is a
+          // crowded map, which is a true thing about the room.
+          //
+          // The baseline is lifted by half of whatever hangs below it, so the
+          // whole block straddles the centre rather than the name sitting on it
+          // with the rows pushed off downward.
+          queueLabel(`obj:${o.rec.id}`, text, ox,
+            oy + 4 - ((sub ? sub.length * LABEL_SUB_DY : 0) / 2),
+            // Backed like every other label on this map, which matters here more
+            // than anywhere: the object label sits *on* its own mark by design,
+            // and on the phone the whole map is drawn over camera passthrough —
+            // text on a lit room with a dashed ring behind it is not text. The
+            // backing is null wherever the backdrop is already opaque, so the
+            // dashboard is unchanged.
+            objCss, labelBg, o.fade * objectsAlpha, null,
+            { sub, fixed: true });
+        }
+        // The hit target, in the same turned space the pointer is tested in.
+        // Recorded last so it is the mark as actually drawn, ring and all.
+        if (o.rec && !o.dead) lastObjectDots.push({ id: o.rec.id, x: ox, y: oy, r: rPx });
+      }
+      ctx.globalAlpha = 1;
+    }
+
     // Markers: a stroke along the tag's x axis, projected.
     const half = (markerMap?.sizeM || 0.15) / 2;
     lastGlyphs = [];
@@ -1602,24 +2108,16 @@ function createMap2dView(canvas, mode = 'top', {
     schedule();
   }
 
-  function schedule() {
-    if (!rafPending && active) {
-      rafPending = true;
-      nextFrame(draw);
-    }
-  }
-
   return {
     setActive(on) {
-      active = on;
       if (on) {
         lastFrameAt = 0;
         // A hidden view ran no frames, so its eased viewport is as old as the
         // last time it was looked at. Re-seeded from whatever is in force now
         // rather than swept there over the first tenth of a second.
         shown = null;
-        schedule();
       }
+      loop.setActive(on);
     },
 
     setShowPose(on) {
@@ -1640,6 +2138,41 @@ function createMap2dView(canvas, mode = 'top', {
     setFocusMarker(id) {
       if (id === focusId) return;
       focusId = id;
+      schedule();
+    },
+
+    // The object whose card is open in the drawer. What it decides is which
+    // object's co-visibility legs are drawn — every object's at once is a web
+    // across the room, and "what has this been seen with" is a question asked of
+    // one thing at a time. Told from outside for the same reason the hover and
+    // the focused tag are: the drawer and every room view have to agree, and the
+    // only thing that can know is the viewer.
+    setFocusObject(id) {
+      if (id === focusObjectId) return;
+      focusObjectId = id;
+      schedule();
+    },
+
+    // Detected objects. Same reconcile as setMarkerMap below and for the same
+    // reason: the snapshot arrives whole, and clearing it would throw away the
+    // one thing that says an object at a new position is the same object.
+    setObjects(list) {
+      const live = new Set();
+      for (const o of list || []) {
+        live.add(o.id);
+        const had = objectDots.get(o.id);
+        if (had) {
+          had.tp = o.p;
+          had.tr = o.r;
+          had.dead = false;
+          had.rec = o;
+        } else {
+          objectDots.set(o.id, {
+            pos: [...o.p], tp: o.p, r: o.r, tr: o.r, fade: 0, dead: false, rec: o,
+          });
+        }
+      }
+      for (const [id, o] of objectDots) if (!live.has(id)) o.dead = true;
       schedule();
     },
 
@@ -1922,6 +2455,12 @@ function createMap2dView(canvas, mode = 'top', {
       } else if (name === 'pairs') {
         showPairs = on;
         schedule();
+      } else if (name === 'objects') {
+        showObjects = on;
+        schedule();
+      } else if (name === 'object-labels') {
+        showObjectLabels = on;
+        schedule();
       }
     },
 
@@ -1958,6 +2497,35 @@ function createMap2dView(canvas, mode = 'top', {
         // "which way must the map be turned so that is up".
         headingRad = Math.hypot(fa, fb) < 1e-6 ? headingRad : Math.atan2(-fa, -fb * orient);
       }
+      schedule();
+    },
+
+    // Where this client is standing and which way it is pointing, so the map can
+    // answer "what am I looking at". Object labels are the only thing that reads
+    // it: on a phone held up in a room the map is a few centimetres across, and
+    // a dozen names on it is a wall of text over the one or two things in front
+    // of the person holding it. The marks all stay — what is *there* does not
+    // depend on which way anyone is facing — and only the naming narrows.
+    //
+    // `fwd` points **out of the lens**, in the room frame — `quatRotate(q,
+    // [0,0,1])` in this project's CV axes, the same vector `objects.js` dots
+    // against a camera-to-object offset to get depth along the optical axis.
+    // Taken unnegated for that reason. `setHeadingUp` negates the same vector
+    // and is not a precedent: it is answering "how far must the map turn so this
+    // direction points up the screen", which is a rotation of the paper and not
+    // a claim about which way the camera faces.
+    //
+    // Deliberately not folded into `setHeadingUp`: heading-up is a switch the
+    // user turns off, and where the phone is pointing does not stop being true
+    // when they do.
+    //
+    // Any of the three null clears it, and cleared means every object is
+    // labelled — the dashboard's behaviour, and the honest fallback for a client
+    // that has lost its fix.
+    setGaze(fwd, pos, halfFovRad) {
+      gaze = fwd && pos && halfFovRad > 0
+        ? { fwd, pos, cosHalf: Math.cos(Math.min(halfFovRad, Math.PI / 2)) }
+        : null;
       schedule();
     },
 
