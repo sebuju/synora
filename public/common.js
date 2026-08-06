@@ -488,6 +488,57 @@ function createCostMeter({ windowMs = 5000, shape }) {
   };
 }
 
+// A redraw loop for a view that is only drawn while it is being looked at.
+// Both room renderers had their own copy of it — the same `active` flag, the
+// same "a frame is already coming" latch, the same draw that re-schedules
+// itself — and they differ in one thing: which requestAnimationFrame they
+// queue on. That difference is what made one of them wedge.
+//
+// `/xr-client` queues the map on the *session's* rAF while an immersive session
+// is up, because inside one the document's rAF does not run. A session that
+// ends with a frame queued never delivers it. With the latch as a plain
+// boolean, nothing ever cleared it: the view was dead for the life of the page,
+// and re-entering AR could not revive it because scheduling was a no-op.
+//
+// So the latch is a token rather than a flag. Activating or deactivating mints
+// a new one, and a callback from a previous life is dropped: it does not draw,
+// and — the part that matters — it does not clear the latch the current life is
+// holding.
+function createDrawLoop({ nextFrame = (cb) => requestAnimationFrame(cb), draw }) {
+  let active = false;
+  let pending = false;
+  let life = 0;
+
+  function schedule() {
+    if (pending || !active) return;
+    pending = true;
+    const mine = life;
+    nextFrame((t) => {
+      if (mine !== life) return;
+      pending = false;
+      draw(t);
+    });
+  }
+
+  return {
+    schedule,
+    get active() {
+      return active;
+    },
+    // Idempotent on purpose: callers re-assert the current state (a mode being
+    // re-applied, a session starting), and that must schedule a frame without
+    // invalidating the one already in flight.
+    setActive(on) {
+      if (on !== active) {
+        life++;
+        pending = false;
+      }
+      active = on;
+      if (on) schedule();
+    },
+  };
+}
+
 // Screen blanking. A capture device runs for hours with a wake lock holding the
 // display on, and the display is the largest single draw on the phone — nothing
 // else a page can switch off comes close. Blanking costs nothing: the camera,
@@ -912,6 +963,21 @@ function forgetTagSettle(id) {
 // (`#ffd166`), which is survivable only because the anchor is `datum` and never
 // carries this mark: the two can never appear on the same glyph.
 const ROOM_SETTLING_CSS = '#e0a03a';
+
+// Detected objects on the room map. Lives here, not in map2d.js, for the same
+// reason every other room colour does: /xr-client draws the same map and cannot
+// load scene.js. Deliberately unlike the tag palette and unlike the wall
+// strokes — a detected object is an estimate from a neural network, not a
+// surveyed mark or carved evidence, and must not be mistaken for either.
+const ROOM_OBJECT_CSS = '#7f8fd6';
+// And the colour of one the map would actually stand on — promoted, and
+// positioned by parallax rather than by a depth prior. The free-space teal at
+// full strength rather than a new hue: this is the only other thing the map
+// asserts about the room, and a committed object is the same kind of claim.
+// Here beside its sibling rather than inside a renderer, because the 2D map and
+// the object drawer both draw with it and a second copy is how the two would
+// come to disagree about which objects are which.
+const ROOM_OBJECT_BEST_CSS = '#7fb8a4';
 
 // ---------------------------------------------------------------------------
 // Surveyed tag geometry, as right-angle distances. A map's own coordinates

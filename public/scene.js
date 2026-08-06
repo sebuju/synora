@@ -32,7 +32,6 @@ function createSceneView(canvas) {
   const FLOOR_Y = -1.5;         // tags mount roughly at eye height; cosmetic only
 
   let three = null;             // lazy — no WebGL context until first activation
-  let active = false;
   // On: the frustum sits at the reported pose. Off (default): it parks on the
   // uncertainty ring's centre — still showing direction, but anchored on the
   // steadier claim and moving on the ring's slow clock.
@@ -346,12 +345,15 @@ function createSceneView(canvas) {
     ph.tagLines.visible = seen.length > 0;
   }
 
-  let rafPending = false;
   let lastFrameAt = 0;
+  // Shared with the 2D map — see createDrawLoop in common.js. This pane queues
+  // on the document's rAF and never wedged, but the two loops were the same
+  // code twice and only one of them got fixed.
+  const loop = createDrawLoop({ draw });
+  const scheduleDraw = loop.schedule;
 
   function draw(now) {
-    rafPending = false;
-    if (!active) return;
+    if (!loop.active) return;
     const dt = lastFrameAt ? now - lastFrameAt : 16;
     lastFrameAt = now;
 
@@ -465,13 +467,6 @@ function createSceneView(canvas) {
     scheduleDraw();
   }
 
-  function scheduleDraw() {
-    if (!rafPending && active) {
-      rafPending = true;
-      requestAnimationFrame(draw);
-    }
-  }
-
   return {
     // { kind, id } | null — one entity hot across the whole dashboard.
     setHovered(h) {
@@ -479,7 +474,6 @@ function createSceneView(canvas) {
       scheduleDraw();
     },
     setActive(on) {
-      active = on;
       if (on) {
         init();
         if (markerMapPending !== null) {
@@ -487,8 +481,8 @@ function createSceneView(canvas) {
           markerMapPending = null;
         }
         lastFrameAt = 0;
-        scheduleDraw();
       }
+      loop.setActive(on);
     },
 
     setMarkerMap(map) {
@@ -528,7 +522,7 @@ function createSceneView(canvas) {
     removeClient(clientId) {
       const ph = clients.get(clientId);
       if (!ph) return;
-      if (!three || !active) {
+      if (!three || !loop.active) {
         disposeClient(ph);
         return;
       }
