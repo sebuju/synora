@@ -2,10 +2,12 @@
 
 const grid = document.getElementById('grid');
 const muteBtn = document.getElementById('muteBtn');
-// The two halves of the dashboard below the header, held because both are
-// disabled wholesale when another dashboard takes the viewer slot.
+// The stage, held because it is disabled wholesale when another dashboard takes
+// the viewer slot — all but its own toggles, which is why that bar is held
+// separately. The drawer columns are disabled through their own layout: there
+// is no single element to hold, and how many of them there are changes.
 const stageEl = document.getElementById('stage');
-const drawerEl = document.getElementById('drawer');
+const stageToolsEl = document.getElementById('stageTools');
 
 // clientId -> { pc, tile, video, label, camBtn, ghost }
 // `devices` means "is there a tile", not "is there a video feed" — a client
@@ -70,17 +72,29 @@ const signaling = connectSignaling('viewer', {
       // that is gone, so a click would be silently swallowed — forgetting a tag
       // or pausing a client would look like it had worked. `inert` rather than
       // pointer-events, because it takes the keyboard too. The header stays
-      // live: the view toggles are local, and the status line in it is what
-      // says how to get the dashboard back.
-      stageEl.inert = true;
-      drawerEl.inert = true;
+      // live: the status line in it is what says how to get the dashboard back.
+      // The stage's own toggles stay live too — they are local, and switching
+      // between the 3D view and the map is still worth doing on a photograph —
+      // which is why the flag goes on the stage's children: inert cannot be
+      // undone on a descendant of an inert ancestor.
+      for (const el of stageEl.children) if (el !== stageToolsEl) el.inert = true;
+      drawers.setInert(true);
       signaling.close();
       return;
     }
     if (clockSync.handle(msg)) return;
     // Everything that describes the room — the survey, the carved floor, the
     // walls — goes straight to the renderers through the shared feed.
-    if (roomFeed.handle(msg)) return;
+    if (roomFeed.handle(msg)) {
+      // The object drawer wants the same push the map views get. Taken off the
+      // message here rather than out of `roomFeed.getObjects()` so the panel is
+      // fed exactly when the renderers are, and only when there is something new.
+      // Both lists. `roomFeed` hands the renderers `msg.objects` alone, which is
+      // the map; the drawer is the one surface that also has to show what the
+      // map threw out and why.
+      if (msg.type === 'objects') objectsPanel.setObjects(msg.objects, msg.quarantined);
+      return;
+    }
     if (msg.type === 'rtp-map') {
       const dev = devices.get(msg.clientId);
       if (dev) {
@@ -98,6 +112,13 @@ const signaling = connectSignaling('viewer', {
     // panel's to know.
     if (msg.type === 'tag-history') {
       clientsPanel.setTagHistory(msg);
+      return;
+    }
+    // The same, for the object drawer. Straight through for the same reason:
+    // which card is open, and whether this is still the object it asked about,
+    // is the panel's to know.
+    if (msg.type === 'object-history') {
+      objectsPanel.setObjectHistory(msg);
       return;
     }
     // A client whose ARCore tracking dropped stops sending poses entirely, so
@@ -475,18 +496,10 @@ const sideBtn = document.getElementById('sideBtn');
 const frontBtn = document.getElementById('frontBtn');
 const poseBtn = document.getElementById('poseBtn');
 const wallsBtn = document.getElementById('wallsBtn');
-const clearTagsBtn = document.getElementById('clearTagsBtn');
-const clearCarveBtn = document.getElementById('clearCarveBtn');
-
-// Actions, not toggles, and both forget something no undo brings back, so both
-// arm on the first click and act on the second — the same two-click gesture as
-// the per-tag remove in the drawer, from the same primitive.
-confirmButton(clearTagsBtn, () => signaling.send({ type: 'survey-clear' }), {
-  armedTitle: 'Click again to forget every tag, the anchor included — the whole room frame',
-});
-confirmButton(clearCarveBtn, () => signaling.send({ type: 'walls-clear' }), {
-  armedTitle: 'Click again to wipe the carved free space and walls',
-});
+const rosterBtn = document.getElementById('rosterBtn');
+const tagListBtn = document.getElementById('tagListBtn');
+const objListBtn = document.getElementById('objListBtn');
+const stageBtn = document.getElementById('stageBtn');
 const sceneCanvas = document.getElementById('scene');
 const map2dCanvas = document.getElementById('map2d');
 const mapSideCanvas = document.getElementById('mapSide');
@@ -525,6 +538,16 @@ function setHovered(h) {
   hovered = h;
   roomViewList.forEach((v) => v.setHovered?.(h));
   clientsPanel.setHovered(h);
+  // Declared further down the file, and reached only from a pointer event or a
+  // card — both of which need the page to have finished evaluating. Guarding it
+  // would not help if that were untrue: a `const` in its dead zone throws
+  // through optional chaining like anything else.
+  objectsPanel.setHovered(h);
+}
+// A mark on the map, clicked. Only objects report one today; the shape is the
+// hover's so a tag or a client can join without a second mechanism.
+function selectFromMap(sel) {
+  if (sel?.kind === 'object') objectsPanel.openObject(sel.id);
 }
 // Which tag's card is open in the drawer, for the same reason the hover is held
 // here: the three map views all draw that tag's distances and none of them can
@@ -536,7 +559,14 @@ function setOpenedTag(id) {
 // neighbour at once is a leg and two labels per tag across the room, which
 // buries the map — and a distance is looked at when a particular tag is the
 // question.
-const mapOpts = { onHover: setHovered, pairsFocusOnly: true };
+// Clicking a mark opens the thing it names. Reported like the hover rather than
+// acted on here, and routed through a function because the panel it opens is
+// built two hundred lines further down — the maps exist before the drawer does.
+const mapOpts = {
+  onHover: setHovered,
+  onSelect: (sel) => selectFromMap(sel),
+  pairsFocusOnly: true,
+};
 const map2dView = createMap2dView(map2dCanvas, 'top', mapOpts);
 // The two elevations are the same view from a quarter turn apart: 'side' keeps
 // x across the screen, 'front' keeps z. A tag seen edge-on in one is seen
@@ -922,7 +952,7 @@ setInterval(() => {
 // client can do to itself is drivable from here; the client owns the behaviour
 // and reports back what it actually did, so nothing here is optimistic.
 const drawerBtn = document.getElementById('drawerBtn');
-const clientsPanel = createClientsPanel(drawerEl, {
+const clientsPanel = createClientsPanel({
   onControl: (clientId, action, value) =>
     signaling.send({ type: 'control', clientId, action, value }),
   onVcam: (clientId, on) => setVcam(on ? clientId : null),
@@ -935,10 +965,129 @@ const clientsPanel = createClientsPanel(drawerEl, {
   // decides when — it is the only thing that knows which card that is — and the
   // answer goes straight back to it.
   onTagHistory: (id) => signaling.send({ type: 'tag-history', id }),
+  // The two room-wide wipes, from the origin tag's own card — the one card that
+  // stands for the frame they both reset. Actions, not toggles, and neither has
+  // an undo, so both arm on the first click and act on the second: the panel
+  // puts them through the same confirmButton the per-tag remove uses.
+  onSurveyClear: () => signaling.send({ type: 'survey-clear' }),
+  onCarveClear: () => signaling.send({ type: 'walls-clear' }),
 });
+
+// The object drawer. Its own panel rather than another section of the clients
+// one: they share the chart (spark.js) and nothing else, and the object record
+// answers a different question — not "what is connected" but "how did the map
+// come to believe this".
+const objectDrawerEl = document.getElementById('objectDrawer');
+const objectsPanel = createObjectsPanel(objectDrawerEl, {
+  onObjectHistory: (id) => signaling.send({ type: 'object-history', id }),
+  onHover: setHovered,
+  // The open object's halo and its co-visibility legs are drawn by the room
+  // views, which cannot see the drawer — the same relay the opened tag has.
+  onOpen: (id) => roomViewList.forEach((v) => v.setFocusObject?.(id)),
+});
+// Fed from the message handler rather than by joining `roomViewList`. That list
+// is not a list of things with optional setters — `refreshViews` calls
+// `setShowPose` on every member unguarded, and `roomFeed` calls `setMarkerMap`
+// the same way — so it is the set of *room renderers*, and a drawer panel is not
+// one of those however many methods it happens to share.
+// The open card re-asks for its record on its own schedule. A second is the
+// cadence the record is written at, so anything faster is asking the same
+// question twice.
+setInterval(() => {
+  if (showDrawer && showObjList) objectsPanel.tick();
+}, 500);
 // Open by default: the drawer is the only place that lists a client which has no
 // tile, so starting closed hides exactly the clients worth knowing about.
 let showDrawer = true;
+// The other half of the row. Putting the stage away is how the drawer is read
+// at full width — a tag's history charts are 340px wide otherwise.
+let showStage = true;
+// The settings form is eighteen rows above the roster and the tags, and it is
+// read once a session while they are watched for the length of a walk. Shown by
+// default because that is where it was before it could be put away.
+const settingsBtn = document.getElementById('settingsBtn');
+// Held up here rather than beside the form they belong to: the card is one of
+// the movable panels, and the registry below has to name its root.
+const settingsCard = document.getElementById('settingsCard');
+const settingsRows = document.getElementById('settingsRows');
+const settingsStatus = document.getElementById('settingsStatus');
+let showSettings = true;
+// The drawer's two lists. Both on by default — between them they are what the
+// drawer is, and a dashboard that came back from a reload with neither would
+// look like the panel had failed rather than like it had been put away.
+let showRoster = true;
+let showTagList = true;
+// The object list is the third, and it is **off** by default where the other two
+// are on. It is a record of an experiment that feeds nothing, twenty-odd cards
+// long, and it is opened to answer a question rather than watched — the same
+// standing the object channel itself has.
+let showObjList = false;
+
+// ---------------------------------------------------------------------------
+// The drawer columns. Five movable panels, each one root element and the button
+// that shows it; drawers.js owns which column each is in, this owns whether it
+// is shown at all and where that answer is stored.
+//
+// The roots come from three different places — two static in the page, two
+// built by the clients panel, one a mount point the objects panel fills — and
+// that is exactly why the registry exists: past here nothing cares which.
+// `name` is the word the column's tool row prints, not the button's title: the
+// title says what the control does ("Camera composite", "Server settings") and
+// is read one at a time under a pointer, while these are read as a list across
+// several columns and have to stay short enough to be one.
+const panels = [
+  { key: 'cams', name: 'Cams', el: document.getElementById('camsPanel'), btn: combinedBtn, shown: () => combinedActive },
+  { key: 'settings', name: 'Settings', el: settingsCard, btn: settingsBtn, shown: () => showSettings },
+  { key: 'taglist', name: 'Tags', el: clientsPanel.sections.taglist, btn: tagListBtn, shown: () => showTagList },
+  { key: 'roster', name: 'Clients', el: clientsPanel.sections.roster, btn: rosterBtn, shown: () => showRoster },
+  { key: 'objlist', name: 'Objects', el: objectDrawerEl, btn: objListBtn, shown: () => showObjList },
+];
+
+// Which panels sit in which column, left to right. Its own key rather than a
+// field in the view state: that object is rebuilt from `viewToggles` on every
+// save and is booleans only, so an array in it would be written once and
+// dropped by the next click.
+const DRAWER_STATE_KEY = 'streamer-viewer-drawers';
+
+// What was stored may name a panel this build no longer has, or miss one it has
+// gained. Neither is an error worth losing the arrangement over: unknown keys
+// and repeats are dropped, anything missing joins the first column, and an
+// arrangement with nothing left in it falls back to one column holding
+// everything — the same reasoning as a toggle added after someone last saved
+// keeping its own default rather than reading as off.
+function readDrawerLayout() {
+  let saved = null;
+  try {
+    saved = JSON.parse(localStorage.getItem(DRAWER_STATE_KEY) || 'null');
+  } catch {
+    saved = null;
+  }
+  const known = new Set(panels.map((p) => p.key));
+  const seen = new Set();
+  const out = [];
+  for (const col of Array.isArray(saved) ? saved : []) {
+    const keys = (Array.isArray(col) ? col : [])
+      .filter((k) => known.has(k) && !seen.has(k));
+    for (const k of keys) seen.add(k);
+    if (keys.length) out.push(keys);
+  }
+  const missing = panels.map((p) => p.key).filter((k) => !seen.has(k));
+  if (!out.length) return [missing];
+  out[0].push(...missing);
+  return out;
+}
+
+const drawers = createDrawerLayout(document.querySelector('main'), panels, {
+  onChange: () => {
+    try {
+      localStorage.setItem(DRAWER_STATE_KEY, JSON.stringify(drawers.getLayout()));
+    } catch {
+      // Private mode, or storage full. Where the panels sit is not worth
+      // breaking the move over — the same call the view state makes.
+    }
+  },
+});
+drawers.setLayout(readDrawerLayout());
 
 function refreshClientsPanel() {
   if (!showDrawer) return;
@@ -961,28 +1110,44 @@ function refreshViews() {
   sideBtn.classList.toggle('on', showSide);
   frontBtn.classList.toggle('on', showFront);
   drawerBtn.classList.toggle('on', showDrawer);
+  stageBtn.classList.toggle('on', showStage);
+  document.body.classList.toggle('no-stage', !showStage);
+  settingsBtn.classList.toggle('on', showSettings);
   poseBtn.classList.toggle('on', showPoseMarker);
   wallsBtn.classList.toggle('on', showWalls);
+  rosterBtn.classList.toggle('on', showRoster);
+  tagListBtn.classList.toggle('on', showTagList);
+  objListBtn.classList.toggle('on', showObjList);
   roomViewList.forEach((v) => v.setShowPose(showPoseMarker));
   roomViewList.forEach((v) => v.setLayer?.('walls', showWalls));
-  clientsPanel.setActive(showDrawer);
+  // One loop for all five, on the panel's own root. Each used to be its own
+  // line against its own element, and two of them were class rules on the
+  // drawer that only worked while there was exactly one — one of which also
+  // blanked the object list, because that list is named `.tag-list` too.
+  for (const p of panels) p.el.style.display = p.shown() ? '' : 'none';
+  // Every column together: the header's one button, and the columns' own
+  // toggles are inside them, so a column hidden alone would have no way back.
+  drawers.setActive(showDrawer);
   refreshClientsPanel();
   // The backdrop hides the tile grid behind a full-bleed view. The combined
   // canvas is in the drawer now and covers nothing, so it no longer asks for
   // one — a 340px drawer blacking out the whole grid behind it was the old
   // pip's rule outliving the pip.
   backdrop.style.display = room ? 'block' : '';
-  combined.style.display = combinedActive ? 'block' : '';
   roomViews.classList.toggle('active', room);
   sceneCanvas.classList.toggle('active', show3d);
   maps2d.classList.toggle('active', show2d || showSide || showFront);
   map2dCanvas.classList.toggle('active', show2d);
   mapSideCanvas.classList.toggle('active', showSide);
   mapFrontCanvas.classList.toggle('active', showFront);
-  sceneView.setActive(show3d);
-  map2dView.setActive(show2d);
-  mapSideView.setActive(showSide);
-  mapFrontView.setActive(showFront);
+  // A hidden stage stops its views rather than letting them render into it.
+  // A display:none canvas measures 0x0, which is a NaN aspect recomputed every
+  // frame for a picture nobody can see — the same rule the closed drawer
+  // follows for the composite.
+  sceneView.setActive(show3d && showStage);
+  map2dView.setActive(show2d && showStage);
+  mapSideView.setActive(showSide && showStage);
+  mapFrontView.setActive(showFront && showStage);
   if (camsVisible()) drawCombined();
   else {
     syncLabel.textContent = '';
@@ -1013,6 +1178,14 @@ const viewToggles = [
   // value, and renaming it would read every existing viewer's saved layout as
   // "not stored" and reopen the drawer on someone who closed it.
   { key: 'clients', btn: drawerBtn, get: () => showDrawer, set: (v) => { showDrawer = v; } },
+  { key: 'settings', btn: settingsBtn, get: () => showSettings, set: (v) => { showSettings = v; } },
+  // Not 'clients': that key is the drawer's, from when this button was the
+  // client list. The roster's own key has to be a new one, or the two would
+  // share a stored value and each would move the other.
+  { key: 'roster', btn: rosterBtn, get: () => showRoster, set: (v) => { showRoster = v; } },
+  { key: 'taglist', btn: tagListBtn, get: () => showTagList, set: (v) => { showTagList = v; } },
+  { key: 'objlist', btn: objListBtn, get: () => showObjList, set: (v) => { showObjList = v; } },
+  { key: 'stage', btn: stageBtn, get: () => showStage, set: (v) => { showStage = v; } },
 ];
 
 function loadViewState() {
@@ -1060,10 +1233,6 @@ loadViewState();
 // never what it was asked for, the same rule every remote control in the panel
 // below follows. A number field is the one exception the rule has to allow: it
 // is being typed into, so it is left alone while it holds the focus.
-const settingsCard = document.getElementById('settingsCard');
-const settingsRows = document.getElementById('settingsRows');
-const settingsStatus = document.getElementById('settingsStatus');
-const tagSizeLabel = document.getElementById('tagSizeLabel');
 const SETTING_STATUS_MS = 5000;
 let settingsSpec = [];
 let settingsValues = {};
@@ -1116,6 +1285,39 @@ function makeSettingRow(spec) {
     return handle;
   }
 
+  if (spec.type === 'string') {
+    // A closed list, so a select rather than a text field — the schema already
+    // says what the valid answers are and typing one of them by hand is a way
+    // to get it wrong. Committed on change like the toggle, not behind a Set
+    // button: there is nothing to type, so there is no half-entered state for a
+    // Set button to protect.
+    const select = document.createElement('select');
+    for (const v of spec.values || []) {
+      const opt = document.createElement('option');
+      opt.value = v;
+      opt.textContent = v;
+      select.append(opt);
+    }
+    select.setAttribute('aria-label', spec.label);
+    const commit = () => sendSetting(spec.key, select.value);
+    if (spec.danger) {
+      // Same two-click gesture as everything else that throws work away, and
+      // for the same reason — except the arming has to live on a button, so a
+      // select that carries a warning gets one beside it.
+      const apply = document.createElement('button');
+      apply.type = 'button';
+      apply.textContent = 'Set';
+      apply.classList.add('danger');
+      confirmButton(apply, commit, { armedTitle: `Click again — ${spec.danger}` });
+      root.append(select, apply);
+    } else {
+      select.onchange = commit;
+      root.append(select);
+    }
+    handle.select = select;
+    return handle;
+  }
+
   const input = document.createElement('input');
   input.type = 'number';
   input.min = settingShown(spec, spec.min);
@@ -1148,6 +1350,41 @@ function makeSettingRow(spec) {
   return handle;
 }
 
+// Headings come from the schema, like everything else in this card: the server
+// says which group a setting is in and this page renders the string it is
+// given. Consecutive runs, not a bucket-by-name — the schema's order is the
+// card's order and a group is a stretch of it. A setting with no group is its
+// own unheaded run, so one that predates this cannot vanish off the card.
+function settingGroups(spec) {
+  const out = [];
+  for (const s of spec) {
+    const last = out[out.length - 1];
+    if (last && last.name === (s.group || '')) last.specs.push(s);
+    else out.push({ name: s.group || '', specs: [s] });
+  }
+  return out;
+}
+
+function makeSettingGroup() {
+  const root = document.createElement('div');
+  root.className = 'setting-group';
+  const head = document.createElement('div');
+  head.className = 'group-head';
+  const rows = document.createElement('div');
+  root.append(head, rows);
+  return { root, head, rows };
+}
+
+function paintSettingGroup(handle, group) {
+  handle.head.textContent = group.name;
+  handle.head.style.display = group.name ? '' : 'none';
+  syncKeyed(handle.rows, group.specs, {
+    key: (spec) => spec.key,
+    make: makeSettingRow,
+    paint: paintSettingRow,
+  });
+}
+
 function paintSettingRow(handle, spec) {
   const v = settingsValues[spec.key];
   if (v === undefined) return;
@@ -1160,47 +1397,36 @@ function paintSettingRow(handle, spec) {
     handle.btn.setAttribute('aria-pressed', v ? 'true' : 'false');
     return;
   }
+  if (handle.select) {
+    // Left alone while it has focus, for the same reason the number field is:
+    // a repaint landing mid-choice would snap the list back to what the server
+    // still thinks is true.
+    if (document.activeElement !== handle.select && handle.select.value !== v) {
+      handle.select.value = v;
+    }
+    return;
+  }
   if (document.activeElement === handle.input) return;
   const shown = String(settingShown(spec, v));
   if (handle.input.value !== shown) handle.input.value = shown;
 }
 
-// The tag size in the header, because every distance this dashboard draws
-// scales by it and a wrong one is invisible in all of them — the room simply
-// comes out uniformly too big. Click to open the drawer it is set in.
-function updateTagSizeLabel() {
-  const spec = settingsSpec.find((s) => s.key === 'markerSizeM');
-  const v = settingsValues.markerSizeM;
-  tagSizeLabel.textContent = spec && v !== undefined
-    ? `tag ${settingShown(spec, v)} ${spec.unit}`
-    : '';
-}
-
 function updateSettings(msg) {
   if (msg.spec) settingsSpec = msg.spec;
   settingsValues = msg.values || {};
-  syncKeyed(settingsRows, settingsSpec, {
-    key: (spec) => spec.key,
-    make: makeSettingRow,
-    paint: paintSettingRow,
+  // Two levels of the same primitive, so a schema that reorders, adds or drops
+  // a setting is right for free — a heading whose group empties goes with it.
+  syncKeyed(settingsRows, settingGroups(settingsSpec), {
+    key: (group) => group.name,
+    make: makeSettingGroup,
+    paint: paintSettingGroup,
   });
-  updateTagSizeLabel();
   if (msg.error) setSettingsStatus(msg.error, true);
   else if (msg.changed?.length) {
     setSettingsStatus(`applied: ${msg.changed
       .map((k) => settingsSpec.find((s) => s.key === k)?.label ?? k).join(', ')}`);
   }
 }
-
-const drawerToggle = viewToggles.find((t) => t.key === 'clients');
-tagSizeLabel.onclick = () => {
-  if (!drawerToggle.get()) {
-    drawerToggle.set(true);
-    saveViewState();
-    refreshViews();
-  }
-  settingsCard.scrollIntoView({ block: 'nearest' });
-};
 
 muteBtn.onclick = () => {
   soundOn = !soundOn;

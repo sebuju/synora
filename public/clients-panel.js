@@ -33,8 +33,9 @@ const PANEL_DETECT_STALE_MS = 10000;
 // never disagree about which side of the line a client is on.
 const PANEL_DETECT_BEHIND_RATIO = 0.75;
 
-function createClientsPanel(el,
-  { onControl, onVcam, onRename, onHover, onTagOpen, onTagRemove, onTagHistory, onClientRemove }) {
+function createClientsPanel(
+  { onControl, onVcam, onRename, onHover, onTagOpen, onTagRemove, onTagHistory, onClientRemove,
+    onSurveyClear, onCarveClear }) {
   const cards = new Map();   // clientId -> card DOM
 
   // Pointing at a card here points at the same entity in the room views, and
@@ -292,6 +293,30 @@ function createClientsPanel(el,
       }
     } else {
       out.push('not detecting');    // no fresh report at all (tags off, or none yet)
+    }
+
+    // The object channel, when this client has fed it at all. Cumulative counts
+    // over the walk rather than a rate, because the number that matters is a
+    // ratio: a detection that never met its pose is a detection that changed
+    // nothing, and that failure ran for a whole session with nothing anywhere
+    // that could have shown it. `joined` here is both halves of the join —
+    // matched on arrival, and parked and later collected.
+    const obj = info.obj;
+    if (obj && obj.offered) {
+      const bits = [`obj ${obj.offered} frames`];
+      if (obj.inferred) {
+        const done = obj.joined + obj.collected;
+        bits.push(`${obj.inferred} det`);
+        if (obj.ms) bits.push(`${Math.round(obj.ms / obj.inferred)} ms`);
+        // What the outline fitter adds, beside what the detector costs rather
+        // than folded into it: the claim it makes for itself is a small number
+        // against a large one, and a total cannot carry that claim.
+        if (obj.outlineMs) bits.push(`+${(obj.outlineMs / obj.inferred).toFixed(1)} ms shape`);
+        bits.push(`joined ${Math.round((done / obj.inferred) * 100)}%`);
+      }
+      if (obj.busy) bits.push(`${obj.busy} busy`);
+      if (obj.evicted) bits.push(`${obj.evicted} LOST`);
+      out.push(bits.join(' · '));
     }
 
     const link = [];
@@ -662,168 +687,14 @@ function createClientsPanel(el,
   // Sample layout as tag-history.js packs it: [t, x,y,z, qx,qy,qz,qw, mm, deg].
   const S_T = 0, S_P = 1, S_Q = 4, S_MM = 8, S_DEG = 9;
 
-  const SPARK_H = 40;
-  // The two series share one chart and are therefore a categorical pair, checked
-  // as one against this card's own #1c1c1c: OKLab ΔE 8.9 under protanopia and
-  // deuteranopia, 16.7 with normal vision, both above the floor. They are the
-  // panel's own green and amber taken down into the dark-surface lightness band
-  // — the text colours (#8fc79d / #e0a03a) sit above it, and as 2 px lines on
-  // near-black they are too pale and too close to each other to tell apart.
-  const SPARK_MOVED = '#3aa471';
-  const SPARK_OFF = '#bd8420';
-  // Reserved, and used here for the one event that is a fault: the tag was found
-  // somewhere else and dropped. A promotion is not a fault, so it is muted.
-  const SPARK_RESEED = '#e0603a';
-  const SPARK_EVENT = '#7a7a7a';
-  const SPARK_AXIS = '#333';
-  const SPARK_INK = '#9a9a9a';
-  // A break in the line rather than a straight segment across the gap: nothing
-  // was measured in between, and a level line there reads as "held still" —
-  // which is exactly the claim a tag nobody looked at must not be allowed to
-  // make.
+  // The chart itself lives in spark.js, shared with the object drawer: the
+  // colours, the gap rule, the thinning-aware spacing and the axis label are the
+  // same problem for both records and had no business being copied.
   //
-  // Measured against the record's own cadence, never a fixed interval. The
-  // server samples at most once a second but only while the tag is *being
-  // refined*, which needs two known tags in one frame — on a real journal that
-  // came out at one sample every ten seconds — and the old half of a long record
-  // is thinned, so its spacing is a multiple of the new half's. A fixed 2.5 s
-  // rule broke every segment of every series: nothing was drawn but the axis.
-  const SPARK_GAP_FACTOR = 4;
-  const SPARK_GAP_MIN_MS = 5000;
-  // Below this many points the samples are drawn as dots as well as a line: a
-  // sparse record is mostly breaks, and a break between two invisible points
-  // leaves an empty chart that cannot be told from no data at all.
-  const SPARK_DOTS_UNDER = 80;
+  // Which marks are faults *is* per record. For a tag there is one: it was found
+  // somewhere else and dropped.
+  const tagEventColor = (kind) => (kind === 'reseeded' ? SPARK_RESEED : SPARK_EVENT);
 
-  function gapMs(pts) {
-    if (pts.length < 3) return SPARK_GAP_MIN_MS;
-    const d = [];
-    for (let i = 1; i < pts.length; i++) d.push(pts[i][0] - pts[i - 1][0]);
-    d.sort((a, b) => a - b);
-    return Math.max(SPARK_GAP_MIN_MS, SPARK_GAP_FACTOR * d[d.length >> 1]);
-  }
-
-  function niceMax(v) {
-    if (!(v > 0)) return 1;
-    const mag = 10 ** Math.floor(Math.log10(v));
-    // Finer than the usual 1/2/5: a 107 mm trace against a 200 mm ceiling uses
-    // half the height it has, and these are 40 px tall to begin with. Nothing
-    // here rounds past 1.5x the data.
-    for (const step of [1, 1.5, 2, 3, 5, 7.5, 10]) {
-      if (v <= step * mag) return step * mag;
-    }
-    return 10 * mag;
-  }
-
-  // One chart, any number of series on one axis — both charts here are built
-  // from it, and a second copy would be the place the two drift apart. Series
-  // that do not share a unit never share a chart: millimetres and degrees are
-  // two charts, not two axes.
-  function drawSpark(canvas, { series, events, t0, t1, fmt, hoverT }) {
-    const w = Math.max(60, Math.round(canvas.clientWidth || 0));
-    const dpr = window.devicePixelRatio || 1;
-    if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(SPARK_H * dpr)) {
-      canvas.width = Math.round(w * dpr);
-      canvas.height = Math.round(SPARK_H * dpr);
-    }
-    const g = canvas.getContext('2d');
-    g.setTransform(dpr, 0, 0, dpr, 0, 0);
-    g.clearRect(0, 0, w, SPARK_H);
-    const top = 11, bottom = SPARK_H - 3;
-    const span = Math.max(1, t1 - t0);
-    let vmax = 0;
-    for (const s of series) for (const [, v] of s.pts) vmax = Math.max(vmax, v);
-    vmax = niceMax(vmax);
-    const x = (t) => ((t - t0) / span) * (w - 1);
-    const y = (v) => bottom - (Math.min(v, vmax) / vmax) * (bottom - top);
-
-    // The zero line, because every series here is a distance from something and
-    // zero is where they all mean "no disagreement left".
-    g.strokeStyle = SPARK_AXIS;
-    g.lineWidth = 1;
-    g.beginPath();
-    g.moveTo(0, bottom + 0.5);
-    g.lineTo(w, bottom + 0.5);
-    g.stroke();
-
-    // Under the traces: an event is when something happened to the tag, not a
-    // measurement of it, and it must not cover the curve it explains.
-    for (const ev of events) {
-      if (ev.t < t0) continue;
-      const ex = Math.round(x(ev.t)) + 0.5;
-      g.strokeStyle = ev.kind === 'reseeded' ? SPARK_RESEED : SPARK_EVENT;
-      g.beginPath();
-      g.moveTo(ex, top - 3);
-      g.lineTo(ex, bottom);
-      g.stroke();
-    }
-
-    for (const s of series) {
-      g.strokeStyle = s.color;
-      g.lineWidth = 2;
-      g.lineJoin = 'round';
-      g.lineCap = 'round';
-      g.beginPath();
-      const gap = gapMs(s.pts);
-      let prevT = null;
-      for (const [t, v] of s.pts) {
-        if (prevT === null || t - prevT > gap) g.moveTo(x(t), y(v));
-        else g.lineTo(x(t), y(v));
-        prevT = t;
-      }
-      g.stroke();
-      if (s.pts.length <= SPARK_DOTS_UNDER) {
-        g.fillStyle = s.color;
-        for (const [t, v] of s.pts) {
-          g.beginPath();
-          g.arc(x(t), y(v), 1.5, 0, Math.PI * 2);
-          g.fill();
-        }
-      }
-    }
-
-    // The scale, as one number: these are sparklines in a 320 px drawer and an
-    // axis would cost more room than the trace it labels. Without it the chart
-    // is shape-only and a 2 mm wobble looks like a 2 m one.
-    g.fillStyle = SPARK_INK;
-    g.font = '9px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
-    g.textAlign = 'right';
-    g.textBaseline = 'top';
-    g.fillText(fmt(vmax), w - 1, 0);
-
-    if (hoverT !== null && hoverT !== undefined) {
-      const hx = Math.round(x(hoverT)) + 0.5;
-      g.strokeStyle = '#cfcfcf';
-      g.beginPath();
-      g.moveTo(hx, top - 3);
-      g.lineTo(hx, bottom);
-      g.lineWidth = 1;
-      g.stroke();
-      for (const s of series) {
-        const pt = nearestPt(s.pts, hoverT);
-        if (!pt) continue;
-        g.fillStyle = s.color;
-        g.beginPath();
-        g.arc(x(pt[0]), y(pt[1]), 2.5, 0, Math.PI * 2);
-        g.fill();
-      }
-    }
-  }
-
-  function nearestPt(pts, t) {
-    let best = null, bestD = Infinity;
-    for (const p of pts) {
-      const d = Math.abs(p[0] - t);
-      if (d < bestD) { bestD = d; best = p; }
-    }
-    return best;
-  }
-
-  // Everything the two charts draw, derived from the raw record in one place so
-  // the charts, the summary and the hover readout cannot disagree about what a
-  // number means. Both drift series are measured against the pose the map holds
-  // *now* — the question being asked of the history is how far the tag has come
-  // to get here, so the curve has to arrive at zero on the right.
   function histSeries(hist) {
     const s = hist.samples;
     const out = { moved: [], off: [], turned: [], offDeg: [], path: 0 };
@@ -977,6 +848,7 @@ function createClientsPanel(el,
       unit: chart.spec.unit,
       fmt: chart.spec.fmt,
       hoverT: chart.hoverT,
+      eventColor: tagEventColor,
     });
     if (chart.hoverT === null) {
       keyRow(chart.key, chart.series.map((s) => [s.color, s.label]));
@@ -1126,11 +998,14 @@ function createClientsPanel(el,
     root.className = 'drawer-card tag';
     const head = document.createElement('div');
     head.className = 'head';
-    // The settle state, as a dot, because a collapsed card has no room for the
-    // sentence — and a drawer of collapsed cards must still be able to say which
-    // tag is the one worth opening.
+    // The tag's own colour, the one the 2D map draws its bar and id chip in, so
+    // a shut card and a mark on the map name each other without a reader having
+    // to match ids across two surfaces. Identity only: the settle state is the
+    // card's outline (`.settling`, style.css), because a 7px disc carrying two
+    // meanings at once reads as neither.
     const dot = document.createElement('span');
     dot.className = 'dot';
+    dot.style.background = isAnchor ? ROOM_ANCHOR_COLOR_CSS : roomTagColorCss(id);
     const name = document.createElement('span');
     name.className = 'name';
     name.textContent = `Tag ${id}`;
@@ -1178,8 +1053,8 @@ function createClientsPanel(el,
     const live = kvRow('in view', 'no');
     if (isAnchor) {
       // The datum has nothing to be settled about — it is where it is by
-      // definition — so its dot says "not a measurement" rather than "fine".
-      dot.className = 'dot datum';
+      // definition — so its card is never outlined, and its gold is the same
+      // gold both room views give the anchor.
       dot.title = 'The room origin: not measured, never refined';
     }
 
@@ -1229,6 +1104,32 @@ function createClientsPanel(el,
     };
 
     root.append(head, lines, histEls.root);
+
+    // The two room-wide wipes, on the one card that stands for the room frame
+    // rather than in a toolbar above every card alike: forgetting the survey
+    // and wiping the carve both reset what the origin is the origin *of*. Only
+    // the anchor gets them, and only inside its open card — the same `.ctrls`
+    // row a client card carries, so a shut card hides them the way it hides
+    // everything else it has to say.
+    if (isAnchor) {
+      const ctrls = document.createElement('div');
+      ctrls.className = 'ctrls';
+      const clearTags = button('Forget survey',
+        'Forget every tag, this one included — the whole room frame');
+      clearTags.className = 'danger';
+      confirmButton(clearTags, () => onSurveyClear?.(), {
+        armedTitle: 'Click again to forget every tag, the anchor included — the whole room frame',
+      });
+      const clearCarve = button('Wipe carve',
+        'Wipe the carved free space and the walls read off it');
+      clearCarve.className = 'danger';
+      confirmButton(clearCarve, () => onCarveClear?.(), {
+        armedTitle: 'Click again to wipe the carved free space and walls',
+      });
+      ctrls.append(clearTags, clearCarve);
+      root.append(ctrls);
+    }
+
     // `tag` is the newest map entry for it, kept so the settle line can be
     // repainted without one: it carries an age, and no marker-map message comes
     // back to a tag that has stopped being refined.
@@ -1340,7 +1241,7 @@ function createClientsPanel(el,
         el.className = r.cls || '';
       },
     });
-    if (!card.isAnchor) paintSettle(card.settle, card.dot, tag);
+    if (!card.isAnchor) paintSettle(card, tag);
     // Re-padded as a whole: the colon column is the longest label on the card
     // and the set of rows just changed.
     layoutKv(card.lines);
@@ -1355,9 +1256,9 @@ function createClientsPanel(el,
   // The rows are plain divs aligned by their own padding, so nesting them in a
   // container of their own costs nothing. Keyed by label: the state's own rows
   // change with it, and the ones both states carry are the same rows.
-  function paintSettle(el, dot, tag) {
+  function paintSettle(card, tag) {
     const { rows, warn } = settleRows(tag);
-    syncKeyed(el, rows, {
+    syncKeyed(card.settle, rows, {
       key: ([label]) => label,
       make: () => document.createElement('div'),
       paint: (div, [label, value]) => {
@@ -1368,9 +1269,14 @@ function createClientsPanel(el,
     });
     // The state's own rows change with it — a tag going disputed grows a
     // `last check` — so the card is re-padded as a whole, not just here.
-    layoutKv(el);
-    dot.className = warn ? 'dot warn' : 'dot';
-    dot.title = rows.map(([label, value]) => `${label}: ${value}`).join(' · ');
+    layoutKv(card.settle);
+    // On the card, not on the dot: the dot is the tag's colour now. Absence is
+    // the resting state, as it is on the map, so a converged room outlines
+    // nothing and an outline always means go and look. The summary rides the
+    // same element as the mark that raised it — a shut card says nothing else
+    // about why it is outlined.
+    card.root.classList.toggle('settling', warn);
+    card.root.title = rows.map(([label, value]) => `${label}: ${value}`).join(' · ');
   }
 
   // The ages on the cards, moved on regardless of survey traffic. A tag that
@@ -1378,7 +1284,7 @@ function createClientsPanel(el,
   // and it is also the one no marker-map message will ever come back to.
   function paintTagsAges() {
     for (const card of tagCards.values()) {
-      if (!card.isAnchor) paintSettle(card.settle, card.dot, card.tag);
+      if (!card.isAnchor) paintSettle(card, card.tag);
       // The open card's charts are drawn against *now* as their right edge, so
       // they go stale on the same clock the ages do — a tag that stopped being
       // refined must be seen to trail off rather than ending at the edge.
@@ -1424,18 +1330,23 @@ function createClientsPanel(el,
   emptyEl.textContent = 'No clients connected';
   // Clients are updated in place, so they need a container of their own or a
   // client connecting after the map arrived would be appended below the tags.
-  // Tags first: the survey is the standing description of the room and is read
-  // top to bottom as a tree, while the clients are whoever happens to be in it
-  // — a list that empties and refills, and one that would otherwise push the
-  // tree down the drawer every time someone connected.
   const clientsEl = document.createElement('div');
+  clientsEl.className = 'roster';
+  // The roster is two elements — the list and the line that says it is empty —
+  // and they are one panel: the "No clients connected" line is the roster
+  // saying so, not the column it happens to be in. Wrapped, so whoever mounts
+  // it has one root to mount and cannot separate them.
+  const rosterEl = document.createElement('div');
+  rosterEl.append(emptyEl, clientsEl);
   const tagsEl = document.createElement('div');
-  el.append(tagsEl, emptyEl, clientsEl);
+  tagsEl.className = 'tag-list';
 
   return {
-    setActive(on) {
-      el.classList.toggle('active', on);
-    },
+    // The two lists this panel builds, as roots for whoever arranges the
+    // columns. Handed over rather than appended anywhere: which column each
+    // one is in, and whether it is shown at all, stopped being this panel's
+    // business the moment there could be more than one column.
+    sections: { taglist: tagsEl, roster: rosterEl },
 
     // Told from outside, like the room views: one entity is hot across the
     // whole dashboard, and this only draws it — on whichever card family the

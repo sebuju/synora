@@ -10,28 +10,24 @@
   <header class="tight">
     <a class="home" href="/" title="Back to start">Dashboard</a>
     <span id="status" class="grow">connecting…</span>
-    <!-- The room's only metric datum, in the header rather than behind a click:
-         every distance on this page scales by it, a wrong one is invisible in
-         everything downstream (the room just comes out uniformly too big), and
-         the number itself is the printed tag someone is holding. Click to open
-         the drawer where it is set. -->
-    <span id="tagSizeLabel" title="Printed tag edge — click to change"></span>
     <span id="syncLabel"></span>
-    <!-- Views | room overlays | the drawer. Nothing here destroys anything —
-         the two wipes live in the drawer, beside the tag list they empty. -->
-    <button id="sceneBtn" class="toggle">3D</button>
-    <button id="map2dBtn" class="toggle">Top</button>
-    <!-- The two elevations differ only in which room axis runs across the
-         screen; the axis gizmo in each one's corner says which. -->
-    <button id="sideBtn" class="toggle" title="Elevation across x">Side</button>
-    <button id="frontBtn" class="toggle" title="Elevation across z">Front</button>
-    <span class="sep"></span>
-    <button id="poseBtn" class="toggle">Pose</button>
-    <button id="wallsBtn" class="toggle">Walls</button>
-    <span class="sep"></span>
+    <!-- What is left once the view toggles moved onto the view they alter: how
+         this dashboard is doing, and the two halves of the row below. Neither
+         of these is a view toggle — they decide which halves exist at all, and
+         each takes its width out of the other. One glyph for both, the same
+         window split the same way, with the half each button owns filled in. -->
+    <button id="stageBtn" class="icon-btn compact" type="button" title="Stage" aria-label="Stage">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M5 4.5h9.5v15H5z" fill="currentColor" fill-opacity="0.45" stroke="none"/>
+        <rect x="3" y="4.5" width="18" height="15" rx="2"/>
+        <path d="M14.5 4.5v15"/>
+      </svg>
+    </button>
     <button id="drawerBtn" class="icon-btn compact" type="button" title="Drawer" aria-label="Drawer">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
            stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M14.5 4.5H19v15h-4.5z" fill="currentColor" fill-opacity="0.45" stroke="none"/>
         <rect x="3" y="4.5" width="18" height="15" rx="2"/>
         <path d="M14.5 4.5v15"/>
       </svg>
@@ -50,74 +46,170 @@
         </div>
         <div id="roomStats"></div>
       </div>
-    </div>
-    <div id="drawer">
-      <!-- Controls for what the drawer itself holds: the composite below, the
-           audio of the feeds it shows, and the two wipes that forget the survey
-           and the carve the tag list under here is made of. All were in the
-           header, where they sat among the view toggles — a row of things that
-           change what is drawn, with two that destroy what it is drawn from. The
-           panel appends the roster and the tags after these, so they stay at the
-           top. -->
-      <div id="drawerTools">
-        <!-- The two wipes read as one pair: the same strike over the thing being
-             forgotten, a surveyed tag and a carved cell. Red before they are
-             even reached for — the two-click arming says "this one, now", the
-             colour says "these two are not like the others". Held at the far end
-             of the row from the controls that only change what is shown, so the
-             pointer never passes over one on its way to the other. -->
-        <button id="clearTagsBtn" class="icon-btn compact danger" type="button" title="Clear tags" aria-label="Clear tags">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
-               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M4 8V5.5A1.5 1.5 0 0 1 5.5 4H8"/>
-            <path d="M16 4h2.5A1.5 1.5 0 0 1 20 5.5V8"/>
-            <path d="M20 16v2.5a1.5 1.5 0 0 1-1.5 1.5H16"/>
-            <path d="M8 20H5.5A1.5 1.5 0 0 1 4 18.5V16"/>
-            <rect x="9" y="9" width="6" height="6"/>
-            <path d="M3.5 20.5l17-17"/>
-          </svg>
-        </button>
-        <button id="clearCarveBtn" class="icon-btn compact danger" type="button" title="Clear carve" aria-label="Clear carve">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
-               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <rect x="4" y="4" width="16" height="16" rx="1.5"/>
-            <path d="M12 4v16"/>
-            <path d="M4 12h16"/>
-            <path d="M3.5 20.5l17-17"/>
-          </svg>
-        </button>
-        <span class="grow"></span>
-        <button id="combinedBtn" class="icon-btn compact" type="button" title="Camera composite" aria-label="Camera composite">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
-               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <rect x="2.5" y="6" width="13" height="12" rx="2.5"/>
-            <path d="M15.5 10.5l5-3.2v9.4l-5-3.2z"/>
-          </svg>
-        </button>
-        <button id="muteBtn" class="icon-btn compact" type="button" title="Feed audio" aria-label="Feed audio">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
-               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M4 9.5h3.5L12 5.5v13L7.5 14.5H4z"/>
-            <path d="M15.3 9.4a4 4 0 0 1 0 5.2"/>
-            <path d="M17.9 6.9a7.5 7.5 0 0 1 0 10.2"/>
-            <path class="slash" d="M3.5 3.5l17 17"/>
-          </svg>
-        </button>
-      </div>
-      <canvas id="combined" width="1920" height="1080"></canvas>
-      <!-- Server settings. Static here, above whatever the panel appends, and
-           built from the schema the server sends rather than from a list of
-           fields written out twice — a new setting in settings.js turns up here
-           on its own. -->
-      <div id="settingsCard" class="drawer-card settings">
-        <div class="head">
-          <span class="name">Server settings</span>
-          <span id="settingsStatus" class="at"></span>
+      <!-- The toggles for what is drawn here, on the thing they draw on. Two
+           groups: which room view is open, then which layers it shows. Icons
+           rather than words because they sit over the render instead of on the
+           chrome — and because the four view buttons are one family, the same
+           cube with a different face lit, which is a thing a row of four words
+           cannot say. -->
+      <div id="stageTools">
+        <div>
+          <button id="sceneBtn" class="icon-btn compact" type="button" title="3D" aria-label="3D">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/>
+              <path d="M4 7.5l8 4.5 8-4.5"/>
+              <path d="M12 12v9"/>
+            </svg>
+          </button>
+          <button id="map2dBtn" class="icon-btn compact" type="button" title="Top" aria-label="Top">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 3l8 4.5-8 4.5-8-4.5z" fill="currentColor" fill-opacity="0.45"/>
+              <path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/>
+              <path d="M4 7.5l8 4.5 8-4.5"/>
+              <path d="M12 12v9"/>
+            </svg>
+          </button>
+          <!-- The two elevations differ only in which room axis runs across the
+               screen; the lit face says which, and the axis gizmo in each one's
+               corner is what it has to agree with. -->
+          <button id="sideBtn" class="icon-btn compact" type="button"
+                  title="Side — elevation across x" aria-label="Side">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M20 7.5v9L12 21v-9z" fill="currentColor" fill-opacity="0.45"/>
+              <path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/>
+              <path d="M4 7.5l8 4.5 8-4.5"/>
+              <path d="M12 12v9"/>
+            </svg>
+          </button>
+          <button id="frontBtn" class="icon-btn compact" type="button"
+                  title="Front — elevation across z" aria-label="Front">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M4 7.5l8 4.5v9l-8-4.5z" fill="currentColor" fill-opacity="0.45"/>
+              <path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/>
+              <path d="M4 7.5l8 4.5 8-4.5"/>
+              <path d="M12 12v9"/>
+            </svg>
+          </button>
         </div>
-        <div id="settingsRows"></div>
+        <div>
+          <!-- A camera's cone from where it stands: what the pose layer draws. -->
+          <button id="poseBtn" class="icon-btn compact" type="button" title="Pose" aria-label="Pose">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 16.5L5.5 6.5"/>
+              <path d="M12 16.5l6.5-10"/>
+              <path d="M5.5 6.5a7.6 7.6 0 0 1 13 0"/>
+              <circle cx="12" cy="16.5" r="1.7" fill="currentColor" stroke="none"/>
+            </svg>
+          </button>
+          <button id="wallsBtn" class="icon-btn compact" type="button" title="Walls" aria-label="Walls">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="3.5" y="5.5" width="17" height="13" rx="1"/>
+              <path d="M3.5 10h17M3.5 14.5h17"/>
+              <path d="M12 5.5V10M8 10v4.5M16 10v4.5M12 14.5v4"/>
+            </svg>
+          </button>
+        </div>
       </div>
     </div>
   </main>
+  <!-- Where the movable panels and their toggles are parsed, and nowhere they
+       are ever seen: drawers.js takes each one by key on load and mounts it in
+       whichever column the stored arrangement puts it in. Static here rather
+       than built in JS because a canvas with a fixed backing store, a settings
+       card and a mount point are markup, not behaviour — and `hidden` so none
+       of it flashes at the top of the page before the first mount. -->
+  <div id="panelStore" hidden>
+    <!-- The composite, and the audio of the feeds it is made of. The mute
+         button sits *on* the canvas, the way the webcam button sits on a video
+         tile: it is not a control for a panel, it is a control for what is in
+         one, and in a per-column tool row it would be the one button that
+         showed or hid nothing. -->
+    <div id="camsPanel">
+      <canvas id="combined" width="1920" height="1080"></canvas>
+      <button id="muteBtn" class="icon-btn compact" type="button" title="Feed audio" aria-label="Feed audio">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M4 9.5h3.5L12 5.5v13L7.5 14.5H4z"/>
+          <path d="M15.3 9.4a4 4 0 0 1 0 5.2"/>
+          <path d="M17.9 6.9a7.5 7.5 0 0 1 0 10.2"/>
+          <path class="slash" d="M3.5 3.5l17 17"/>
+        </svg>
+      </button>
+    </div>
+    <!-- Server settings, built from the schema the server sends rather than
+         from a list of fields written out twice — a new setting in settings.js
+         turns up here on its own. -->
+    <div id="settingsCard" class="drawer-card settings">
+      <div class="head">
+        <span class="name">Server settings</span>
+        <span id="settingsStatus" class="at"></span>
+      </div>
+      <div id="settingsRows"></div>
+    </div>
+    <!-- The object drawer's own container, so its list is a panel in its own
+         right rather than something appended into the middle of another. -->
+    <div id="objectDrawer"></div>
+    <!-- The toggles. One per movable panel and no more: each travels with the
+         panel it shows, so a column advertises what it holds and nothing else.
+         Hovering one reveals the two arrows that walk that panel a column over;
+         drawers.js wraps each button to hang them off it. -->
+    <div id="panelButtons">
+      <button id="combinedBtn" class="icon-btn compact" type="button" title="Camera composite" aria-label="Camera composite">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <rect x="2.5" y="6" width="13" height="12" rx="2.5"/>
+          <path d="M15.5 10.5l5-3.2v9.4l-5-3.2z"/>
+        </svg>
+      </button>
+      <!-- The two lists the clients panel builds, each a panel in its own
+           right. A column holding a room's worth of tags and a roster is one
+           scroll either way; these are how it becomes one or the other. -->
+      <button id="rosterBtn" class="icon-btn compact" type="button" title="Clients" aria-label="Clients">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="9.5" cy="8.5" r="3.3"/>
+          <path d="M3.5 19.5c0-3.1 2.7-5.2 6-5.2s6 2.1 6 5.2"/>
+          <path d="M16.2 5.6a3.3 3.3 0 0 1 0 5.8"/>
+          <path d="M17.6 14.7c1.8.7 2.9 2.4 2.9 4.8"/>
+        </svg>
+      </button>
+      <!-- The printed tag itself, the same glyph the wipe on the origin card
+           carries — without the strike through it. -->
+      <button id="tagListBtn" class="icon-btn compact" type="button" title="Tags" aria-label="Tags">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M4 8V5.5A1.5 1.5 0 0 1 5.5 4H8"/>
+          <path d="M16 4h2.5A1.5 1.5 0 0 1 20 5.5V8"/>
+          <path d="M20 16v2.5a1.5 1.5 0 0 1-1.5 1.5H16"/>
+          <path d="M8 20H5.5A1.5 1.5 0 0 1 4 18.5V16"/>
+          <rect x="9" y="9" width="6" height="6"/>
+        </svg>
+      </button>
+      <!-- The object drawer. A chair seen from above, because the thing this
+           list is about is furniture the detector named. -->
+      <button id="objListBtn" class="icon-btn compact" type="button" title="Objects" aria-label="Objects">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M6 11V6.5A1.5 1.5 0 0 1 7.5 5h9A1.5 1.5 0 0 1 18 6.5V11"/>
+          <rect x="4" y="11" width="16" height="5" rx="1.5"/>
+          <path d="M7 16v3M17 16v3"/>
+        </svg>
+      </button>
+      <button id="settingsBtn" class="icon-btn compact" type="button" title="Server settings" aria-label="Server settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="3.2"/>
+          <path d="M20.83 10.28A9 9 0 0 1 20.83 13.72L18.28 14.04A6.6 6.6 0 0 1 16.9 16.42L17.9 18.79A9 9 0 0 1 14.93 20.51L13.37 18.46A6.6 6.6 0 0 1 10.63 18.46L9.07 20.51A9 9 0 0 1 6.1 18.79L7.1 16.42A6.6 6.6 0 0 1 5.72 14.04L3.17 13.72A9 9 0 0 1 3.17 10.28L5.72 9.96A6.6 6.6 0 0 1 7.1 7.58L6.1 5.21A9 9 0 0 1 9.07 3.49L10.63 5.54A6.6 6.6 0 0 1 13.37 5.54L14.93 3.49A9 9 0 0 1 17.9 5.21L16.9 7.58A6.6 6.6 0 0 1 18.28 9.96Z"/>
+        </svg>
+      </button>
+    </div>
+  </div>
   <script src="/vendor/three.min.js"></script>
   <script src="/vendor/OrbitControls.js"></script>
   <script src="/common.js"></script>
@@ -126,7 +218,10 @@
   <script src="/scene.js"></script>
   <script src="/map2d.js"></script>
   <script src="/room-feed.js"></script>
+  <script src="/spark.js"></script>
   <script src="/clients-panel.js"></script>
+  <script src="/objects-panel.js"></script>
+  <script src="/drawers.js"></script>
   <script src="/viewer.js"></script>
 </body>
 </html>

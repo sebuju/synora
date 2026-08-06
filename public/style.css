@@ -115,9 +115,15 @@ header .home:hover {
 }
 
 /* Icon buttons carry no text to keep apart, so the row is closed up. Scoped:
-   the client's header is a thumb target and keeps its spacing. */
+   the client's header is a thumb target and keeps its spacing.
+   Wider on the right for the same reason it is only the dashboard's: what sits
+   under that edge here is the drawer, whose own tool row is held off it by the
+   scrollbar. Matched so the last button in the header and the last button in
+   the drawer line up down one edge. No other page has anything to line up
+   with. */
 header.tight {
   gap: 6px;
+  padding-right: 18px;
 }
 
 #status,
@@ -255,7 +261,9 @@ button.active:active:not(:disabled),
   background: var(--btn-on-hover);
 }
 
-/* Text toggles show their state as a dot instead of on/off wording. */
+/* Text toggles show their state as a dot instead of on/off wording. The
+   dashboard's view toggles were the ones with wording; what is left is the
+   settings card's bool rows, where the dot is the whole button. */
 button.toggle::before {
   content: '';
   display: inline-block;
@@ -750,31 +758,127 @@ body.paused #pauseOverlay {
   z-index: 1;
 }
 
-/* The drawer's own controls, above the composite they act on. In the header
-   they were reachable while the drawer was shut, i.e. while the canvas they
-   toggle was not on screen at all. The row is split by a `.grow` spacer rather
-   than by an alignment on the container: the two ends are two groups, and one of
-   them destroys data. */
-#drawerTools {
+/* A column's own controls, at the top of it: one toggle per panel that column
+   holds, and none for the panels it does not. Held to the right edge, the one
+   the cards below are read down. Wrapping because a column narrowed by two
+   others beside it can be thinner than six buttons. */
+.drawer-tools {
   display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 6px;
   margin-bottom: 8px;
 }
 
-/* The combined stream lives in the drawer, above the cards. It used to float
+/* What this column is showing, in words, held at the far end of the row from
+   the buttons by its own auto margin rather than by an alignment on the row —
+   the buttons stay flush right whether this has anything to say or not.
+   Truncated rather than wrapped: a column can be narrower than its own list,
+   and a name growing the row a line taller would move every panel under it
+   down each time one was switched on. */
+.drawer-tools .names {
+  flex: 0 1 auto;
+  min-width: 0;
+  margin-right: auto;
+  align-self: center;
+  font-size: 12px;
+  color: #9a9a9a;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Nothing on in this column: no label, and no gap where one would be. The row
+   is flush right on its own, so the auto margin going with it changes nothing.
+   Same rule the header's own chips follow when they have no value yet. */
+.drawer-tools .names:empty {
+  display: none;
+}
+
+/* A column with everything switched off has already shrunk to the width of its
+   own controls, so those controls stop being a row and become the column — a
+   strip of buttons down the edge rather than a stub of one across the top.
+   Both alignments have to be handed back: in a column direction the flush-right
+   justify becomes flush-bottom, which would drop the strip to the floor. */
+.drawer.empty .drawer-tools {
+  flex-direction: column;
+  justify-content: flex-start;
+  align-items: center;
+}
+
+/* One toggle and the two arrows that walk its panel a column over. The arrows
+   are inside the thing being hovered, flush under the button, so the pointer
+   can travel down onto them without leaving the hover — a gap here is a flyout
+   that cannot be reached. `visibility` rather than `display`, the same as the
+   card and tile remove buttons: a hidden box that still measures is what lets
+   the pointer arrive somewhere rather than at nothing.
+
+   Centred on the toggle: the pair is read as belonging to the button above it,
+   and hung off one edge it reads as belonging to whatever is beside it. The
+   two minis are 10px wider than the compact toggle, so a centred pair
+   overhangs by 5px each side — inside the column's own 8px padding even for
+   the last button in a flush-right row, which is what stops the overhang
+   meeting the horizontal clip that comes with `overflow-y`. */
+.tool {
+  position: relative;
+  display: inline-flex;
+}
+
+.tool .move {
+  position: absolute;
+  top: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 4;
+  display: flex;
+  gap: 2px;
+  padding-top: 2px;
+  visibility: hidden;
+}
+
+.tool:hover .move {
+  visibility: visible;
+}
+
+/* The one move that cannot be made: the panel is alone in its column and that
+   column is already at that end, so it would be destroyed and rebuilt
+   identically. Dimmed rather than hidden — the pair reads as a pair. */
+.tool .move button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+/* The combined stream lives in a drawer, above the cards. It used to float
    over the room views as a picture-in-picture, which meant the one view that
    shows the actual cameras was also the one covering up whatever was underneath
-   it. In the drawer it takes space instead of borrowing it. The canvas keeps its
+   it. In a drawer it takes space instead of borrowing it. The canvas keeps its
    1920x1080 backing store — that is what the compositing and sync code reads —
-   and CSS only shrinks what is drawn. */
+   and CSS only shrinks what is drawn.
+
+   The panel is the canvas plus the audio switch for what is on it, and it
+   anchors that switch the way a video tile anchors its own. */
+#camsPanel {
+  position: relative;
+  margin-bottom: 8px;
+}
+
 #combined {
-  display: none;
+  display: block;
   width: 100%;
   height: auto;
-  margin-bottom: 8px;
   background: #000;
   border: 1px solid #333;
   border-radius: 6px;
+}
+
+/* On the picture rather than in a tool row, for the same reason the webcam
+   button is on a tile: it does not show or hide a panel, it changes what is
+   already in one, and a row of panel toggles is exactly where it would be
+   mistaken for one. Same corner as .tile .cam-btn. */
+#muteBtn {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
 }
 
 /* Room views (3D scene and/or 2D floor plan side by side): same layering
@@ -871,19 +975,31 @@ body.paused #pauseOverlay {
   }
 }
 
-/* The side drawer: the camera composite, the client roster with its remote
-   controls, and the surveyed tags. Not named after any one of them — it started
-   as the client list and grew the other two, and a name that only covers the
-   first is how the third ends up somewhere else instead.
+/* The drawer columns. Their own flex row rather than siblings of the stage:
+   with the stage away they have one box to divide between them instead of each
+   arguing with the row for a share, and it keeps them on the stage's right
+   without every reorder having to step around it. Sized by its children, so an
+   empty row (every column hidden) takes no width at all. */
+#drawers {
+  display: flex;
+  min-width: 0;
+  height: 100%;
+}
+
+/* A drawer: whatever panels currently sit next to each other, with the toggles
+   for exactly those at the top. Not named after its contents — it started as
+   the client list, grew the composite and the tags, and there is no longer any
+   one of them it is more about than another.
 
    A column of the layout, not a sheet over it: it takes its width out of the
    row so the views beside it get the rest, which is why nothing in it needs a
-   z-index or a translucent background any more. Capped at half the window so a
-   narrow one cannot squeeze the views away entirely. */
-#drawer {
+   z-index or a translucent background. Shrinkable rather than fixed — three
+   columns at a rigid 380px crush the stage to nothing before any of them
+   gives. */
+.drawer {
   display: none;
-  flex: 0 0 340px;
-  max-width: 50%;
+  flex: 0 0 380px;
+  min-width: 0;
   height: 100%;
   padding: 8px;
   background: #0c0c0c;
@@ -891,11 +1007,40 @@ body.paused #pauseOverlay {
   overflow-y: scroll;
 }
 
-#drawer.active {
+.drawer.active {
   display: block;
 }
 
-#drawer .none {
+/* The stage put away entirely: the columns stop being things beside something
+   and become the page. An even split rather than a basis each — with nothing
+   to leave room for, one column at 380px is a stripe down the left edge and
+   three of them still leave the rest empty. */
+body.no-stage #stage {
+  display: none;
+}
+
+body.no-stage #drawers {
+  flex: 1 1 100%;
+}
+
+body.no-stage .drawer {
+  flex: 1 1 0;
+}
+
+/* Every panel in this column switched off: what is left is the tool row that
+   switches them back on, and a column reserving 380px for nothing is 380px the
+   views do not get. Sized to that row instead, and `auto` rather than the
+   always-on scrollbar — the reserved gutter stops the layout jumping as cards
+   arrive and leave, and there is nothing here to arrive. Listed twice because
+   the stage-away rule sets the whole `flex` shorthand and outranks this one. */
+.drawer.empty,
+body.no-stage .drawer.empty {
+  flex-grow: 0;
+  flex-basis: auto;
+  overflow-y: auto;
+}
+
+.drawer .none {
   padding: 8px 4px;
   font-size: 13px;
   color: #777;
@@ -1031,7 +1176,11 @@ body.paused #pauseOverlay {
 }
 
 .drawer-card.tag:not(.open) .lines,
-.drawer-card.tag:not(.open) .hist {
+.drawer-card.tag:not(.open) .hist,
+/* The origin card's two wipes, which only it has. A control row is not a
+   summary, and these two least of all: they reset the room frame, so they are
+   reached the same way everything else inside a tag card is — by opening it. */
+.drawer-card.tag:not(.open) .ctrls {
   display: none;
 }
 
@@ -1048,22 +1197,30 @@ body.paused #pauseOverlay {
   background: #212121;
 }
 
-/* Settled, settling, or not a measurement at all — the sentence that says so is
-   inside the card, and this is what is left of it when the card is shut. */
+/* Which tag this card is, as a colour — the fill is painted inline from
+   roomTagColorCss (the anchor's gold from ROOM_ANCHOR_COLOR_CSS), so the rule
+   only owns the shape. It is what is left of the card when it is shut, and on a
+   drawer of shut cards it is the only thing tying a card to its mark on the
+   map. */
 .drawer-card .dot {
   align-self: center;
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: #3aa471;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
 }
 
-.drawer-card .dot.warn {
-  background: #e0a03a;
-}
-
-.drawer-card .dot.datum {
-  background: #55585c;
+/* The survey is not done with this one. The whole card is marked, not the dot:
+   a 7px disc is where the tag's identity lives now, and a second meaning
+   stacked on it is unreadable at that size — while a drawer scrolled past at a
+   glance is a column of card edges. An outline rather than the border or an
+   inset ring, because both are taken: the border by hover and by the open card,
+   the inset ring by .seen. Offset so it reads as a ring around the card and not
+   as a border that changed colour; it costs no layout, and 1px of the drawer's
+   8px padding is room it already has. Amber is ROOM_SETTLING_CSS (common.js),
+   the same mark the map puts around the tag's id chip. */
+.drawer-card.tag.settling {
+  outline: 1px solid #e0a03a;
+  outline-offset: 1px;
 }
 
 /* In view of a client right now. On the card rather than only in its lines,
@@ -1167,6 +1324,21 @@ body.paused #pauseOverlay {
   padding: 3px 0;
 }
 
+/* A heading is a divider, not a control: the same muted grey as the units, and
+   the space above it is what separates the groups — a rule would be a fifth
+   line in a card that is already all lines. */
+.drawer-card.settings .group-head {
+  margin: 10px 0 2px;
+  color: #888;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.drawer-card.settings .setting-group:first-child .group-head {
+  margin-top: 2px;
+}
+
 .drawer-card.settings .setting .label {
   font-size: 12px;
   color: #bbb;
@@ -1205,6 +1377,30 @@ body.paused #pauseOverlay {
   border-radius: 4px;
 }
 
+/* A choice from a fixed list, styled as the number field's sibling rather than
+   left to the browser: it is the same kind of thing — a value box in the value
+   column with a Set button beside it — and a default select next to a styled
+   input reads as a control from a different application.
+
+   It spans the value and unit columns because a filename does not fit in 7ch
+   and there is no unit to displace, and it stops short of the button column so
+   Set stays on the right edge every other row's Set is on. */
+.drawer-card.settings .setting select {
+  grid-column: 2 / 4;
+  width: 100%;
+  min-width: 0;
+  height: 24px;
+  padding: 2px 4px;
+  color: #eee;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  background: #2d2d2d;
+  border: unset;
+  border-radius: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* Every button in the card is one height, whatever it holds. Left to their
    content they are not: a Set button is sized by a line of 12 px text, a toggle
    by an 8 px dot, and the two came out several pixels apart in a column that is
@@ -1218,29 +1414,6 @@ body.paused #pauseOverlay {
   padding: 0px;
   font-size: 12px;
   width: 32px;
-}
-
-/* The room's only metric datum, in the header. Monospace and boxed like the
-   client's own id label: it is a measured number, not a caption, and it is read
-   against a printed tag someone is holding. */
-#tagSizeLabel {
-  flex-shrink: 0;
-  color: #eee;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 13px;
-  padding: 3px 8px;
-  cursor: pointer;
-  background: #2d2d2d;
-  border: 1px solid #444;
-  border-radius: 6px;
-}
-
-#tagSizeLabel:hover {
-  border-color: #666;
-}
-
-#tagSizeLabel:empty {
-  display: none;
 }
 
 /* The survey chain, drawn as the nesting itself: a tag's card sits inside its
@@ -1323,12 +1496,12 @@ body.paused #pauseOverlay {
    dashboard is otherwise unchanged at that instant, so a hard cut reads as a
    render glitch instead of as the room draining of colour. */
 #stage,
-#drawer {
+.drawer {
   transition: filter 600ms ease, opacity 600ms ease;
 }
 
 body.displaced #stage,
-body.displaced #drawer {
+body.displaced .drawer {
   filter: grayscale(1);
   opacity: 0.75;
 }
@@ -1349,4 +1522,179 @@ body.displaced #drawer {
 
 #roomStats:empty {
   display: none;
+}
+
+/* The view toggles, over the views they switch. Top-left against #roomStats'
+   top-right, at the same inset, so the two read as one pair of corners. No
+   plate behind them — the button skin is already built to sit over video and
+   over a room view (see the token note at the top), and #roomStats is plated
+   because monospace text on a render is unreadable, not because an overlay
+   here needs it. Transparent to the pointer except on the buttons themselves:
+   the gaps sit over an OrbitControls canvas, and a dead strip across the top
+   of a 3D view is a drag that quietly does nothing. Wrapping and capped, so a
+   narrow stage folds the layer group under the view group rather than running
+   it into the stats box. */
+#stageTools {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: 3;   /* over #roomViews (2), which is over #backdrop (1) */
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  max-width: 60%;
+  pointer-events: none;
+}
+
+/* The two groups, so a wrap breaks between them and never inside one. */
+#stageTools > div {
+  display: flex;
+  gap: 6px;
+}
+
+#stageTools button {
+  pointer-events: auto;
+}
+
+/* --- The object drawer ---------------------------------------------------- */
+/* Its own section under the tag list, shown or hidden as a whole. Off by
+   default: it is a record of an experiment that feeds nothing, and it is opened
+   to answer a question rather than watched. */
+#objectDrawer .empty {
+  color: #6f6f6f;
+  font-size: 12px;
+  padding: 6px 2px;
+}
+
+#objectDrawer .empty:only-child,
+#objectDrawer .tag-list:not(:empty) + .empty {
+  display: none;
+}
+
+/* Shut is one line, the same bargain the tag cards make — twenty-six open cards
+   is not a list. */
+.drawer-card.object:not(.open) .body {
+  display: none;
+}
+
+.drawer-card.object .body {
+  margin-top: 6px;
+}
+
+/* Same chart box as the tag drawer's: the canvas is sized from its own layout
+   box in device pixels every time it is drawn, so CSS has to settle the width
+   first or every chart is drawn at whatever width the last one had. */
+.drawer-card.object canvas.spark {
+  display: block;
+  width: 100%;
+  height: 40px;
+  margin-top: 4px;
+}
+
+.drawer-card.object .rows .row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  color: #9a9a9a;
+  line-height: 1.5;
+}
+
+.drawer-card.object .rows .row span:last-child {
+  color: #c8c8c8;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+/* The event log. Newest first, monospace clock down the left so the column can
+   be read without reading the sentences beside it. */
+.drawer-card.object .events {
+  margin-top: 6px;
+  border-top: 1px solid #2c2c2c;
+  padding-top: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 168px;
+  overflow-y: auto;
+}
+
+.drawer-card.object .events .event {
+  display: flex;
+  gap: 6px;
+  font-size: 11px;
+  color: #a8a8a8;
+  line-height: 1.4;
+}
+
+.drawer-card.object .events .event .t {
+  color: #6f6f6f;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  flex: none;
+}
+
+/* The moments that are the map having been wrong about something — a
+   quarantine, a re-seed, an entry absorbed away. The same red the sparkline
+   marks them in, so the chart and the list name the same events. */
+.drawer-card.object .events .event.fault {
+  color: #e0603a;
+}
+
+/* An object card's heading ends in its state, not its position — the position
+   moved inside when the list gained a spatial order that already says where
+   things are. Pushed to the right edge the way a tag's ordinates are, and for
+   the same reason: `out — class`, `prior 61%`, `n=3` is what is scanned *down*
+   the drawer, and a clause that starts wherever the class name happens to end
+   cannot be scanned at all. */
+.drawer-card.object .kind {
+  margin-left: auto;
+  padding-left: 8px;
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* The name gives way first: a class name can be truncated and still read
+   ("Cabinet/she…"), where a truncated state cannot. */
+.drawer-card.object .name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The position row is the one thing in the card set in axis colours, so its
+   value keeps the monospace column but not the flat grey the other rows use. */
+.drawer-card.object .rows .row:first-child span:last-child {
+  color: inherit;
+}
+
+/* A quarantined object's card. **Not dimmed** — `.drawer-card.gone` fades an
+   offline client to 0.55 because that card is one of many and its content is
+   stale, but this one is the card most likely to be the one actually being read:
+   it is the answer to "where did that go". The same objection that took opacity
+   off the map applies, so the state is a rail down the left edge in the fault
+   colour, and the reason is written in the heading. */
+/* What the map has ruled out. Greyed as well as faded: greyscale is what takes
+   the teal and the periwinkle off the class dot, and those two colours mean
+   "the map stands on this" — which is exactly what has stopped being true.
+   The objection that took opacity off the map does not carry here. There it was
+   the only thing saying an object existed at all, over a busy canvas; here the
+   card is a row in a list, still legible, and the fade is saying "not part of
+   the room" in the one place it is safe to say quietly. */
+.drawer-card.object.gone {
+  opacity: 0.55;
+  filter: grayscale(1);
+}
+
+/* Full strength while it is being read. This card is opened precisely to ask
+   why this one went, and that is not a question to answer through a fade. */
+.drawer-card.object.gone.open,
+.drawer-card.object.gone:hover {
+  opacity: 1;
+  filter: none;
+}
+
+/* Under a rule of its own, so the list reads as the room and then as what the
+   room no longer has, rather than as one list with three odd entries at the
+   bottom. */
+.drawer-card.object:not(.gone) + .drawer-card.object.gone {
+  margin-top: 10px;
 }
