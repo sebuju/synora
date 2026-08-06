@@ -556,22 +556,48 @@ function solvePose(objPts, imgPts, K, seed, { maxIter = 60 } = {}) {
 
 // The room<-session transform implied by one paired (session pose, room pose).
 //
-// Both frames are gravity-aligned — ARCore's session frame by definition, the
-// room frame to about 2 degrees — so the whole transform is a yaw and a
-// translation, four numbers. Three places need it and it must be one
-// implementation: the phone recovers it to draw the object readout, the server
-// recovers it to say how far a shape-derived fix sits from the survey's own, and
-// `replay-objects.js` recovers it as the ground truth its carry error is
-// measured against. Two of those disagreeing about the sign of a yaw is not a
-// bug anything downstream could see.
+// Returned twice over, and which one a caller wants is a real choice:
+//
+//   - `se3` is the transform as measured — the full rotation and the translation
+//     that goes with it. Exact by construction.
+//   - `yaw`/`t` is that transform with its pitch and roll dropped, on the
+//     assumption that both frames are gravity-aligned: ARCore's session frame is
+//     by definition, and the room frame is meant to be.
+//
+// **The room frame is not as upright as that assumption needs.** Its gravity is
+// the anchor tag's, so a tilt in the tag's solved pose is a tilt in the whole
+// map, and the map is internally consistent about it — every other tag agrees,
+// because they were all placed through the same datum. Measured on one walk
+// (`recordings/2026-08-06_234424_client1`): 5.8 degrees, steady, p90 6.2.
+//
+// Dropping that tilt is a rotation *about the camera*, so the error it leaves is
+// zero at the eye and grows with range — 77 mm at 1.5 m on that walk, half a
+// metre across a room. Anything drawing a mapped point over the real thing has to
+// use `se3`. `yaw`/`t` is for the consumers that want a heading rather than a
+// position, and for the localizer, which solves for a yaw in a world it takes to
+// be gravity-aligned and would have nothing to compare a full rotation against.
+//
+// One implementation either way: the phone recovers this to draw the object
+// readout, the server recovers it to say how far a shape-derived fix sits from
+// the survey's own, and `replay-objects.js` recovers it as the ground truth its
+// carry error is measured against. Two of those disagreeing about the sign of a
+// yaw is not a bug anything downstream could see.
 function sessionAlignment(xr, roomPose) {
   if (!xr?.p || !xr?.q || !roomPose?.p || !roomPose?.q) return null;
-  const q = quatMul(roomPose.q, quatConj(xr.q));
+  const q = quatNormalize(quatMul(roomPose.q, quatConj(xr.q)));
   const yaw = 2 * Math.atan2(q[1], q[3]);
   const c = Math.cos(yaw);
   const s = Math.sin(yaw);
   const rp = [c * xr.p[0] + s * xr.p[2], xr.p[1], -s * xr.p[0] + c * xr.p[2]];
-  return { yaw, t: [roomPose.p[0] - rp[0], roomPose.p[1] - rp[1], roomPose.p[2] - rp[2]] };
+  const ep = quatRotate(q, xr.p);
+  return {
+    yaw,
+    t: [roomPose.p[0] - rp[0], roomPose.p[1] - rp[1], roomPose.p[2] - rp[2]],
+    se3: {
+      q,
+      p: [roomPose.p[0] - ep[0], roomPose.p[1] - ep[1], roomPose.p[2] - ep[2]],
+    },
+  };
 }
 
 if (typeof module !== 'undefined') {
