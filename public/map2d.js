@@ -41,9 +41,15 @@ const AXIS_GIZMO_LABEL_PX = 14;
 const AXIS_GIZMO_TEXT_PX = 7;
 const AXIS_GIZMO_PAD = 12;
 
-// Label text. One constant because the dodge, the obstacle test and the drawing
-// all have to be measuring the same font.
+// Label text, and the second line some labels carry under it. The sub line is
+// smaller and set in the same family: it is the same label continued, not a
+// second label, and at equal size the two lines read as two marks.
 const LABEL_FONT = '12px ui-monospace, monospace';
+const LABEL_SUB_FONT = '10px ui-monospace, monospace';
+// Baseline of the sub line below the main one, and how far the pair reaches
+// under the anchor — both in screen pixels, since that is what the dodge and
+// the obstacle tests are measured in.
+const LABEL_SUB_DY = 11;
 
 // Room y, the one axis that means something without knowing the room frame's
 // convention. Written as an arrow and a magnitude — `↑0.38`, `↓0.73` — where x
@@ -552,8 +558,26 @@ function createMap2dView(canvas, mode = 'top', {
     // may not be dodged somewhere else and then read as pointing the wrong way.
     // A pinned label takes its spot before anything searches and is drawn last,
     // over whatever it lands on.
-    const queueLabel = (key, text, x, y, color, bg, alpha = 1, pin = null) =>
-      labels.push({ key, text, x, y, color, bg, alpha, pin });
+    // `opts.sub` is an array of smaller lines drawn under the first and placed
+    // as one block with it — detail belonging to the same mark, not further
+    // labels that could end up somewhere else and be read against another one.
+    // `opts.fixed` opts the label out of the dodge entirely, in both directions:
+    // it does not move and nothing moves for it. Both in an options bag rather
+    // than as a ninth and tenth positional, which is where the argument list
+    // stopped being readable.
+    const queueLabel = (key, text, x, y, color, bg, alpha = 1, pin = null, opts = null) =>
+      labels.push({
+        key,
+        text,
+        x,
+        y,
+        color,
+        bg,
+        alpha,
+        pin,
+        sub: opts?.sub?.length ? opts.sub : null,
+        fixed: !!opts?.fixed,
+      });
     // Nearest first, so a label sits as close to its mark as it can. The ring
     // reaches further than it used to because labels now block each other as
     // well as the strokes: a cluster of sight lines to one tag exhausted the
@@ -581,15 +605,28 @@ function createMap2dView(canvas, mode = 'top', {
       // Widths are measured once per distinct string, not once per label per
       // frame: the font is a constant here, so the same twenty-odd strings were
       // being measured thirty times a second for no new information.
-      const halfWidth = (text) => {
-        let half = textHalfWidths.get(text);
+      // Keyed by size as well as by string: the sub line is set smaller, and one
+      // cache across two fonts would hand back whichever width happened to be
+      // measured first.
+      const halfWidth = (text, small) => {
+        const key = small ? `sub:${text}` : text;
+        let half = textHalfWidths.get(key);
         if (half === undefined) {
           if (textHalfWidths.size > 512) textHalfWidths.clear();
+          if (small) ctx.font = LABEL_SUB_FONT;
           half = ctx.measureText(text).width / 2;
-          textHalfWidths.set(text, half);
+          if (small) ctx.font = LABEL_FONT;
+          textHalfWidths.set(key, half);
         }
         return half;
       };
+      // A two-line label is as wide as its widest line and reaches a line
+      // further down. Everything that places or reserves space goes through
+      // these two, so the dodge, the obstacle test and the drawing can never
+      // disagree about how big a label is.
+      const labelHalf = (lb) => (lb.sub || []).reduce(
+        (m, s) => Math.max(m, halfWidth(s, true)), halfWidth(lb.text));
+      const labelDrop = (lb) => (lb.sub ? lb.sub.length * LABEL_SUB_DY : 0);
       // The dodge runs in the same turned space as the geometry it is dodging;
       // only the drawing is straightened, about the spot the label ended up at.
       // Text that rode the rotation would be sideways or upside down exactly
@@ -602,41 +639,64 @@ function createMap2dView(canvas, mode = 'top', {
           ctx.translate(-x, -y);
         }
         if (lb.bg) {
-          const w2 = halfWidth(lb.text) + 4;
+          const w2 = labelHalf(lb) + 4;
           ctx.fillStyle = lb.bg;
-          ctx.fillRect(x - w2, y - 11, w2 * 2, 14);
+          ctx.fillRect(x - w2, y - 11, w2 * 2, 14 + labelDrop(lb));
         }
         ctx.fillStyle = lb.color;
         ctx.fillText(lb.text, x, y);
+        if (lb.sub) {
+          // Smaller, and only smaller. The size difference is what says the
+          // rows are subordinate to the name; dimming them as well would make
+          // the detail hard to read at exactly the zoom it exists for.
+          ctx.font = LABEL_SUB_FONT;
+          lb.sub.forEach((s, i) => ctx.fillText(s, x, y + (i + 1) * LABEL_SUB_DY));
+          ctx.font = LABEL_FONT;
+        }
         if (labelRot) ctx.restore();
       };
       const boxFor = (lb, ox, oy) => ({
-        minX: lb.x + ox - halfWidth(lb.text) - LABEL_PAD,
+        minX: lb.x + ox - labelHalf(lb) - LABEL_PAD,
         minY: lb.y + oy - 11 - LABEL_PAD,
-        maxX: lb.x + ox + halfWidth(lb.text) + LABEL_PAD,
-        maxY: lb.y + oy + 3 + LABEL_PAD,
+        maxX: lb.x + ox + labelHalf(lb) + LABEL_PAD,
+        maxY: lb.y + oy + 3 + labelDrop(lb) + LABEL_PAD,
       });
       // Solid labels claim their spot first and the fading ones dodge around
       // them, never the other way round. Below half opacity a label stops
       // reserving at all — a ghost about to disappear must not push a live
       // label aside for good, since a kept spot is only given up when blocked.
       const order = labels.slice().sort((a, b) => b.alpha - a.alpha);
+      // A fixed label sits on its anchor and takes no part in any of this: it
+      // neither dodges nor reserves. The dodge exists so that a label which
+      // *names a place* is not read against the wrong mark, and it pays for that
+      // with a label that can end up a long way from what it names. A label
+      // whose mark is drawn around it, and whose own coordinate is in its text,
+      // is not naming a place — so it can sit dead on the thing and let whatever
+      // else lands there land there. Drawn before everything, so the survey's
+      // own text is the layer on top when they do collide.
+      for (const lb of order) {
+        if (!lb.fixed || lb.alpha <= 0.01) continue;
+        ctx.globalAlpha = lb.alpha;
+        drawLabel(lb, lb.x, lb.y);
+      }
       // A pinned label cannot move, so it is the one thing every dodge has to
       // route around: it reserves before the search starts rather than in turn.
       for (const lb of order) {
+        if (lb.fixed) continue;
         if (lb.pin && lb.alpha > 0.5) taken.push(boxFor(lb, lb.pin[0], lb.pin[1]));
       }
       // Held back and drawn after the rest, so a pinned label lands on top of
       // whatever could not get out of its way.
       const pinned = [];
       for (const lb of order) {
-        if (lb.alpha <= 0.01) continue;
+        if (lb.alpha <= 0.01 || lb.fixed) continue;
         if (lb.pin) {
           pinned.push(lb);
           continue;
         }
         ctx.globalAlpha = lb.alpha;
-        const half = halfWidth(lb.text);
+        const half = labelHalf(lb);
+        const drop = labelDrop(lb);
         let x = lb.x;
         let y = lb.y;
         const boxAt = (ox, oy) => boxFor(lb, ox, oy);
@@ -647,7 +707,7 @@ function createMap2dView(canvas, mode = 'top', {
           if (taken.some((t) => t.minX < b.maxX && t.maxX > b.minX
             && t.minY < b.maxY && t.maxY > b.minY)) return false;
           return obstacles.every((o) => !segHitsBox(o.x1, o.y1, o.x2, o.y2,
-            cx - half - o.r, cy - 10 - o.r, cx + half + o.r, cy + 2 + o.r));
+            cx - half - o.r, cy - 10 - o.r, cx + half + o.r, cy + 2 + drop + o.r));
         };
         // The dodge is re-searched every frame against obstacles that move
         // every frame, so a label near a tie flickers between two offsets. Its
