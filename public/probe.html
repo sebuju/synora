@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Probe</title>
+  <link rel="stylesheet" href="/style.css">
+  <style>
+    /* Extra top padding: the report is the first thing read and sitting it
+       hard against the topnav makes it look like part of the chrome. */
+    main { flex-direction: column; gap: 14px; padding: 12px 12px 16px; overflow-y: auto; justify-content: flex-start; }
+    #report, #live {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 13px; white-space: pre-line; color: #bbb; max-width: 640px;
+    }
+    .yes { color: #4fbf6f; }
+    .no { color: #c86a6a; }
+    button.wide { padding: 8px 16px; font-size: 15px; }
+    /* The in-session overlay: the phone is in AR, so this is the only way to
+       read anything while walking. */
+    #overlay {
+      position: fixed; inset: auto 8px 8px 8px; z-index: 20;
+      background: rgba(0,0,0,0.72); border-radius: 6px; padding: 10px;
+      font-family: ui-monospace, monospace; font-size: 13px; color: #eee;
+      white-space: pre-line; display: none;
+      padding-top: 20px;
+    }
+    #overlay.on { display: block; }
+    /* Read and tapped while walking, so the buttons need clear water between
+       them and the readout above them, and between each other. */
+    #overlayText { margin-bottom: 12px; }
+    #btnContainer { display: flex; gap: 6px; }
+    #overlay button { margin-right: 12px; padding: 8px 14px; }
+    /* The flags block: read standing in the room, so the state pill has to be
+       findable without reading the sentence next to it. */
+    #flags, #sensors { max-width: 640px; font-size: 13px; color: #bbb; }
+    .flagHead { color: #ddd; font-weight: 600; }
+    .flagNote { color: #888; margin: 6px 0 10px; line-height: 1.4; }
+    .flagRow { border-top: 1px solid #2a2a2a; padding: 8px 0; }
+    .flagName { color: #ddd; }
+    .flagName span { margin-left: 8px; font-family: ui-monospace, monospace; font-size: 12px; }
+    .unknown { color: #8a8a8a; }
+    .flagWhy { color: #999; margin: 2px 0 6px; line-height: 1.4; }
+    .flagUrl { display: flex; align-items: center; gap: 12px; margin-top: 8px; }
+    .flagUrl code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px; color: #cfc9a8; overflow-wrap: anywhere;
+    }
+    .flagUrl button { padding: 4px 10px; font-size: 12px; }
+    /* A reader's button and its numbers are one unit — the numbers mean nothing
+       without knowing which sensor is running. */
+    .flagRead { margin-top: 6px; }
+    .flagRead button { padding: 4px 10px; font-size: 12px; min-width: 190px; text-align: left; }
+    .flagData {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px; color: #cfc9a8; margin: 4px 0 0 2px;
+      white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.45;
+    }
+    .sensorOff { color: #6f6f6f; }
+    .flagPerm { color: #7f8fa0; font-size: 12px; margin-top: 2px; }
+  </style>
+</head>
+<body>
+  <header>
+    <a class="home" href="/" title="Back to start">Probe</a>
+    <span id="status" class="grow">checking…</span>
+  </header>
+  <main>
+    <div id="report">probing…</div>
+    <button id="startBtn" class="wide" type="button" disabled>Start AR session</button>
+    <div id="live"></div>
+    <section id="sensors"></section>
+    <section id="flags"></section>
+  </main>
+  <div id="overlay">
+    <div id="overlayText"></div>
+    <div id="btnContainer">
+      <button id="markBtn" type="button">Mark origin</button>
+      <button id="endBtn" type="button">End</button>
+    </div>
+  </div>
+  <script src="/probe.js"></script>
+</body>
+</html>

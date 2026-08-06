@@ -23,7 +23,7 @@ const STATE_DIR = process.env.SYNORA_STATE_DIR || __dirname;
 const CERT_DIR = path.join(__dirname, 'certs');
 const RECORDINGS_DIR = path.join(STATE_DIR, 'recordings');
 const PUBLIC_DIR = path.join(__dirname, 'public');
-// One-off measurement rigs (in the spirit of /xr-probe, but not features at
+// One-off measurement rigs (in the spirit of /probe, but not features at
 // all) live outside public/ so the app's own pages stay uncluttered by them.
 const EXPERIMENTS_DIR = path.join(__dirname, 'experiments');
 const FFMPEG = path.join(__dirname, 'tools', 'ffmpeg.exe');
@@ -302,7 +302,7 @@ function serveStatic(req, res) {
   if (urlPath === '/viewer' || urlPath === '/dashboard') urlPath = '/viewer.html';
   if (urlPath === '/calibrate') urlPath = '/calibrate.html';
   if (urlPath === '/markers') urlPath = '/markers.html';
-  if (urlPath === '/xr-probe') urlPath = '/xr-probe.html';
+  if (urlPath === '/probe') urlPath = '/probe.html';
   if (urlPath === '/xr-client') urlPath = '/xr-client.html';
   if (urlPath === '/digital') urlPath = '/digital.html';
   if (urlPath === '/audio-lab') urlPath = '/experiments/audio-lab.html';
