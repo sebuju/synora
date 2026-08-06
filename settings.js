@@ -24,6 +24,14 @@ const fs = require('fs');
 // the stored unit, so a viewer that renders millimetres and a journal that
 // records metres cannot come to disagree about what 150 means.
 //
+// `group` is the heading a setting appears under in the dashboard, and the
+// reason the order of this list is not arbitrary: consecutive entries sharing a
+// group are one run under one heading, so a new setting goes beside the ones it
+// belongs with rather than at the end. What a setting acts on is the split —
+// the room, what the phone sends, what this PC does with it, what is written as
+// pictures — and the dashboard renders the string it is given, so nothing over
+// there decides what belongs where.
+//
 // `danger` is the sentence shown before the change is allowed through, for the
 // settings that throw work away. It is copy, not a mechanism: the store applies
 // whatever it validates. Asking is the dashboard's job, because the dashboard
@@ -32,6 +40,7 @@ const SPEC = [
   {
     key: 'markerSizeM',
     label: 'Tag size',
+    group: 'Room',
     type: 'number',
     def: 0.15,
     min: 0.02,
@@ -48,6 +57,7 @@ const SPEC = [
   {
     key: 'poseRateMs',
     label: 'Detection interval',
+    group: 'Room',
     type: 'number',
     def: 100,
     min: 50,
@@ -62,6 +72,7 @@ const SPEC = [
   {
     key: 'wallsEnabled',
     label: 'Wall carving',
+    group: 'Room',
     type: 'bool',
     def: true,
     help: 'Carve free space and infer walls from accepted pose reports. Off, the grid stops '
@@ -70,6 +81,7 @@ const SPEC = [
   {
     key: 'poseJournalEnabled',
     label: 'Pose journal',
+    group: 'Room',
     type: 'bool',
     def: true,
     help: 'Record every observation and the pose the survey made of it to '
