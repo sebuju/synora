@@ -35,6 +35,9 @@ const {
   quatAngleDeg, quatConj, quatFromRvec, quatMedian, quatMul, quatRotate,
   mirrorRvecGuesses, se3Compose, se3FromRvecTvec, se3Invert,
 } = require('./public/pose-math.js');
+// Own argument parsing and journal reader, like replay-survey.js; only the path
+// expansion is shared, so `recordings` reaches into the session directories.
+const { expandJournals } = require('./replay-common.js');
 
 function usage(err) {
   if (err) console.error(err);
@@ -309,7 +312,7 @@ let framesSeen = 0;
 let framesAlt = 0;
 let markerSizeM = null;
 
-for (const file of journals) {
+for (const file of expandJournals(journals)) {
   let text;
   try {
     text = fs.readFileSync(file, 'utf8');

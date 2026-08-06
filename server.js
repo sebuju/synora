@@ -531,6 +531,42 @@ function roomPoseMessage(clientId, msg, room) {
   };
 }
 
+// One directory per client connection — one walk — holding everything that walk
+// produced: the recording and the pose journal.
+//
+// A walk is the unit every comparison in this project is actually about ("run
+// the replay over these journals, then over those"), and it used to be
+// reconstructed by eye from two filenames whose stamps differ by a second or
+// two because they open at different moments. A directory says it instead.
+//
+// Keyed on the *main* socket: the bulk socket is a separate connection sharing
+// a client id, and its bytes belong to the walk that socket is having. A socket
+// that somehow arrives with no main socket falls back to a directory of its own
+// rather than dropping the walk.
+function sessionDir(ws) {
+  const main = ws.role === 'client' ? ws : clients.get(ws.clientId);
+  const owner = main || ws;
+  if (!owner.sessionDir) {
+    owner.sessionDir = path.join(RECORDINGS_DIR,
+      `${fmtFileStamp(new Date())}_client${owner.clientId}`);
+  }
+  return owner.sessionDir;
+}
+
+// Created on first write, never on connect: a client that records nothing must
+// not leave an empty directory behind for every reload.
+//
+// `seq` disambiguates the second and later files of a kind within one walk —
+// the recorder is rebuilt on a camera switch, a resolution change and a mic
+// toggle.
+function sessionPath(ws, name, seq = 0) {
+  const dir = sessionDir(ws);
+  fs.mkdirSync(dir, { recursive: true });
+  if (!seq) return path.join(dir, name);
+  const dot = name.indexOf('.');
+  return path.join(dir, `${name.slice(0, dot)}-${seq + 1}${name.slice(dot)}`);
+}
+
 function closeRecording(ws) {
   if (!ws.recordingStream) return;
   ws.recordingStream.end();
@@ -543,9 +579,8 @@ function closeRecording(ws) {
 
 function openRecording(ws) {
   closeRecording(ws);
-  fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
-  ws.recordingPath = path.join(
-    RECORDINGS_DIR, `${fmtFileStamp(new Date())}_client${ws.clientId}.webm`);
+  ws.recordingSeq = (ws.recordingSeq ?? -1) + 1;
+  ws.recordingPath = sessionPath(ws, 'capture.webm', ws.recordingSeq);
   ws.recordingStream = fs.createWriteStream(ws.recordingPath);
   ws.recordingBytes = 0;
   log(`Recording started: ${path.relative(__dirname, ws.recordingPath)}`);
@@ -573,9 +608,7 @@ function closePoseJournal(ws) {
 function journalPose(ws, entry) {
   if (!settings.get('poseJournalEnabled')) return;
   if (!ws.poseJournal) {
-    fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
-    ws.poseJournalPath = path.join(RECORDINGS_DIR,
-      `${fmtFileStamp(new Date())}_client${ws.clientId}.pose.jsonl`);
+    ws.poseJournalPath = sessionPath(ws, 'pose.jsonl');
     ws.poseJournal = fs.createWriteStream(ws.poseJournalPath);
     ws.poseJournalLines = 0;
     // The marker size cannot be recovered from the observations — it is the

@@ -178,7 +178,7 @@ The knobs that belong to the *room* rather than to a device, in the dashboard dr
 | Tag size | 150 mm | Printed tag edge, the room's only metric datum. **Clears the survey and the carve** — every tag position was measured at the old scale. |
 | Detection interval | 100 ms | How often a client attempts a tag detection. Pushed to every connected client at once. |
 | Wall carving | on | Whether accepted pose reports carve free space. Off, the grid stops growing but is kept — the wipe that throws it away is its own control. |
-| Pose journal | on | Whether observations are recorded to `recordings/*.pose.jsonl`. This is what the replay harnesses re-run, so it is on by default. |
+| Pose journal | on | Whether observations are recorded to `recordings/<walk>/pose.jsonl`. This is what the replay harnesses re-run, so it is on by default. |
 
 Tag size is also settable from `/markers` (the page that prints the sheet, which has no dashboard socket) and is shown in the dashboard header: every distance on that page scales by it, and a wrong one is invisible in all of them — the room simply comes out uniformly too big. A change made from either place reaches the other immediately. `GET`/`POST /api/settings` is the same path for anything without a page open.
 
@@ -191,7 +191,7 @@ flowchart LR
     P1["client 1..N  /client"]
     S["server.js  HTTPS + ws  :8443"]
     V["dashboard  /viewer"]
-    R[("recordings/*.webm")]
+    R[("recordings/walk/capture.webm")]
     C["ffmpeg → AkVCamManager"]
 
     P1 -- "WS signaling + WS bulk (WebM chunks)" --> S
@@ -255,9 +255,9 @@ The active client's chunk stream is teed into `ffmpeg`, decoded, and piped to `A
 
 ## Recordings
 
-- Path: `recordings/<stamp>_client<id>.webm`.
-- A new file starts on connect/reconnect, camera switch, mic toggle, resolution change, and the new-recording button. Pause does not split the file.
-- Pose journals are written beside them as `.pose.jsonl` and are the input to the replay harnesses.
+- One directory per walk: `recordings/<stamp>_client<id>/`, holding everything one client connection produced. The video is `capture.webm` inside it.
+- A new file starts on connect/reconnect, camera switch, mic toggle, resolution change, and the new-recording button. Pause does not split the file. Later files in the same walk are `capture-2.webm`, `capture-3.webm` — a reconnect is a new walk and gets its own directory.
+- The pose journal is `pose.jsonl` in the same directory and is the input to the replay harnesses. The replay tools take the directory: `node replay-survey.js recordings` runs the whole corpus.
 - Retention is manual; disk space is the only limit.
 - A 0-byte file means the client's screen was off or the page was backgrounded — the camera delivers no frames there.
 
@@ -272,6 +272,8 @@ replay-tagbias.js    per-tag mirror-branch and orientation statistics
 replay-depth.js      ARCore depth against the tag solver's own distance
 ```
 
+Every harness takes walk directories, or the whole corpus in one argument — `node replay-survey.js recordings` — and reaches one level in to find the journals. `migrate-recordings.js` converts a pre-existing flat corpus to that layout; it says what it would move by default, needs `--apply` to move anything, and undoes itself from the manifest it writes.
+
 Compare replays only against a *fixed* `markers.json` — the live server rewrites it mid-session, and a moved map silently invalidates a "before" number.
 
 ## Project layout
@@ -283,6 +285,7 @@ walls.js               free-space carve, wall inference, negative evidence
 devices.js             device registry: settings, calibration, fingerprints
 settings.js            persisted server settings: schema, store, validation
 replay-*.js            offline measurement harnesses
+migrate-recordings.js  flat recordings/ -> one directory per walk, reversible
 fetch-vendor.js        downloads opencv.js / three.js
 public/
   xr-client.js/.html   ARCore pose + tag detection + on-phone map
@@ -306,7 +309,7 @@ public/
   probe.js/.html       device capability readout: WebXR, drift, sensors, flags
   viewer.html · index.html · style.css
 certs/                 self-signed cert, generated on first run   (gitignored)
-recordings/            video + pose journals                      (gitignored)
+recordings/            one directory per walk: video + journal    (gitignored)
 tools/                 ffmpeg.exe for the virtual webcam          (gitignored)
 public/vendor/         fetched opencv.js / three.js               (gitignored)
 markers.json           surveyed marker map                        (gitignored)

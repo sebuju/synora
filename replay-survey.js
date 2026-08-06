@@ -40,6 +40,11 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { createSurvey } = require('./survey.js');
+// This tool predates replay-common.js and keeps its own argument parsing and
+// journal reader; only the path expansion is borrowed, so that `recordings`
+// means the whole corpus here exactly as it does everywhere else now that a
+// walk is a directory.
+const { expandJournals } = require('./replay-common.js');
 const {
   quatAngleDeg, quatMedian, quatMul, quatNormalize, quatRotate,
 } = require('./public/pose-math.js');
@@ -341,7 +346,7 @@ const total = {
   },
 };
 
-for (const file of journals) {
+for (const file of expandJournals(journals)) {
   let text;
   try {
     text = fs.readFileSync(file, 'utf8');
