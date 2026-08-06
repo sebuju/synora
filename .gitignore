@@ -6,6 +6,8 @@ public/vendor/
 markers.json
 markers-history.json
 walls.json
+objects.json
+objects-history.json
 server.log
 .vscode/
 .claude/
@@ -15,3 +17,4 @@ pose-settings.json
 devices.json
 overlay.log
 .trash/
+models/
