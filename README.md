@@ -29,7 +29,7 @@ No build step, no app install: vanilla JS served as static files. A client is an
 
 ## Setup
 
-Requirements: Node ≥ 18. Clients and PC on the same LAN. For `/xr-client`: Android with ARCore and a Chrome that grants WebXR `camera-access` — `/xr-probe` reports what a given device actually grants and measures its tracking drift over a walked loop.
+Requirements: Node ≥ 18. Clients and PC on the same LAN. For `/xr-client`: Android with ARCore and a Chrome that grants WebXR `camera-access` — `/probe` reports what a given device actually grants, measures its tracking drift over a walked loop, and reads out every sensor the browser exposes.
 
 ```bash
 npm install
@@ -303,7 +303,7 @@ public/
   calibrate.js/.html   ChArUco camera calibration
   markers.js/.html     printable tag sheet
   digital.js/.html     exact-size on-screen tag
-  xr-probe.js/.html    WebXR capability + drift measurement
+  probe.js/.html       device capability readout: WebXR, drift, sensors, flags
   viewer.html · index.html · style.css
 certs/                 self-signed cert, generated on first run   (gitignored)
 recordings/            video + pose journals                      (gitignored)
@@ -324,7 +324,7 @@ Conventions: dates/times are 24-hour `dd/mm/yy`, formatted only by the helpers i
 | Certificate warning | Self-signed; accept once per device. |
 | Client cannot reach the server | Same Wi-Fi required; AP client isolation must be off; firewall must allow Node on 8443. |
 | Cert invalid after an IP change | Delete `certs/` and restart — regenerated with current addresses in the SAN. |
-| `/xr-client` starts, screen black, nothing happens | WebXR needs a WebGL base layer to composite the passthrough into, and `dom-overlay` is optional. Run `/xr-probe` to see what this device actually grants. |
+| `/xr-client` starts, screen black, nothing happens | WebXR needs a WebGL base layer to composite the passthrough into, and `dom-overlay` is optional. Run `/probe` to see what this device actually grants. |
 | XR client localized, then everything drifts | ARCore VIO divergence — it never reports `tracking-lost`. The slip detector flags it; walk back to a tag to re-acquire. |
 | Overlay red, UNCALIBRATED | No stored calibration for that lens — run `/calibrate`. Poses fall back to an FOV guess and the server refuses such a client the survey: a ~5% scale error would be permanent in `markers.json`. |
 | Overlay amber, "rotated" / "scaled from WxH" | Working from a derived model — calibrated in the other orientation or at another resolution. Usable; calibrate in the orientation and resolution you stream at to clear it. |
