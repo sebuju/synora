@@ -679,6 +679,34 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
     sights.set(key, { ax: cam[0], az: cam[2], bx: end[0], bz: end[1], vp: vpCell, id: m.id });
   }
 
+  // **A detected object proves the same thing a decoded tag does.**
+  //
+  // The line to it was empty, and a wall may not be drawn across it. Until this
+  // existed the object map was the one sight-line source the grid never saw, and
+  // it was wrong against it where it is right against everything else: measured
+  // on this room, 48 of 991 object rays (4.8%) ran through an emitted wall,
+  // concentrated on three segments and seven objects, while `sightBlocks()`
+  // read a clean zero because it only scores the lines this module carved.
+  // Almost certainly openings nobody happened to walk through.
+  //
+  // The id is namespaced (`o<id>`) so a marker moving cannot invalidate these,
+  // and they are deliberately *not* invalidated when their object merges away or
+  // is quarantined. A sight line is a fact about the room, not about the entry
+  // that happened to record it — a camera did look along it, whatever the map
+  // later decided the thing at the end was called.
+  //
+  // Same standoff as a tag's, for the same reason: an object mounted on a wall
+  // approaches that wall by definition, and a line reaching all the way would
+  // shred the wall it is hanging on.
+  function noteObjectSight(cam, p, id) {
+    const vpCell = cellKey(Math.floor(cam[0] / C.cellM), Math.floor(cam[2] / C.cellM));
+    const key = `${vpCell}:o${id}`;
+    if (sights.has(key)) return false;
+    const end = pullToCamera(cam[0], cam[2], p[0], p[2]);
+    sights.set(key, { ax: cam[0], az: cam[2], bx: end[0], bz: end[1], vp: vpCell, id: `o${id}` });
+    return true;
+  }
+
   // A line must not be allowed to cut the wall its own tag is mounted on. It
   // approaches that wall by definition, and at a shallow angle it clips the
   // segment a few centimetres from its own endpoint — which shredded real
@@ -2624,6 +2652,7 @@ function createWalls({ file, log, markerSizeM, opts } = {}) {
     load,
     setMarkerMap,
     handleReport,
+    noteObjectSight,
     // Raw cell state for offline diagnosis (replay tooling only — the live
     // paths never read it).
     debugCellAt(x, z) {
