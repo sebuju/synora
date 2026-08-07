@@ -1367,7 +1367,87 @@ const objectHistory = createObjectHistory({
   log,
   anchorId: () => survey.getMarkerMap().anchorId,
 });
-const objects = createObjects({ file: OBJECTS_FILE, log, history: objectHistory });
+// Is there a wall between the camera and this point?
+//
+// The stale rule's missing input. Not seeing an object that is in frame, in
+// range and facing you is evidence it has gone; not seeing one that is behind a
+// wall is evidence of the wall. `objects.js` deliberately reads nothing of the
+// walls grid, so the question is injected as a predicate rather than imported —
+// which also means it is off, and the rule simply loses one gate, wherever no
+// walls have been carved.
+//
+// **A wall an endpoint is standing on cannot be the wall in the way.** A clock,
+// a picture and a wall fan are mounted *on* a wall and a phone is often against
+// one, so a ray drawn between them crosses that wall — the object is routinely a
+// few centimetres past the plane, because the plane is known to about a grid
+// cell and the object's own position to rather less.
+//
+// Measured here: `Fan #388` sits 23 mm beyond the wall at z=0 and was gated from
+// everywhere. The first attempt pulled both endpoints in *along the ray*, which
+// fails exactly where it matters — looked at from a direction near-parallel to
+// the wall, 0.3 m along the ray barely changes the distance to the plane, so the
+// endpoint stays on the far side and every sighting is still cut. The margin has
+// to be perpendicular to the wall, which is what discarding the segment is.
+const WALL_LOS_MARGIN_M = 0.3;
+// `getWalls()` regroups planes and re-reads the free set on every call, and this
+// is asked once per mapped object per frame. The grid moves over minutes, so a
+// few seconds of staleness costs nothing a walk would notice.
+const WALL_CACHE_MS = 5000;
+let wallSegs = null;
+let wallSegsAt = 0;
+function wallSegments(now) {
+  if (!wallSegs || now - wallSegsAt > WALL_CACHE_MS) {
+    wallSegs = walls.getWalls() || [];
+    wallSegsAt = now;
+  }
+  return wallSegs;
+}
+
+function segmentsCross(a, b, c, d) {
+  const s = (p, q, r) => Math.sign((q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0]));
+  return s(a, b, c) !== s(a, b, d) && s(c, d, a) !== s(c, d, b);
+}
+
+// Distance from a room point to a wall segment, in plan view.
+function distToSeg(p, a, b) {
+  const vx = b[0] - a[0];
+  const vz = b[1] - a[1];
+  const len2 = vx * vx + vz * vz;
+  const t = len2 ? Math.max(0, Math.min(1,
+    ((p[0] - a[0]) * vx + (p[2] - a[1]) * vz) / len2)) : 0;
+  return Math.hypot(p[0] - (a[0] + vx * t), p[2] - (a[1] + vz * t));
+}
+
+function lineOfSight(cam, p) {
+  const segs = wallSegments(Date.now());
+  if (!segs.length) return true;
+  // Plan view: the grid this is answered from is 2D, and a wall is a wall at
+  // every height it has.
+  const from = [cam[0], cam[2]];
+  const to = [p[0], p[2]];
+  for (const w of segs) {
+    if (distToSeg(p, w.a, w.b) < WALL_LOS_MARGIN_M) continue;      // mounted on it
+    if (distToSeg(cam, w.a, w.b) < WALL_LOS_MARGIN_M) continue;    // standing against it
+    if (segmentsCross(from, to, w.a, w.b)) return false;
+  }
+  return true;
+}
+
+const objects = createObjects({
+  file: OBJECTS_FILE,
+  log,
+  history: objectHistory,
+  opts: {
+    lineOfSight,
+    // The other direction, and the first time the object map has ever written
+    // to anything. A sighting is proof the line to it was clear, which is the
+    // evidence the grid needs and the only source of it the grid has never had.
+    // Cheap: `noteObjectSight` is keyed by viewpoint cell and object, so a walk
+    // contributes one line per standpoint per object however many frames it
+    // spends there, and re-recording is a map lookup.
+    onSight: (cam, p, id) => { if (walls.noteObjectSight(cam, p, id)) wallSegs = null; },
+  },
+});
 
 // The object detector is loaded lazily and only when a frame actually arrives:
 // it is 80 MB resident and the channel is off by default.
