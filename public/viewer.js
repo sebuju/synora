@@ -496,6 +496,9 @@ const sideBtn = document.getElementById('sideBtn');
 const frontBtn = document.getElementById('frontBtn');
 const poseBtn = document.getElementById('poseBtn');
 const wallsBtn = document.getElementById('wallsBtn');
+const objectsBtn = document.getElementById('objectsBtn');
+const objCandBtn = document.getElementById('objCandBtn');
+const objLabelsBtn = document.getElementById('objLabelsBtn');
 const rosterBtn = document.getElementById('rosterBtn');
 const tagListBtn = document.getElementById('tagListBtn');
 const objListBtn = document.getElementById('objListBtn');
@@ -876,6 +879,19 @@ let showPoseMarker = false;
 // nothing rather than noise.
 let showWalls = true;
 
+// The object layer, split the way the map draws it: what it has committed to
+// (promoted and off the depth prior) and everything else it has put a ring
+// around. Two switches rather than one because the two are worth looking at
+// apart — a first walk is nearly all candidates, and the question "what does
+// this map actually stand on" cannot be asked of a picture holding both.
+// The names ride on their own switch again: the labels are how an object is
+// identified against the drawer's cards, and a dense room is a map of text.
+// Independent of the two above, deliberately — labels for a hidden object draw
+// nothing, which needs no special case to say.
+let showObjects = true;
+let showObjCandidates = true;
+let showObjLabels = true;
+
 // ---------------------------------------------------------------------------
 // One description of a client, merged from everything that knows part of one:
 // the server's roster (what it is and what it was told to do), the peer
@@ -1163,11 +1179,17 @@ function refreshViews() {
   settingsBtn.classList.toggle('on', showSettings);
   poseBtn.classList.toggle('on', showPoseMarker);
   wallsBtn.classList.toggle('on', showWalls);
+  objectsBtn.classList.toggle('on', showObjects);
+  objCandBtn.classList.toggle('on', showObjCandidates);
+  objLabelsBtn.classList.toggle('on', showObjLabels);
   rosterBtn.classList.toggle('on', showRoster);
   tagListBtn.classList.toggle('on', showTagList);
   objListBtn.classList.toggle('on', showObjList);
   roomViewList.forEach((v) => v.setShowPose(showPoseMarker));
   roomViewList.forEach((v) => v.setLayer?.('walls', showWalls));
+  roomViewList.forEach((v) => v.setLayer?.('objects', showObjects));
+  roomViewList.forEach((v) => v.setLayer?.('object-candidates', showObjCandidates));
+  roomViewList.forEach((v) => v.setLayer?.('object-labels', showObjLabels));
   // One loop for all five, on the panel's own root. Each used to be its own
   // line against its own element, and two of them were class rules on the
   // drawer that only worked while there was exactly one — one of which also
@@ -1222,6 +1244,9 @@ const viewToggles = [
   { key: 'front', btn: frontBtn, get: () => showFront, set: (v) => { showFront = v; } },
   { key: 'pose', btn: poseBtn, get: () => showPoseMarker, set: (v) => { showPoseMarker = v; } },
   { key: 'walls', btn: wallsBtn, get: () => showWalls, set: (v) => { showWalls = v; } },
+  { key: 'objects', btn: objectsBtn, get: () => showObjects, set: (v) => { showObjects = v; } },
+  { key: 'objcand', btn: objCandBtn, get: () => showObjCandidates, set: (v) => { showObjCandidates = v; } },
+  { key: 'objlabels', btn: objLabelsBtn, get: () => showObjLabels, set: (v) => { showObjLabels = v; } },
   // Key stays 'clients' although the button no longer is: it names a stored
   // value, and renaming it would read every existing viewer's saved layout as
   // "not stored" and reopen the drawer on someone who closed it.

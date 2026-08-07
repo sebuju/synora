@@ -46,12 +46,12 @@
         </div>
         <div id="roomStats"></div>
       </div>
-      <!-- The toggles for what is drawn here, on the thing they draw on. Two
-           groups: which room view is open, then which layers it shows. Icons
-           rather than words because they sit over the render instead of on the
-           chrome — and because the four view buttons are one family, the same
-           cube with a different face lit, which is a thing a row of four words
-           cannot say. -->
+      <!-- The toggles for what is drawn here, on the thing they draw on. Three
+           groups: which room view is open, then the layers the room is measured
+           by, then the object experiment's own. Icons rather than words because
+           they sit over the render instead of on the chrome — and because the
+           four view buttons are one family, the same cube with a different face
+           lit, which is a thing a row of four words cannot say. -->
       <div id="stageTools">
         <div>
           <button id="sceneBtn" class="icon-btn compact" type="button" title="3D" aria-label="3D">
@@ -112,6 +112,41 @@
               <rect x="3.5" y="5.5" width="17" height="13" rx="1"/>
               <path d="M3.5 10h17M3.5 14.5h17"/>
               <path d="M12 5.5V10M8 10v4.5M16 10v4.5M12 14.5v4"/>
+            </svg>
+          </button>
+        </div>
+        <!-- The object layer, its own group rather than three more buttons in
+             the one above: those are what the room is measured by, these are an
+             experiment that feeds nothing, and the gap says so. Each icon is the
+             mark it switches, drawn as map2d.js draws it — the committed ring is
+             dashed around a filled size mark, the candidate ring dotted around a
+             hollow one, which is the same and only difference the map itself
+             makes between the two. -->
+        <div>
+          <button id="objectsBtn" class="icon-btn compact" type="button"
+                  title="Objects — committed" aria-label="Objects">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="8.5" stroke-dasharray="3 3"/>
+              <circle cx="12" cy="12" r="4" fill="currentColor" fill-opacity="0.45"/>
+            </svg>
+          </button>
+          <button id="objCandBtn" class="icon-btn compact" type="button"
+                  title="Candidates — not committed" aria-label="Candidates">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="8.5" stroke-dasharray="1 3"/>
+              <circle cx="12" cy="12" r="4"/>
+            </svg>
+          </button>
+          <!-- A mark with its name and rows beside it: what the label layer adds
+               to one object. -->
+          <button id="objLabelsBtn" class="icon-btn compact" type="button"
+                  title="Object labels" aria-label="Object labels">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="6" cy="12" r="2.6"/>
+              <path d="M11.5 9h9M11.5 12.5h7M11.5 16h4.5"/>
             </svg>
           </button>
         </div>

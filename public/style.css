@@ -1580,7 +1580,7 @@ body.displaced .drawer {
   pointer-events: none;
 }
 
-/* The two groups, so a wrap breaks between them and never inside one. */
+/* The groups, so a wrap breaks between them and never inside one. */
 #stageTools > div {
   display: flex;
   gap: 6px;
