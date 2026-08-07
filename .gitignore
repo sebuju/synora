@@ -1,6 +1,7 @@
 node_modules/
 certs/
 recordings/
+corpus-*/
 tools/
 public/vendor/
 markers.json
