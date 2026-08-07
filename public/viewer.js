@@ -544,16 +544,56 @@ function setHovered(h) {
   // through optional chaining like anything else.
   objectsPanel.setHovered(h);
 }
-// A mark on the map, clicked. Only objects report one today; the shape is the
-// hover's so a tag or a client can join without a second mechanism.
+// Which panels a card of each kind lives in, for openFromMap below. The drawer
+// itself is 'clients' — that key names a stored value from when the button was
+// the client list (see the note on viewToggles).
+const CARD_PANELS = {
+  tag: ['clients', 'taglist'],
+  client: ['clients', 'roster'],
+  object: ['clients', 'objlist'],
+};
+// A mark on the map, clicked: open what it names in the drawer. The shape is
+// the hover's, so this is the same "one entity, everywhere" identity the rest
+// of the dashboard uses.
+//
+// The panel is switched on first. A card opened into a column that is switched
+// off is scrolled to by nobody and read by nobody — the object list is off by
+// default, so that would be the commonest of the three clicks doing nothing at
+// all. Persisted like any other panel change: a panel that opens itself and is
+// gone again on reload is a layout that cannot be kept.
 function selectFromMap(sel) {
-  if (sel?.kind === 'object') objectsPanel.openObject(sel.id);
+  if (!sel) return;
+  const wanted = CARD_PANELS[sel.kind] || [];
+  let changed = false;
+  for (const t of viewToggles) {
+    if (!wanted.includes(t.key) || t.get()) continue;
+    t.set(true);
+    changed = true;
+  }
+  if (changed) {
+    saveViewState();
+    refreshViews();
+  }
+  // The card is revealed a frame later (revealCard), which is what lets the
+  // display change above take effect first.
+  if (sel.kind === 'object') objectsPanel.openObject(sel.id);
+  else if (sel.kind === 'tag') clientsPanel.openTag(sel.id);
+  // A client card has no shut state to open — it carries live controls and
+  // stays open — so bringing it on screen is the whole of what selecting one
+  // can mean. It is already lit: the pointer is still on the mark.
+  else if (sel.kind === 'client') clientsPanel.revealClient(sel.id);
 }
 // Which tag's card is open in the drawer, for the same reason the hover is held
 // here: the three map views all draw that tag's distances and none of them can
 // see the drawer.
+//
+// The reverse of the click above: the map goes to the card's subject as well,
+// or a card can name a tag that is off the panned viewport it sits beside. The
+// views ignore it when the tag is already on screen, so opening a card does not
+// move a map that was already showing the answer.
 function setOpenedTag(id) {
   roomViewList.forEach((v) => v.setFocusMarker?.(id));
+  if (id !== null) roomViewList.forEach((v) => v.focusOn?.({ kind: 'tag', id }));
 }
 // The tag-to-tag legs are the open card's own. Every tag drawing its nearest
 // neighbour at once is a leg and two labels per tag across the room, which
@@ -982,8 +1022,12 @@ const objectsPanel = createObjectsPanel(objectDrawerEl, {
   onObjectHistory: (id) => signaling.send({ type: 'object-history', id }),
   onHover: setHovered,
   // The open object's halo and its co-visibility legs are drawn by the room
-  // views, which cannot see the drawer — the same relay the opened tag has.
-  onOpen: (id) => roomViewList.forEach((v) => v.setFocusObject?.(id)),
+  // views, which cannot see the drawer — the same relay the opened tag has,
+  // including the pan onto the thing the card is about.
+  onOpen: (id) => roomViewList.forEach((v) => {
+    v.setFocusObject?.(id);
+    if (id !== null) v.focusOn?.({ kind: 'object', id });
+  }),
 });
 // Fed from the message handler rather than by joining `roomViewList`. That list
 // is not a list of things with optional setters — `refreshViews` calls

@@ -449,6 +449,8 @@ function createClientsPanel(
   // so that there is one description of a tag's past and it is the server's.
   let tagHist = null;
   let histAskedAt = 0;
+  // A card opened from a room view is scrolled to twice: see openTag.
+  let revealPending = false;
   // Polled while a card is open. A sample a second is what the server records,
   // so asking faster only re-sends the same array.
   const HIST_POLL_MS = 1000;
@@ -958,6 +960,11 @@ function createClientsPanel(
     openTagId = id;
     tagHist = null;
     histAskedAt = 0;
+    // Cleared here rather than only where it is used, so a card opened by hand
+    // never scrolls the drawer out from under the pointer when its record
+    // lands. Only a card opened from a room view sets it, and only for that
+    // card.
+    revealPending = false;
     for (const [tagId, card] of tagCards) {
       card.root.classList.toggle('open', tagId === id);
       if (tagId === id) paintHistory(card);
@@ -1394,6 +1401,34 @@ function createClientsPanel(
       tagHist = { id: msg.id, samples: msg.samples || [], events: msg.events || [] };
       const card = tagCards.get(msg.id);
       if (card) paintHistory(card);
+      // The card's real height is only known here — see openTag.
+      if (card && revealPending) {
+        revealPending = false;
+        revealCard(card.root);
+      }
+    },
+
+    // A tag's card, opened because its bar or chip was clicked in a room view.
+    // Opened, never toggled like the card's own click is: a click on a mark says
+    // "this one", and clicking the same tag twice must not shut what it asked
+    // for.
+    //
+    // Scrolled to twice for the same reason the object drawer's is: the card
+    // opens against an empty record and grows by its charts and events when the
+    // answer to the request this just sent arrives.
+    openTag(id) {
+      const card = tagCards.get(id);
+      if (!card) return;
+      setOpenTag(id);
+      revealPending = true;
+      revealCard(card.root);
+    },
+
+    // A client's card, likewise — but there is nothing to open. A client card
+    // carries live controls and never collapses, so bringing it on screen is
+    // the whole of what selecting one can do.
+    revealClient(id) {
+      revealCard(cards.get(id)?.root);
     },
   };
 }

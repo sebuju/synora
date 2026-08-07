@@ -679,6 +679,57 @@ function confirmButton(el, onConfirm, { armedTitle = 'Click again to confirm', o
   return handle;
 }
 
+// --- Bringing a card into view ----------------------------------------------
+// A card opened by something other than a click on itself — a mark clicked in a
+// room view, which cannot see the drawer — has to be scrolled to, or the click
+// reads as having done nothing.
+//
+// `scrollIntoView({ block: 'nearest' })` is what this replaces and is not
+// enough: it refuses to scroll at all when the card already straddles the
+// scrollport, and when it does scroll it leaves an edge flush against the
+// drawer's. Both cases put the card's own body — the part the click asked for —
+// half off screen.
+//
+// Deferred by a frame rather than measured in the calling turn. Opening a card
+// can also switch its panel on, and a card in a `display: none` column has no
+// box to scroll to; a frame lets that display change, the column layout and the
+// panel's own repaint all land first. Always deferred, not only on that path:
+// one behaviour is easier to trust than two, and a frame is invisible next to a
+// card scrolled to the wrong place.
+const REVEAL_PAD_PX = 8;
+function revealCard(el, pad = REVEAL_PAD_PX) {
+  if (!el) return;
+  requestAnimationFrame(() => {
+    // Re-tested inside the frame, not before it: a card can leave the drawer
+    // between the click and here — the tag it named was forgotten, the object
+    // was merged away — and a detached or hidden element measures as a zero box
+    // at the origin, which scrolls the drawer to the top for no reason.
+    if (!el.isConnected || !el.offsetParent) return;
+    const box = scrollParent(el);
+    if (!box) return;
+    const r = el.getBoundingClientRect();
+    const b = box.getBoundingClientRect();
+    const above = (r.top - pad) - b.top;
+    const below = (r.bottom + pad) - b.bottom;
+    // A card taller than the drawer cannot be shown whole, so its head wins:
+    // the name, the position and the first rows are what was asked for, and the
+    // charts below them are read by scrolling on from there.
+    if (r.height + pad * 2 > b.height || above < 0) box.scrollTop += above;
+    else if (below > 0) box.scrollTop += below;
+  });
+}
+
+// The box a card actually scrolls in. Found rather than named: the panels move
+// between columns (drawers.js), so the element above any given card is not
+// fixed.
+function scrollParent(el) {
+  for (let n = el.parentElement; n; n = n.parentElement) {
+    const oy = getComputedStyle(n).overflowY;
+    if ((oy === 'auto' || oy === 'scroll') && n.scrollHeight > n.clientHeight) return n;
+  }
+  return null;
+}
+
 // --- Reusing the elements already on screen ---------------------------------
 // Every list on the dashboard arrives as a whole new snapshot — a roster, a
 // marker map, a history record — and the obvious rendering of
