@@ -28,6 +28,7 @@ function poseUncertainty(msg) {
 
 function createRoomFeed(views) {
   let markerMap = null;
+  let objects = null;
   // clientId -> the last *detection* message reported. See applyPose and
   // lastDetection (common.js).
   const lastDet = new Map();
@@ -49,6 +50,14 @@ function createRoomFeed(views) {
       }
       if (msg.type === 'walls') {
         views.forEach((v) => v.setWalls?.(msg.walls));
+        return true;
+      }
+      // Detected objects, triangulated from the neural detector's bearings.
+      // Optional chaining like the two above: this is a 2D-map layer, and the
+      // 3D scene opts out by not having the setter.
+      if (msg.type === 'objects') {
+        objects = msg;
+        views.forEach((v) => v.setObjects?.(msg.objects));
         return true;
       }
       return false;
@@ -81,6 +90,10 @@ function createRoomFeed(views) {
     // which survey they are showing.
     getMarkerMap() {
       return markerMap;
+    },
+
+    getObjects() {
+      return objects;
     },
   };
 }
