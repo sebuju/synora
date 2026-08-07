@@ -272,6 +272,8 @@ replay-survey.js     marker map + pose: map error, joint-PnP coverage, jumps
 replay-walls.js      carve + walls: leak count, extent audit, sight crossings
 replay-tagbias.js    per-tag mirror-branch and orientation statistics
 replay-depth.js      ARCore depth against the tag solver's own distance
+replay-objects.js    detected objects: coverage where tags do not reach, cross-session
+                     repeatability, position scatter, same-class separation
 ```
 
 Every harness takes walk directories, or the whole corpus in one argument — `node replay-survey.js recordings` — and reaches one level in to find the journals.
