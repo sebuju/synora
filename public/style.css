@@ -1090,6 +1090,31 @@ body.no-stage .drawer.empty {
   border-color: #8d8d8d;
 }
 
+/* Co-visibility partner of the focused object card (hovered, or open once the
+   pointer has moved on) — in the object drawer for another object, in the
+   clients drawer for a tag. The colour is ROOM_OBJECT_BEST_CSS (common.js),
+   the same green the map draws co-visibility legs in, so the wash and the legs
+   read as the same claim, and its strength rides the custom property the panel
+   sets per card: a partner from three frames and one from three hundred must
+   not read alike. The `1` fallback is the tag cards' normal case, not an error
+   path — the clients drawer is handed the key set without the counts, so a tag
+   partner washes at full strength and says only that it is one.
+
+   The whole card is washed, through `background-image` rather than through the
+   background colour or the border. Every other channel on this shell is
+   already spoken for — colour and border by `.hot` and by the open card, the
+   outline by `.settling`, the inset ring by `.seen` — and a state that took
+   one of them would make that state vanish whenever the two coincided. A
+   flat-gradient image is the one layer nothing else uses: it sits *over*
+   whichever background colour those states settled on, so a partner card that
+   is also hot, open, settling or in view keeps all of it and gains the wash. */
+.drawer-card.co {
+  --co-wash: linear-gradient(
+    rgba(127, 184, 164, calc(var(--co, 1) * 0.2)),
+    rgba(127, 184, 164, calc(var(--co, 1) * 0.2)));
+  background-image: var(--co-wash);
+}
+
 .drawer-card .head {
   display: flex;
   align-items: center;
@@ -1231,6 +1256,15 @@ body.no-stage .drawer.empty {
      for by hover and by the open card, and a state that overwrote either would
      make one of them disappear whenever a tag came into view. */
   box-shadow: inset 0 0 0 1px #2e6b4d;
+}
+
+/* The open card sets `background` as a shorthand, which resets the image the
+   wash rides on — and it outweighs `.drawer-card.co`, so the wash would vanish
+   on exactly the card most likely to be read. Restated rather than duplicated:
+   the gradient itself lives in `--co-wash` on `.co`, which no background
+   shorthand can reset, so the two rules cannot drift to different greens. */
+.drawer-card.tag.open.co {
+  background-image: var(--co-wash);
 }
 
 .drawer-card .hist {

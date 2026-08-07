@@ -1028,6 +1028,10 @@ const objectsPanel = createObjectsPanel(objectDrawerEl, {
     v.setFocusObject?.(id);
     if (id !== null) v.focusOn?.({ kind: 'object', id });
   }),
+  // Tag partners in the co-visibility set light the clients drawer's tag
+  // cards. This panel owns the object records the set is built from; the
+  // viewer only carries the result to the other drawer, same as onHover/onOpen.
+  onCoSeen: (keys) => clientsPanel.setCoSeen(keys),
 });
 // Fed from the message handler rather than by joining `roomViewList`. That list
 // is not a list of things with optional setters — `refreshViews` calls

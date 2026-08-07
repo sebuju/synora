@@ -138,7 +138,9 @@ function spatialOrder(list) {
   return [...list].sort((a, b) => key.get(a.id) - key.get(b.id) || a.id - b.id);
 }
 
-function createObjectsPanel(el, { onObjectHistory, onHover, onOpen }) {
+function createObjectsPanel(el, {
+  onObjectHistory, onHover, onOpen, onCoSeen,
+}) {
   const cards = new Map();       // object id -> card
   // The map, and what the map has ruled out. Held apart because they are two
   // different claims and the list draws them as such — but they are one set of
@@ -147,6 +149,18 @@ function createObjectsPanel(el, { onObjectHistory, onHover, onOpen }) {
   let objects = [];
   let quarantined = [];
   let openId = null;
+  // The hovered card, kept apart from `openId` so the two can be told apart:
+  // hover wins the co-visibility highlight when the pointer is on a card, but
+  // a highlight driven by hover alone would die the instant the reader moved
+  // the pointer to scroll toward a lit partner, so the open card is what is
+  // left to light once the pointer is gone. `hotId ?? openId` in coState() is
+  // the whole rule.
+  let hotId = null;
+  // The set last reported outward, as a joined key string. `applyCo` runs from
+  // `render`, which runs on every objects push several times a second, and the
+  // set is unchanged almost every time — reporting anyway would have the
+  // clients drawer walk and re-toggle every tag card at that rate for nothing.
+  let coReported = null;
   let hist = null;
   let askedAt = 0;
   // A card opened from the map is scrolled to twice: see openObject.
@@ -178,6 +192,65 @@ function createObjectsPanel(el, { onObjectHistory, onHover, onOpen }) {
     // cards already have.
     onOpen?.(id);
     ask();
+    applyCo();
+  }
+
+  // The co-visibility set for whatever is currently focused, or null when
+  // nothing is. Keys are `o<id>`/`t<id>` as the wire already shapes them, and
+  // values are 0..1 strengths normalised against the strongest partner in the
+  // set — a partner from three frames and one from three hundred must not
+  // read alike.
+  function coState() {
+    const focus = hotId ?? openId;
+    if (focus === null) return null;
+    const rec = cards.get(focus)?.rec;
+    if (!rec) return null;
+    const raw = new Map();
+    for (const [k, n] of rec.seenWith || []) raw.set(k, n);
+    // The wire keeps only each entry's own strongest eight pairs, so the
+    // focus can name a partner whose own eight are full of others. Walking
+    // every other card's list for a mention of the focus is what stops the
+    // highlight from depending on which of the two cards the pointer
+    // happened to land on — without it, hovering A would light B but
+    // hovering B would not light A back.
+    const focusKey = `o${focus}`;
+    for (const [id, card] of cards) {
+      if (id === focus || !card.rec) continue;
+      for (const [k, n] of card.rec.seenWith || []) {
+        if (k !== focusKey) continue;
+        raw.set(`o${id}`, Math.max(raw.get(`o${id}`) || 0, n));
+      }
+    }
+    raw.delete(focusKey);
+    if (!raw.size) return null;
+    let max = 0;
+    for (const n of raw.values()) max = Math.max(max, n);
+    const out = new Map();
+    // Floored rather than left to reach zero: the strength drives the wash's
+    // alpha, and a partner at the bottom of the range still has to read as a
+    // partner against the plain card next to it, not as a rounding error.
+    for (const [k, n] of raw) out.set(k, Math.max(0.45, n / max));
+    return out;
+  }
+
+  // Washes this panel's own cards and reports the whole set outward, tag keys
+  // included. Reported, never applied outside these cards — the clients
+  // drawer's tag cards are lit by the viewer relaying this, the same
+  // arrangement `onOpen` already has above.
+  function applyCo() {
+    const co = coState();
+    for (const [id, card] of cards) {
+      const strength = co?.get(`o${id}`);
+      card.root.classList.toggle('co', strength !== undefined);
+      if (strength !== undefined) card.root.style.setProperty('--co', strength);
+      else card.root.style.removeProperty('--co');
+    }
+    const keys = co ? [...co.keys()] : null;
+    const stamp = keys ? keys.join(',') : '';
+    if (stamp !== coReported) {
+      coReported = stamp;
+      onCoSeen?.(keys);
+    }
   }
 
   function ask() {
@@ -475,6 +548,10 @@ function createObjectsPanel(el, { onObjectHistory, onHover, onOpen }) {
     // survey was reset. Nothing else would ever close it, and the panel would go
     // on asking the server about an object it no longer has.
     if (openId !== null && !cards.has(openId)) setOpen(null);
+    // Cards are torn down and rebuilt here, not just reordered, so a card
+    // that appears or comes back mid-hover would otherwise stay dark until
+    // the next hover event re-visits it.
+    applyCo();
   }
 
   return {
@@ -490,7 +567,9 @@ function createObjectsPanel(el, { onObjectHistory, onHover, onOpen }) {
     // simply ignores the kinds that are not its own.
     setHovered(h) {
       const id = h?.kind === 'object' ? h.id : null;
+      hotId = id;
       for (const [oid, card] of cards) card.root.classList.toggle('hot', oid === id);
+      applyCo();
     },
 
     // Opened from the map rather than from its own head. Scrolled to as well as

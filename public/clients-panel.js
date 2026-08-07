@@ -435,6 +435,13 @@ function createClientsPanel(
   // since must be drawn hot from the start.
   let hot = null;
   const isHot = (kind, id) => !!hot && hot.kind === kind && hot.id === id;
+  // The co-visibility set relayed from the object drawer, as a Set of
+  // `t<id>`/`o<id>` keys — this panel only owns the tags, so only the `t*`
+  // members are ever looked up. No strength here: the objects panel is the
+  // one holding the counts, and a tag partner is a yes/no claim at this
+  // distance rather than a graded one.
+  let coSeen = null;
+  const isCo = (id) => !!coSeen && coSeen.has(`t${id}`);
   let agesPaintedAt = 0;
   const AGE_TICK_MS = 1000;
 
@@ -1254,6 +1261,10 @@ function createClientsPanel(
     layoutKv(card.lines);
     card.root.classList.toggle('hot', isHot('tag', tag.id));
     card.root.classList.toggle('open', tag.id === openTagId);
+    // A tag card rebuilt while a highlight is live — syncKeyed makes and
+    // paints in the same pass — must not come back dark just because it
+    // missed the setCoSeen call that lit its neighbours.
+    card.root.classList.toggle('co', isCo(tag.id));
     // The record already in hand rather than the next poll: the charts are
     // drawn against *now* as their right edge, and a map message is as good a
     // moment as any to move it on.
@@ -1365,6 +1376,17 @@ function createClientsPanel(
       }
       for (const [id, card] of cards) {
         card.root.classList.toggle('hot', isHot('client', id));
+      }
+    },
+
+    // The object drawer's co-visibility set, relayed rather than computed
+    // here — the counts live on the object records, which this panel never
+    // sees. `keys` is the whole set including `o*` members; only `t*` ones
+    // name anything this panel draws.
+    setCoSeen(keys) {
+      coSeen = keys ? new Set(keys) : null;
+      for (const [tagId, card] of tagCards) {
+        card.root.classList.toggle('co', isCo(tagId));
       }
     },
     update(list, markerMap = null) {
