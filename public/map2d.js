@@ -382,7 +382,15 @@ function createMap2dView(canvas, mode = 'top', {
   let walls = [];
   let nextWallKey = 1;
   let showWalls = true;
+  // The two halves of the object layer, switched apart because they are two
+  // different claims about the room: `showObjects` is what the map has committed
+  // to (promoted, and standing on parallax rather than on a depth prior),
+  // `showObjectCandidates` everything else it has drawn a ring for. That is the
+  // same and only split the marks themselves carry — best colour and a dashed
+  // ring against the dim colour and a dotted one — so a reader turning one off
+  // is left with exactly the class the other icon shows.
   let showObjects = true;
+  let showObjectCandidates = true;
   // The name and stat block drawn on each object's own mark. Separate from the
   // marks themselves because a caller can already be naming them somewhere else:
   // the XR client carries a list of what is in view and the names belong there,
@@ -391,7 +399,11 @@ function createMap2dView(canvas, mode = 'top', {
   // objects are named, and the panel's cards cross-reference the `#id` this
   // prints.
   let showObjectLabels = true;
+  // One fade each, not one shared: turning the candidates off has to leave the
+  // committed objects at full strength, and a single alpha would dim every mark
+  // on the way to hiding half of them.
   let objectsAlpha = 0;
+  let objCandAlpha = 0;
   let wallsAlpha = 1;
   // The dark backdrop and the 1 m grid it carries: everything that is only
   // there to be drawn *on*. Turned off, the canvas is cleared instead of
@@ -1187,6 +1199,7 @@ function createMap2dView(canvas, mode = 'top', {
 
     poseMix = animFade(poseMix, showPose, dt);
     objectsAlpha = animFade(objectsAlpha, showObjects, dt);
+    objCandAlpha = animFade(objCandAlpha, showObjectCandidates, dt);
     wallsAlpha = animFade(wallsAlpha, showWalls, dt);
     backdropAlpha = animFade(backdropAlpha, showBackdrop, dt);
     pairsAlpha = animFade(pairsAlpha, showPairs, dt);
@@ -1592,7 +1605,7 @@ function createMap2dView(canvas, mode = 'top', {
     // Detected objects, under the tags: the survey is what the room is measured
     // by and must not be obscured by a guess about the furniture.
     lastObjectDots = [];
-    if (objectsAlpha > 0.01) {
+    if (objectsAlpha > 0.01 || objCandAlpha > 0.01) {
       // The co-visibility legs of the opened object, under its own mark and
       // under everything else's. One line per thing it has been in frame with,
       // its weight the count: what this drawer question is really asking is
@@ -1602,8 +1615,17 @@ function createMap2dView(canvas, mode = 'top', {
       // Drawn from the *opened* object only. The whole table at once is a web
       // across the room with a line between every pair, which is a picture of
       // the map's density rather than of any object's neighbourhood.
+      // Which of the two fades a mark belongs to, in one place: the colour, the
+      // dash and the switch all have to agree about what "committed" means, and
+      // three copies of the test is three chances for a mark to be drawn in one
+      // half's palette while the other half's button controls it.
+      const committedOf = (rec) => !!(rec?.promoted && rec.usable !== false);
+      const alphaOf = (rec) => (committedOf(rec) ? objectsAlpha : objCandAlpha);
       const focus = focusObjectId === null ? null : objectDots.get(focusObjectId);
-      if (focus?.rec?.seenWith?.length) {
+      // The legs fade with the object they radiate from — a hidden object with
+      // its neighbourhood still drawn is a web anchored on nothing.
+      const focusAlpha = focus ? alphaOf(focus.rec) : 0;
+      if (focus?.rec?.seenWith?.length && focusAlpha > 0.01) {
         const [fx, fy] = px(focus.pos);
         const top = focus.rec.seenWith.reduce((m, [, n]) => Math.max(m, n), 1);
         ctx.setLineDash([]);
@@ -1623,7 +1645,7 @@ function createMap2dView(canvas, mode = 'top', {
           // card's text makes.
           ctx.strokeStyle = k.startsWith('t')
             ? roomTagColorCss(Number(k.slice(1))) : ROOM_OBJECT_BEST_CSS;
-          ctx.globalAlpha = objectsAlpha * (0.25 + 0.55 * (n / top));
+          ctx.globalAlpha = focusAlpha * (0.25 + 0.55 * (n / top));
           ctx.lineWidth = 1 + 1.5 * (n / top);
           ctx.beginPath();
           ctx.moveTo(fx, fy);
@@ -1634,6 +1656,12 @@ function createMap2dView(canvas, mode = 'top', {
         ctx.lineWidth = 1;
       }
       for (const [, o] of objectDots) {
+        // Which half this mark is in, decided before anything is drawn: the halo
+        // and the hit target are the object too, and a ring switched off that
+        // still lights under the pointer is a target for something invisible.
+        const committed = committedOf(o.rec);
+        const objAlpha = committed ? objectsAlpha : objCandAlpha;
+        if (objAlpha <= 0.01) continue;
         const [ox, oy] = px(o.pos);
         // Straight off the scale rather than by projecting an offset point: the
         // projection is uniform in both axes, so a metre is `scale` pixels in
@@ -1650,7 +1678,7 @@ function createMap2dView(canvas, mode = 'top', {
         const lit = focusObjectId === o.rec?.id
           || (hovered?.kind === 'object' && hovered.id === o.rec?.id);
         if (lit) {
-          ctx.globalAlpha = o.fade * objectsAlpha;
+          ctx.globalAlpha = o.fade * objAlpha;
           ctx.strokeStyle = HOVER_HALO_CSS;
           ctx.lineWidth = 3;
           ctx.setLineDash([]);
@@ -1676,9 +1704,8 @@ function createMap2dView(canvas, mode = 'top', {
         // in the first place. Alpha is the fade animation and the show/hide
         // switch, and nothing else — every state below is a difference in the
         // stroke, which stays legible at full strength.
-        const committed = o.rec?.promoted && o.rec.usable !== false;
         const objCss = committed ? ROOM_OBJECT_BEST_CSS : ROOM_OBJECT_CSS;
-        ctx.globalAlpha = o.fade * objectsAlpha;
+        ctx.globalAlpha = o.fade * objAlpha;
         ctx.strokeStyle = objCss;
         // The measured size, under the scatter ring so the ring stays readable
         // over it. Solid and filled where the ring is dashed and hollow: this is
@@ -1824,7 +1851,7 @@ function createMap2dView(canvas, mode = 'top', {
             // text on a lit room with a dashed ring behind it is not text. The
             // backing is null wherever the backdrop is already opaque, so the
             // dashboard is unchanged.
-            objCss, labelBg, o.fade * objectsAlpha, null,
+            objCss, labelBg, o.fade * objAlpha, null,
             { sub, fixed: true });
         }
         // The hit target, in the same turned space the pointer is tested in.
@@ -2548,6 +2575,9 @@ function createMap2dView(canvas, mode = 'top', {
         schedule();
       } else if (name === 'objects') {
         showObjects = on;
+        schedule();
+      } else if (name === 'object-candidates') {
+        showObjectCandidates = on;
         schedule();
       } else if (name === 'object-labels') {
         showObjectLabels = on;
