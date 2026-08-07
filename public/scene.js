@@ -113,7 +113,8 @@ function createSceneView(canvas) {
     controls.enableZoom = false;
     zoomTargetD = camera.position.distanceTo(controls.target);
     canvas.addEventListener('wheel', (ev) => {
-      ev.preventDefault();
+      // Shift hands the notch back to the browser, as the 2D maps' wheel does.
+      if (!noDefault(ev)) return;
       // The vendor's own step, so the feel of a notch is unchanged.
       zoomTargetD = Math.max(0.3,
         Math.min(60, zoomTargetD * 0.95 ** -Math.sign(ev.deltaY)));

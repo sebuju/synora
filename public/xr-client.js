@@ -2696,7 +2696,11 @@ startBtn.onclick = start;
 // The guard is what that capture costs — the release is delivered here whether
 // or not it happened over the button, so where it happened has to be asked.
 exitBtn.addEventListener('pointerup', (ev) => {
-  ev.preventDefault();
+  // A click built out of pointer events, so it asks the shift question itself.
+  // Nothing on a headset or a phone in a session can hold shift, but the page
+  // is also opened on a desktop to read, and one rule everywhere beats one rule
+  // with an exception nobody can see from the call site.
+  if (!noDefault(ev)) return;
   const over = document.elementFromPoint(ev.clientX, ev.clientY);
   if (over === exitBtn) session?.end();
 });

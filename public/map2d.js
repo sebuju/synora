@@ -482,6 +482,10 @@ function createMap2dView(canvas, mode = 'top', {
   const ZOOM_STEP = 1.15;
   const ZOOM_OUT_LIMIT = 0.05;   // times the fit
   const ZOOM_IN_LIMIT = 200;
+  // How far inside the canvas a mark has to be to count as already shown, for
+  // focusOn below.
+  const FOCUS_EDGE_PX = 48;
+  const FOCUS_EDGE_MAX = 0.25;   // ...but never more than this share of the pane
 
   // Seeded from what is on screen, not from the fit it is easing toward: a
   // grab that lands mid-ease must continue from where the user can see, or the
@@ -491,8 +495,31 @@ function createMap2dView(canvas, mode = 'top', {
     return !!view;
   }
 
+  // Where one entity is, as the room point focusOn should centre on. The eased
+  // position rather than the arriving one: the pan has to land where the mark
+  // is *drawn*, and a tag still gliding to a refined pose would otherwise be
+  // centred on somewhere it has not reached. A dead entity is fading out and is
+  // not something to bring on screen.
+  function focusPos(sel) {
+    if (!sel) return null;
+    if (sel.kind === 'tag') {
+      const m = markers.get(sel.id);
+      return m && !m.dead ? m.pos : null;
+    }
+    if (sel.kind === 'object') {
+      const o = objectDots.get(sel.id);
+      return o && !o.dead ? o.pos : null;
+    }
+    if (sel.kind === 'client') {
+      const c = clients.get(sel.id);
+      return c && !c.dead ? c.cur.p : null;
+    }
+    return null;
+  }
+
   canvas.addEventListener('wheel', (ev) => {
-    ev.preventDefault();
+    // Shift hands the notch back to the browser, unzoomed and unswallowed.
+    if (!noDefault(ev)) return;
     if (!takeOver()) return;
     const w = canvas.clientWidth;
     const h = canvas.clientHeight;
@@ -519,14 +546,17 @@ function createMap2dView(canvas, mode = 'top', {
   const PAN_BUTTON = 2;
   let drag = null;
   canvas.addEventListener('pointerdown', (ev) => {
-    if (ev.button !== PAN_BUTTON || !takeOver()) return;
+    // Shift gives the right button back to the browser, which means its menu:
+    // panning through the menu that the suppressed contextmenu above would
+    // otherwise have hidden leaves a drag whose pointerup never arrives.
+    if (ev.button !== PAN_BUTTON || clickSkipped(ev) || !takeOver()) return;
     drag = { x: ev.clientX, y: ev.clientY, id: ev.pointerId };
     canvas.setPointerCapture(ev.pointerId);
     canvas.style.cursor = 'grabbing';
   });
   // Or the menu opens on the button that starts the pan, over the map it is
   // panning, and the drag never gets its pointerup.
-  canvas.addEventListener('contextmenu', (ev) => ev.preventDefault());
+  canvas.addEventListener('contextmenu', (ev) => noDefault(ev));
   // Distance from a point to a segment, not to its infinite line: a tag bar is
   // 150 mm of wall and the line it lies on runs the length of the room.
   // Ids in the order the shared helper produced them — it deduplicates a pair
@@ -643,6 +673,18 @@ function createMap2dView(canvas, mode = 'top', {
     return [(x - w / 2) / scale + ca, orient * (y - h / 2) / scale + cb];
   }
 
+  // The other way, off the same snapshot and in the reverse order: `toPx`, then
+  // into the rotation. Written beside its inverse so the pair cannot drift —
+  // the turn is `unrotateScreen` with the angle negated, which is the same
+  // matrix and not a second copy of it.
+  function roomToScreen(a, b) {
+    if (!lastXf) return null;
+    const {
+      ca, cb, scale, w, h, rot,
+    } = lastXf;
+    return unrotateScreen((a - ca) * scale + w / 2, orient * (b - cb) * scale + h / 2, w, h, -rot);
+  }
+
   // What the pointer was last reported to be over, so a move across one tag
   // does not repaint the drawer four hundred times.
   let reportedHover = '';
@@ -682,6 +724,22 @@ function createMap2dView(canvas, mode = 'top', {
     return best;
   }
 
+  // What is under a canvas point, as the `{ kind, id }` every surface names an
+  // entity by. Tag, then client, then object — draw order, so what is drawn on
+  // top is what is picked.
+  //
+  // One test for the hover and the click both. Two would eventually disagree,
+  // and the way that shows up is a mark lighting up under the pointer while a
+  // different one takes the click.
+  function hitAt(x, y) {
+    const tagId = markerAt(x, y);
+    if (tagId !== null) return { kind: 'tag', id: tagId };
+    const clientId = clientAt(x, y);
+    if (clientId !== null) return { kind: 'client', id: clientId };
+    const objId = objectAt(x, y);
+    return objId !== null ? { kind: 'object', id: objId } : null;
+  }
+
   canvas.addEventListener('pointermove', (ev) => {
     // Before the drag branch below returns: the readout has to keep up while
     // the paper is being pushed around, which is when a reading is most likely
@@ -689,13 +747,7 @@ function createMap2dView(canvas, mode = 'top', {
     pointerPx = [ev.offsetX, ev.offsetY];
     schedule();
     if (!drag) {
-      const tagId = markerAt(ev.offsetX, ev.offsetY);
-      const clientId = tagId === null ? clientAt(ev.offsetX, ev.offsetY) : null;
-      const objId = tagId === null && clientId === null
-        ? objectAt(ev.offsetX, ev.offsetY) : null;
-      const h = tagId !== null ? { kind: 'tag', id: tagId }
-        : clientId !== null ? { kind: 'client', id: clientId }
-          : objId !== null ? { kind: 'object', id: objId } : null;
+      const h = hitAt(ev.offsetX, ev.offsetY);
       canvas.style.cursor = h ? 'pointer' : '';
       reportHover(h);
       return;
@@ -747,12 +799,15 @@ function createMap2dView(canvas, mode = 'top', {
   canvas.addEventListener('pointerup', (ev) => {
     const p = press;
     press = null;
-    if (!p || p.id !== ev.pointerId) return;
+    // This is a click, assembled by hand rather than delivered as one, so it
+    // asks the shift question itself — the guard that swallows clicks page-wide
+    // has no `click` event here to swallow.
+    if (!p || p.id !== ev.pointerId || clickSkipped(ev)) return;
     if (Math.hypot(ev.offsetX - p.x, ev.offsetY - p.y) > CLICK_SLOP_PX) return;
     // Hit-tested where the press landed rather than where it ended: within the
     // slop they are the same spot, and the press is the one that was aimed.
-    const id = objectAt(p.x, p.y);
-    if (id !== null) onSelect?.({ kind: 'object', id });
+    const sel = hitAt(p.x, p.y);
+    if (sel) onSelect?.(sel);
   });
 
   // Gives the auto-fit back, everywhere on the canvas. It used to forget a tag
@@ -2150,6 +2205,42 @@ function createMap2dView(canvas, mode = 'top', {
     setFocusObject(id) {
       if (id === focusObjectId) return;
       focusObjectId = id;
+      schedule();
+    },
+
+    // Bring one entity on screen, for a card opened in a drawer that cannot see
+    // this canvas. `{ kind, id }`, the shape every surface names an entity by.
+    //
+    // Only when it is not already comfortably on screen, because this is not
+    // free: any view written from outside latches this pane out of its auto-fit
+    // for good (see takeOver), and doing that for a tag the eye is already on
+    // would cost the fit and give nothing. It also makes the reverse gesture
+    // silent on its own — a card opened by clicking the mark cannot pan the map
+    // away from the mark that was clicked.
+    //
+    // Only the centre moves. The scale is the reader's, and a card opened to
+    // check a figure is not a reason to change how much of the room is in view.
+    focusOn(sel) {
+      const p = focusPos(sel);
+      // No transform yet means no first frame: nothing to test against, and no
+      // scale to keep. The next frame fits the whole room anyway, which shows
+      // it.
+      if (!p || !lastXf) return;
+      const [a, b] = proj(p);
+      const at = roomToScreen(a, b);
+      const w = canvas.clientWidth;
+      const h = canvas.clientHeight;
+      // Inset from the edges, not the edges themselves: a mark two pixels
+      // inside the frame is on screen and unreadable, and a mark near the edge
+      // has none of its label or its legs. Capped as a fraction so a narrow
+      // pane keeps a safe box at all.
+      const insetX = Math.min(FOCUS_EDGE_PX, w * FOCUS_EDGE_MAX);
+      const insetY = Math.min(FOCUS_EDGE_PX, h * FOCUS_EDGE_MAX);
+      if (at && at[0] >= insetX && at[0] <= w - insetX
+        && at[1] >= insetY && at[1] <= h - insetY) return;
+      if (!takeOver()) return;
+      view.ca = a;
+      view.cb = b;
       schedule();
     },
 
